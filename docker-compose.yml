@@ -1,0 +1,10 @@
+services:
+  ta-organizer:
+    build: .
+    container_name: ta-organizer
+    volumes:
+      - ./source:/app/source:ro
+      - ./target:/app/target
+    environment:
+      - API_TOKEN=${API_TOKEN}
+    env_file: .env
