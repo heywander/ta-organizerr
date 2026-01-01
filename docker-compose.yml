@@ -3,8 +3,12 @@ services:
     build: /mnt/user/appdata/dockerbuildings
     container_name: ta-organizer
     volumes:
-      - /mnt/user/appdata/dockerbuildings/source:/app/source:ro
+      - /mnt/user/appdata/dockerbuildings/source:/app/source
       - /mnt/user/appdata/dockerbuildings/target:/app/target
+      - /mnt/user/appdata/dockerbuildings/data:/app/data
+    ports:
+      - "8002:5000"
     environment:
-      - SCAN_INTERVAL=${SCAN_INTERVAL:-60}
+      - SCAN_INTERVAL=60
+      - ALLOWED_IPS=127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12
     env_file: /mnt/user/appdata/dockerbuildings/.env

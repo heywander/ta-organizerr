@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transcode Manager - TA Organizerr</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        .codec-badge {
+            font-family: monospace;
+            font-size: 0.8em;
+        }
+
+        .codec-ok {
+            background-color: #28a745;
+        }
+
+        .codec-warn {
+            background-color: #ffc107;
+            color: #000;
+        }
+
+        .codec-bad {
+            background-color: #dc3545;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container-fluid p-4">
+        <header class="d-flex justify-content-between align-items-center mb-4">
+            <h1><i class="bi bi-film"></i> Transcode Manager</h1>
+            <a href="/" class="btn btn-secondary"><i class="bi bi-arrow-left"></i> Back to Dashboard</a>
+        </header>
+
+        <div class="alert alert-info d-flex justify-content-between align-items-center">
+            <div>
+                <strong>ℹ️ Info:</strong> This page shows videos with broken/missing source files. Click "Find Missing
+                Videos" to scan for orphaned symlinks, then transcode them to restore compatibility.
+            </div>
+            <button class="btn btn-primary" onclick="findMissing()">
+                <i class="bi bi-search"></i> Find Missing Videos
+            </button>
+        </div>
+
+        <div class="card mb-4">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h5>Transcode Queue</h5>
+                <div id="pagination-info" class="text-muted"></div>
+            </div>
+            <div class="card-body">
+                <table class="table table-striped">
+                    <thead>
+                        <tr>
+                            <th style="width: 15%;">Channel</th>
+                            <th style="width: 10%;">Published</th>
+                            <th style="width: 30%;">Title</th>
+                            <th style="width: 30%;">Symlink Path</th>
+                            <th style="width: 15%;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="transcode-table">
+                        <tr>
+                            <td colspan="5" class="text-center">
+                                <div class="spinner-border" role="status"></div> Loading...
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+                <nav>
+                    <ul class="pagination justify-content-center" id="pagination">
+                    </ul>
+                </nav>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">Transcoding Log</div>
+            <div class="card-body">
+                <div id="transcode-log"
+                    style="height: 300px; overflow-y: scroll; font-family: monospace; font-size: 0.9em; background-color: #1e1e1e; color: #00ff00; padding: 10px;">
+                    <div>Waiting for transcode jobs...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        let transcodeLogIndex = 0;
+        let currentPage = 1;
+
+        async function findMissing() {
+            const tbody = document.getElementById('transcode-table');
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center"><div class="spinner-border" role="status"></div> Scanning for orphaned symlinks...</td></tr>';
+
+            try {
+                const res = await fetch('/api/check-orphans', { method: 'POST' });
+                const data = await res.json();
+                alert(`Found ${data.count} videos with broken/missing source files.`);
+                currentPage = 1;
+                loadVideos();
+            } catch (e) {
+                alert("Scan failed: " + e);
+                loadVideos();
+            }
+        }
+
+        async function loadVideos(page = 1) {
+            try {
+                const res = await fetch(`/api/transcode/videos?page=${page}&per_page=100`);
+                const data = await res.json();
+
+                const tbody = document.getElementById('transcode-table');
+                tbody.innerHTML = '';
+
+                if (data.videos.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="5" class="text-center">No missing videos found. Click "Find Missing Videos" to scan.</td></tr>';
+                    return;
+                }
+
+                data.videos.forEach(v => {
+                    const tr = document.createElement('tr');
+
+                    tr.innerHTML = `
+                        <td>${v.channel}</td>
+                        <td>${v.published}</td>
+                        <td class="text-truncate" style="max-width: 200px;" title="${v.title}">${v.title}</td>
+                        <td class="text-truncate" style="max-width: 250px;" title="${v.symlink}"><small>${v.symlink}</small></td>
+                        <td>
+                            <button class="btn btn-sm btn-primary" onclick="transcode('${v.symlink}')">
+                                <i class="bi bi-play"></i> Transcode
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+
+                // Update pagination info
+                document.getElementById('pagination-info').textContent =
+                    `Showing ${data.videos.length} of ${data.total} videos (Page ${data.page}/${data.pages})`;
+
+                // Render pagination
+                const pagination = document.getElementById('pagination');
+                pagination.innerHTML = '';
+
+                if (data.pages > 1) {
+                    // Previous button
+                    const prevLi = document.createElement('li');
+                    prevLi.className = `page-item ${data.page === 1 ? 'disabled' : ''}`;
+                    prevLi.innerHTML = `<a class="page-link" href="#" onclick="loadVideos(${data.page - 1}); return false;">Previous</a>`;
+                    pagination.appendChild(prevLi);
+
+                    // Page numbers (show max 5 pages around current)
+                    const startPage = Math.max(1, data.page - 2);
+                    const endPage = Math.min(data.pages, data.page + 2);
+
+                    for (let i = startPage; i <= endPage; i++) {
+                        const li = document.createElement('li');
+                        li.className = `page-item ${i === data.page ? 'active' : ''}`;
+                        li.innerHTML = `<a class="page-link" href="#" onclick="loadVideos(${i}); return false;">${i}</a>`;
+                        pagination.appendChild(li);
+                    }
+
+                    // Next button
+                    const nextLi = document.createElement('li');
+                    nextLi.className = `page-item ${data.page === data.pages ? 'disabled' : ''}`;
+                    nextLi.innerHTML = `<a class="page-link" href="#" onclick="loadVideos(${data.page + 1}); return false;">Next</a>`;
+                    pagination.appendChild(nextLi);
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function transcode(filepath) {
+            if (!confirm("Start transcoding this video? This may take a while.")) return;
+
+            const res = await fetch('/api/transcode/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filepath })
+            });
+
+            const data = await res.json();
+            alert(data.message || "Transcode started! Check the log below.");
+        }
+
+        async function fetchLogs() {
+            try {
+                const res = await fetch('/api/transcode/logs?start=' + transcodeLogIndex);
+                const data = await res.json();
+                if (data.logs && data.logs.length > 0) {
+                    const logBox = document.getElementById('transcode-log');
+                    data.logs.forEach(line => {
+                        const div = document.createElement('div');
+                        div.textContent = line;
+                        logBox.appendChild(div);
+                    });
+                    logBox.scrollTop = logBox.scrollHeight;
+                    transcodeLogIndex = data.next_index;
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        loadVideos();
+        setInterval(fetchLogs, 1000);
+    </script>
+</body>
+
+</html>
