@@ -902,11 +902,45 @@ def api_transcode_logs():
             "next_index": len(transcode_log_buffer)
         })
 
+# Global Scan State
+SCAN_CACHE = {
+    "status": "idle", # idle, scanning, done
+    "results": None,
+    "last_run": None 
+}
+SCAN_THREAD = None
+
 @app.route("/api/recovery/scan", methods=["POST"])
 @requires_auth
 def api_recovery_scan():
-    files = scan_for_unindexed_videos()
-    return jsonify({"files": files, "count": len(files)})
+    global SCAN_THREAD
+    
+    if SCAN_CACHE["status"] == "scanning":
+        return jsonify({"status": "running", "message": "Scan already in progress"}), 202
+
+    def run_scan_async():
+        global SCAN_CACHE
+        SCAN_CACHE["status"] = "scanning"
+        SCAN_CACHE["results"] = None
+        try:
+            results = scan_for_unindexed_videos()
+            SCAN_CACHE["results"] = results
+            SCAN_CACHE["status"] = "done"
+            SCAN_CACHE["last_run"] = datetime.now().isoformat()
+        except Exception as e:
+            SCAN_CACHE["status"] = "error"
+            SCAN_CACHE["results"] = str(e)
+            log(f"❌ Async scan failed: {e}")
+
+    SCAN_THREAD = threading.Thread(target=run_scan_async)
+    SCAN_THREAD.start()
+    
+    return jsonify({"status": "started", "message": "Background scan started"}), 202
+
+@app.route("/api/recovery/poll", methods=["GET"])
+@requires_auth
+def api_recovery_poll():
+    return jsonify(SCAN_CACHE)
 
 @app.route("/api/recovery/start", methods=["POST"])
 @requires_auth

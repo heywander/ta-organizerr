@@ -423,8 +423,7 @@
         }
 
         async function scanRecoveryFiles() {
-            // Loading state for all tabs
-            const loadingRow = '<tr><td colspan="4" class="text-center"><div class="spinner-border text-primary" role="status"></div> Scanning...</td></tr>';
+            const loadingRow = '<tr><td colspan="4" class="text-center"><div class="spinner-border text-primary" role="status"></div> Scanning in background... (This may take a minute)</td></tr>';
             const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
             ids.forEach(id => {
                 const el = document.getElementById(id);
@@ -432,61 +431,89 @@
             });
 
             try {
-                const res = await fetch('/api/recovery/scan', { method: 'POST' });
-                const data = await res.json();
+                // 1. Kick off the scan
+                await fetch('/api/recovery/scan', { method: 'POST' });
 
-                // Helper to render rows
-                const renderRow = (f, type) => {
-                    const cleanPath = f.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-                    if (type === 'unindexed') {
-                        return `<tr>
-                            <td><code>${f.video_id}</code></td>
-                            <td title="${f.path}"><small>${f.filename}</small></td>
-                            <td>${f.size_mb} MB</td>
-                            <td><button class="btn btn-sm btn-success" onclick="startRecovery('${cleanPath}')"><i class="bi bi-cloud-arrow-up"></i> Recover</button></td>
-                        </tr>`;
+                // 2. Poll for results
+                const pollInterval = setInterval(async () => {
+                    try {
+                        const res = await fetch('/api/recovery/poll');
+                        const state = await res.json();
+
+                        if (state.status === 'done') {
+                            clearInterval(pollInterval);
+                            renderResults(state.results);
+                        } else if (state.status === 'error') {
+                            clearInterval(pollInterval);
+                            alert("Scan Error: " + state.results);
+                            resetTables("Error: " + state.results);
+                        }
+                        // If 'scanning' or 'idle', keep polling...
+                    } catch (e) {
+                        clearInterval(pollInterval);
+                        console.error("Poll error", e);
                     }
-                    if (type === 'rescue') {
-                        return `<tr>
-                            <td><code>${f.video_id}</code></td>
-                            <td title="${f.path}"><small>${f.filename}</small></td>
-                            <td class="text-danger small">Missing from: ${f.ta_source}</td>
-                            <td><button class="btn btn-sm btn-danger" onclick="startRecovery('${cleanPath}')"><i class="bi bi-life-preserver"></i> RESCUE</button></td>
-                        </tr>`;
-                    }
-                    if (type === 'redundant') {
-                        return `<tr>
-                            <td><code>${f.video_id}</code></td>
-                            <td title="${f.path}"><small>${f.filename}</small></td>
-                            <td class="text-success small">Exists at: ${f.ta_source}</td>
-                            <td><button class="btn btn-sm btn-outline-secondary" onclick="deleteFile('${cleanPath}')"><i class="bi bi-trash"></i> Delete</button></td>
-                        </tr>`;
-                    }
-                };
-
-                // Clear & Fill
-                ids.forEach(id => {
-                    const el = document.getElementById(id);
-                    if (el) el.innerHTML = '';
-                });
-
-                // Update Badges
-                document.getElementById('badge-unindexed').innerText = data.files.unindexed.length;
-                document.getElementById('badge-rescue').innerText = data.files.rescue.length;
-                document.getElementById('badge-redundant').innerText = data.files.redundant.length;
-
-                // Populate Tables
-                data.files.unindexed.forEach(f => document.getElementById('tbody-unindexed').innerHTML += renderRow(f, 'unindexed'));
-                data.files.rescue.forEach(f => document.getElementById('tbody-rescue').innerHTML += renderRow(f, 'rescue'));
-                data.files.redundant.forEach(f => document.getElementById('tbody-redundant').innerHTML += renderRow(f, 'redundant'));
-
-                if (data.files.unindexed.length === 0) document.getElementById('tbody-unindexed').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No unindexed files found.</td></tr>';
-                if (data.files.rescue.length === 0) document.getElementById('tbody-rescue').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No rescue candidates found.</td></tr>';
-                if (data.files.redundant.length === 0) document.getElementById('tbody-redundant').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No duplicates found.</td></tr>';
+                }, 2000);
 
             } catch (e) {
-                alert("Scan failed: " + e);
+                alert("Failed to start scan: " + e);
             }
+        }
+
+        function resetTables(msg) {
+            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = `<tr><td colspan="4" class="text-center text-muted">${msg}</td></tr>`;
+            });
+        }
+
+        function renderResults(data) {
+            // Helper to render rows
+            const renderRow = (f, type) => {
+                const cleanPath = f.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                if (type === 'unindexed') {
+                    return `<tr>
+                        <td><code>${f.video_id}</code></td>
+                        <td title="${f.path}"><small>${f.filename}</small></td>
+                        <td>${f.size_mb} MB</td>
+                        <td><button class="btn btn-sm btn-success" onclick="startRecovery('${cleanPath}')"><i class="bi bi-cloud-arrow-up"></i> Recover</button></td>
+                    </tr>`;
+                }
+                if (type === 'rescue') {
+                    return `<tr>
+                        <td><code>${f.video_id}</code></td>
+                        <td title="${f.path}"><small>${f.filename}</small></td>
+                        <td class="text-danger small">Missing from: ${f.ta_source}</td>
+                        <td><button class="btn btn-sm btn-danger" onclick="startRecovery('${cleanPath}')"><i class="bi bi-life-preserver"></i> RESCUE</button></td>
+                    </tr>`;
+                }
+                if (type === 'redundant') {
+                    return `<tr>
+                        <td><code>${f.video_id}</code></td>
+                        <td title="${f.path}"><small>${f.filename}</small></td>
+                        <td class="text-success small">Exists at: ${f.ta_source}</td>
+                        <td><button class="btn btn-sm btn-outline-secondary" onclick="deleteFile('${cleanPath}')"><i class="bi bi-trash"></i> Delete</button></td>
+                    </tr>`;
+                }
+            };
+
+            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
+            ids.forEach(id => document.getElementById(id).innerHTML = '');
+
+            // Update Badges
+            document.getElementById('badge-unindexed').innerText = data.unindexed.length;
+            document.getElementById('badge-rescue').innerText = data.rescue.length;
+            document.getElementById('badge-redundant').innerText = data.redundant.length;
+
+            // Populate
+            data.unindexed.forEach(f => document.getElementById('tbody-unindexed').innerHTML += renderRow(f, 'unindexed'));
+            data.rescue.forEach(f => document.getElementById('tbody-rescue').innerHTML += renderRow(f, 'rescue'));
+            data.redundant.forEach(f => document.getElementById('tbody-redundant').innerHTML += renderRow(f, 'redundant'));
+
+            if (data.unindexed.length === 0) document.getElementById('tbody-unindexed').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No unindexed files found.</td></tr>';
+            if (data.rescue.length === 0) document.getElementById('tbody-rescue').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No rescue candidates found.</td></tr>';
+            if (data.redundant.length === 0) document.getElementById('tbody-redundant').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No duplicates found.</td></tr>';
         }
 
         async function startRecovery(filepath) {
@@ -513,7 +540,9 @@
                 const data = await res.json();
                 if (data.success) {
                     alert("File deleted.");
-                    scanRecoveryFiles(); // Refresh
+                    // Refresh not automatic for delete in async mode to avoid full rescan
+                    // Ideally we remove the row, but for now user can re-scan manually or we can trigger fetch
+                    // Let's just alert.
                 } else {
                     alert("Error: " + data.error);
                 }
