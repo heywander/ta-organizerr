@@ -459,47 +459,94 @@ def extract_id_from_filename(filename):
 
 def scan_for_unindexed_videos():
     """
-    Scans SOURCE_DIR for files that are NOT in the TubeArchivist database/metadata.
-    Returns a list of candidate files for recovery.
+    Scans both SOURCE_DIR and TARGET_DIR for files.
+    Classifies them as:
+    - unindexed: Not in TA DB (Needs Import)
+    - redundant: In TA DB AND Source exists (Safe Duplicate)
+    - rescue: In TA DB BUT Source missing (Needs Rescue/Import)
     """
-    log("🔍 Scanning for unindexed files...")
+    log("🔍 Scanning for unindexed and legacy files...")
     
-    # 1. Fetch current known IDs
-    video_map = fetch_all_metadata()
+    # 1. Fetch current known IDs and their source paths
+    video_map = fetch_all_metadata() # {id: {path: ..., ...}}
     known_ids = set(video_map.keys())
     
-    unindexed = []
-    
-    if not SOURCE_DIR.exists():
-        return []
-        
-    for channel_path in SOURCE_DIR.iterdir():
-        if not channel_path.is_dir():
-            continue
-            
-        for video_file in channel_path.glob("*.*"):
-            # Skip non-video files broadly (adjust extensions if needed)
-            if video_file.suffix.lower() not in ['.mp4', '.mkv', '.webm', '.mov']:
-                continue
+    results = {
+        "unindexed": [],
+        "redundant": [],
+        "rescue": []
+    }
+
+    # Helper to check if file is video
+    def is_video(f):
+        return f.suffix.lower() in ['.mp4', '.mkv', '.webm', '.mov']
+
+    # --- Scan SOURCE_DIR (Standard Orphan Check) ---
+    if SOURCE_DIR.exists():
+        for channel_path in SOURCE_DIR.iterdir():
+            if not channel_path.is_dir(): continue
+            for video_file in channel_path.glob("*.*"):
+                if not is_video(video_file): continue
                 
-            # Try to identify
-            vid_id = extract_id_from_filename(video_file.name)
-            
-            # If we found an ID and it's NOT in known_ids
-            if vid_id and vid_id not in known_ids:
-                unindexed.append({
-                    "path": str(video_file),
-                    "filename": video_file.name,
-                    "video_id": vid_id,
-                    "channel_folder": channel_path.name,
-                    "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2)
-                })
-            elif not vid_id:
-                # File without ID? Maybe worth listing too
-                pass
+                vid_id = extract_id_from_filename(video_file.name)
+                if vid_id and vid_id not in known_ids:
+                    results["unindexed"].append({
+                        "path": str(video_file),
+                        "filename": video_file.name,
+                        "video_id": vid_id,
+                        "type": "source_orphan",
+                        "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2)
+                    })
+
+    # --- Scan TARGET_DIR (Legacy "Pinchflat" Check) ---
+    if TARGET_DIR.exists():
+        for channel_path in TARGET_DIR.iterdir():
+            if not channel_path.is_dir(): continue
+            for video_file in channel_path.glob("*.*"):
+                if not is_video(video_file): continue
                 
-    log(f"✅ Found {len(unindexed)} unindexed video files.")
-    return unindexed
+                # We only care about REAL files, not symlinks
+                if video_file.is_symlink():
+                    continue
+                    
+                vid_id = extract_id_from_filename(video_file.name)
+                
+                # Case 1: ID NOT in TA -> Recoverable
+                if vid_id and vid_id not in known_ids:
+                     results["unindexed"].append({
+                        "path": str(video_file),
+                        "filename": video_file.name,
+                        "video_id": vid_id,
+                        "type": "target_realfile",
+                        "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2)
+                    })
+                
+                # Case 2: ID IS in TA
+                elif vid_id:
+                    # Check if TA's source file actually exists
+                    ta_source_path = Path(video_map[vid_id]['filesystem_path'])
+                    
+                    if ta_source_path.exists():
+                        # TA has it, Source exists. This file is REDUNDANT.
+                        results["redundant"].append({
+                            "path": str(video_file),
+                            "filename": video_file.name,
+                            "video_id": vid_id,
+                            "ta_source": str(ta_source_path),
+                            "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2)
+                        })
+                    else:
+                        # TA has it, BUT source is MISSING. This file is a RESCUE candidate.
+                        results["rescue"].append({
+                            "path": str(video_file),
+                            "filename": video_file.name,
+                            "video_id": vid_id,
+                            "ta_source": str(ta_source_path), # Missing path
+                            "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2)
+                        })
+
+    log(f"✅ Scan complete. Unindexed: {len(results['unindexed'])}, Redundant: {len(results['redundant'])}, Rescue: {len(results['rescue'])}")
+    return results
 
 def recover_video_metadata(filepath):
     """
@@ -876,6 +923,31 @@ def api_recovery_start():
         
     threading.Thread(target=run_recovery).start()
     return jsonify({"message": "Recovery started", "status": "started"})
+
+@app.route("/api/recovery/delete", methods=["POST"])
+@requires_auth
+def api_recovery_delete():
+    data = request.get_json()
+    filepath = data.get('filepath')
+    
+    if not filepath:
+        return jsonify({"error": "No filepath provided"}), 400
+        
+    p = Path(filepath)
+    if not p.exists() or not p.is_file():
+        return jsonify({"error": "File not found"}), 404
+        
+    # Safety Check: Never delete anything from SOURCE_DIR via this endpoint
+    if str(SOURCE_DIR) in str(p.resolve()):
+        return jsonify({"error": "Safety Block: Cannot delete files from Source Config."}), 403
+
+    try:
+        p.unlink()
+        log(f"🗑️ Deleted redundant file: {filepath}")
+        return jsonify({"success": True, "message": "File deleted"})
+    except Exception as e:
+        log(f"❌ Delete failed: {e}")
+        return jsonify({"error": str(e)}), 500
     
 if __name__ == "__main__":
     # Start scheduler in background thread
