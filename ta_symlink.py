@@ -921,7 +921,7 @@ def api_recovery_scan():
 
     def run_scan_async():
         global SCAN_CACHE
-        SCAN_CACHE["status"] = "scanning"
+        # SCAN_CACHE["status"] = "scanning" # Already set in main thread
         SCAN_CACHE["results"] = None
         try:
             results = scan_for_unindexed_videos()
@@ -933,6 +933,8 @@ def api_recovery_scan():
             SCAN_CACHE["results"] = str(e)
             log(f"❌ Async scan failed: {e}")
 
+    # Set status IMMEDIATELY to avoid race condition where poll sees "idle"
+    SCAN_CACHE["status"] = "scanning"
     SCAN_THREAD = threading.Thread(target=run_scan_async)
     SCAN_THREAD.start()
     
