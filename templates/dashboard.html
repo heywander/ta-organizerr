@@ -56,9 +56,20 @@
             margin-right: 5px;
         }
 
-        .status-green { background-color: var(--accent-success); box-shadow: 0 0 8px var(--accent-success); }
-        .status-yellow { background-color: var(--accent-warning); box-shadow: 0 0 8px var(--accent-warning); }
-        .status-red { background-color: var(--accent-danger); box-shadow: 0 0 8px var(--accent-danger); }
+        .status-green {
+            background-color: var(--accent-success);
+            box-shadow: 0 0 8px var(--accent-success);
+        }
+
+        .status-yellow {
+            background-color: var(--accent-warning);
+            box-shadow: 0 0 8px var(--accent-warning);
+        }
+
+        .status-red {
+            background-color: var(--accent-danger);
+            box-shadow: 0 0 8px var(--accent-danger);
+        }
 
         .btn-xl {
             padding: 15px 20px;
@@ -72,9 +83,11 @@
 
 <body>
     <div class="container-fluid p-4" style="max-width: 1600px;">
-        <header class="d-flex justify-content-between align-items-center mb-5 border-bottom pb-3" style="border-color: #333 !important;">
+        <header class="d-flex justify-content-between align-items-center mb-5 border-bottom pb-3"
+            style="border-color: #333 !important;">
             <div class="d-flex align-items-center">
-                <h1 class="display-6 mb-0 me-3"><i class="bi bi-collection-play-fill text-primary"></i> TA Organizer</h1>
+                <h1 class="display-6 mb-0 me-3"><i class="bi bi-collection-play-fill text-primary"></i> TA Organizer
+                </h1>
                 <span class="badge bg-secondary" id="connection-status">Connecting...</span>
             </div>
             <div>
@@ -129,9 +142,13 @@
                         <button class="btn btn-primary btn-xl shadow-lg" onclick="triggerScan()">
                             <i class="bi bi-arrow-repeat"></i> Run Full Scan
                         </button>
-                        
+
                         <button class="btn btn-outline-warning" onclick="checkOrphans()">
                             <i class="bi bi-binoculars"></i> Check Orphaned Links
+                        </button>
+
+                        <button class="btn btn-outline-info" onclick="showRecoveryModal()">
+                            <i class="bi bi-bandaid"></i> Recovery Mode
                         </button>
 
                         <!-- Clean button disabled as requested -->
@@ -157,6 +174,48 @@
                     <div class="card-body p-2 bg-black">
                         <div class="log-box" id="log-container">
                             <div class="text-muted">Waiting for system logs...</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recovery Modal -->
+        <div class="modal fade" id="recoveryModal" tabindex="-1">
+            <div class="modal-dialog modal-lg">
+                <div class="modal-content" style="background-color: var(--bg-card); border: 1px solid #444;">
+                    <div class="modal-header border-bottom border-secondary">
+                        <h5 class="modal-title"><i class="bi bi-bandaid"></i> File Recovery</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="alert alert-info">
+                            This tool scans for video files in your source folder that are <strong>NOT</strong> in TA's
+                            database.
+                            It will attempt to fetch metadata (using <code>yt-dlp</code>) and move them to the Import
+                            folder.
+                        </div>
+                        <div class="d-grid mb-3">
+                            <button class="btn btn-primary" onclick="scanRecoveryFiles()">
+                                <i class="bi bi-search"></i> Scan for Unindexed Files
+                            </button>
+                        </div>
+                        <div class="table-responsive" style="max-height: 400px;">
+                            <table class="table table-dark table-striped table-hover mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Video ID</th>
+                                        <th>Filename</th>
+                                        <th>Size</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="recovery-table-body">
+                                    <tr>
+                                        <td colspan="4" class="text-center text-muted">Click Scan to begin...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
                 </div>
@@ -273,6 +332,63 @@
             }
 
             setTimeout(() => { resultsDiv.innerHTML = ''; }, 10000);
+        }
+
+        // Recovery Functions
+        const recoveryModal = new bootstrap.Modal(document.getElementById('recoveryModal'));
+
+        function showRecoveryModal() {
+            recoveryModal.show();
+        }
+
+        async function scanRecoveryFiles() {
+            const tbody = document.getElementById('recovery-table-body');
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center"><div class="spinner-border text-primary" role="status"></div> Scanning...</td></tr>';
+
+            try {
+                const res = await fetch('/api/recovery/scan', { method: 'POST' });
+                const data = await res.json();
+
+                tbody.innerHTML = '';
+                if (data.count === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" class="text-center text-success">No unindexed files found!</td></tr>';
+                    return;
+                }
+
+                data.files.forEach(f => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td><code>${f.video_id}</code></td>
+                        <td title="${f.path}" style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${f.filename}</td>
+                        <td>${f.size_mb} MB</td>
+                        <td>
+                            <button class="btn btn-sm btn-success" onclick="startRecovery('${f.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')">
+                                <i class="bi bi-cloud-arrow-up"></i> Recover
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (e) {
+                tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">Error: ${e}</td></tr>`;
+            }
+        }
+
+        async function startRecovery(filepath) {
+            if (!confirm("Start recovery for this file? This will try to fetch metadata and move it to the Import folder.")) return;
+
+            try {
+                const res = await fetch('/api/recovery/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filepath })
+                });
+                const data = await res.json();
+                alert(data.message || "Recovery started! Check logs.");
+                // Optionally remove the row
+            } catch (e) {
+                alert("Error starting recovery: " + e);
+            }
         }
 
         function clearLogs() {

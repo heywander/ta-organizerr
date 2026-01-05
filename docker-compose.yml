@@ -7,6 +7,7 @@ services:
       - /path/to/your/source:/app/source
       - /path/to/your/target:/app/target
       - /path/to/your/data:/app/data
+      - /path/to/your/import:/app/import
     ports:
       - "8002:5000"
     environment:
