@@ -182,41 +182,122 @@
 
         <!-- Recovery Modal -->
         <div class="modal fade" id="recoveryModal" tabindex="-1">
-            <div class="modal-dialog modal-lg">
+            <div class="modal-dialog modal-xl">
                 <div class="modal-content" style="background-color: var(--bg-card); border: 1px solid #444;">
                     <div class="modal-header border-bottom border-secondary">
-                        <h5 class="modal-title"><i class="bi bi-bandaid"></i> File Recovery</h5>
+                        <h5 class="modal-title"><i class="bi bi-bandaid"></i> Advanced Recovery & Cleanup</h5>
                         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
                     </div>
                     <div class="modal-body">
                         <div class="alert alert-info">
-                            This tool scans for video files in your source folder that are <strong>NOT</strong> in TA's
-                            database.
-                            It will attempt to fetch metadata (using <code>yt-dlp</code>) and move them to the Import
-                            folder.
+                            <i class="bi bi-info-circle"></i> This tool scans for files in your Source and Archive
+                            folders to find issues.
                         </div>
+
                         <div class="d-grid mb-3">
                             <button class="btn btn-primary" onclick="scanRecoveryFiles()">
-                                <i class="bi bi-search"></i> Scan for Unindexed Files
+                                <i class="bi bi-search"></i> Run System Scan
                             </button>
                         </div>
-                        <div class="table-responsive" style="max-height: 400px;">
-                            <table class="table table-dark table-striped table-hover mb-0">
-                                <thead>
-                                    <tr>
-                                        <th>Video ID</th>
-                                        <th>Filename</th>
-                                        <th>Size</th>
-                                        <th>Action</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="recovery-table-body">
-                                    <tr>
-                                        <td colspan="4" class="text-center text-muted">Click Scan to begin...</td>
-                                    </tr>
-                                </tbody>
-                            </table>
+
+                        <ul class="nav nav-tabs border-secondary mb-3" id="recoveryTabs" role="tablist">
+                            <li class="nav-item">
+                                <button class="nav-link active text-warning" data-bs-toggle="tab"
+                                    data-bs-target="#tab-unindexed">
+                                    <i class="bi bi-exclamation-triangle"></i> Unindexed (Import) <span
+                                        class="badge bg-secondary ms-1" id="badge-unindexed">0</span>
+                                </button>
+                            </li>
+                            <li class="nav-item">
+                                <button class="nav-link text-danger" data-bs-toggle="tab" data-bs-target="#tab-rescue">
+                                    <i class="bi bi-life-preserver"></i> Rescue Needed <span
+                                        class="badge bg-secondary ms-1" id="badge-rescue">0</span>
+                                </button>
+                            </li>
+                            <li class="nav-item">
+                                <button class="nav-link text-muted" data-bs-toggle="tab"
+                                    data-bs-target="#tab-redundant">
+                                    <i class="bi bi-trash"></i> Redundant Dupes <span class="badge bg-secondary ms-1"
+                                        id="badge-redundant">0</span>
+                                </button>
+                            </li>
+                        </ul>
+
+                        <div class="tab-content">
+                            <!-- Unindexed Files -->
+                            <div class="tab-pane fade show active" id="tab-unindexed">
+                                <p class="text-muted small">Files found on disk but missing from TubeArchivist. Recover
+                                    them to restore your library.</p>
+                                <div class="table-responsive" style="max-height: 400px;">
+                                    <table class="table table-dark table-striped table-hover mb-0">
+                                        <thead>
+                                            <tr>
+                                                <th>Video ID</th>
+                                                <th>Location</th>
+                                                <th>Size</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="tbody-unindexed">
+                                            <tr>
+                                                <td colspan="4" class="text-center text-muted">Click Scan to begin...
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <!-- Rescue Files -->
+                            <div class="tab-pane fade" id="tab-rescue">
+                                <p class="text-danger small"><strong>CRITICAL:</strong> TubeArchivist thinks it has
+                                    these videos, but the source file is MISSING. However, we found a copy in your
+                                    archives! Recover immediately.</p>
+                                <div class="table-responsive" style="max-height: 400px;">
+                                    <table class="table table-dark table-striped table-hover mb-0">
+                                        <thead>
+                                            <tr>
+                                                <th>Video ID</th>
+                                                <th>Found At</th>
+                                                <th>Missing Source</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="tbody-rescue">
+                                            <tr>
+                                                <td colspan="4" class="text-center text-muted">Click Scan to begin...
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <!-- Redundant Files -->
+                            <div class="tab-pane fade" id="tab-redundant">
+                                <p class="text-muted small"><strong>SAFE TO DELETE:</strong> These files are duplicates.
+                                    TubeArchivist already has a verified copy in the source folder.</p>
+                                <div class="table-responsive" style="max-height: 400px;">
+                                    <table class="table table-dark table-striped table-hover mb-0">
+                                        <thead>
+                                            <tr>
+                                                <th>Video ID</th>
+                                                <th>Duplicate Path</th>
+                                                <th>Verified Source</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="tbody-redundant">
+                                            <tr>
+                                                <td colspan="4" class="text-center text-muted">Click Scan to begin...
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
                         </div>
+
                     </div>
                 </div>
             </div>
@@ -342,41 +423,74 @@
         }
 
         async function scanRecoveryFiles() {
-            const tbody = document.getElementById('recovery-table-body');
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center"><div class="spinner-border text-primary" role="status"></div> Scanning...</td></tr>';
+            // Loading state for all tabs
+            const loadingRow = '<tr><td colspan="4" class="text-center"><div class="spinner-border text-primary" role="status"></div> Scanning...</td></tr>';
+            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = loadingRow;
+            });
 
             try {
                 const res = await fetch('/api/recovery/scan', { method: 'POST' });
                 const data = await res.json();
 
-                tbody.innerHTML = '';
-                if (data.count === 0) {
-                    tbody.innerHTML = '<tr><td colspan="4" class="text-center text-success">No unindexed files found!</td></tr>';
-                    return;
-                }
+                // Helper to render rows
+                const renderRow = (f, type) => {
+                    const cleanPath = f.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                    if (type === 'unindexed') {
+                        return `<tr>
+                            <td><code>${f.video_id}</code></td>
+                            <td title="${f.path}"><small>${f.filename}</small></td>
+                            <td>${f.size_mb} MB</td>
+                            <td><button class="btn btn-sm btn-success" onclick="startRecovery('${cleanPath}')"><i class="bi bi-cloud-arrow-up"></i> Recover</button></td>
+                        </tr>`;
+                    }
+                    if (type === 'rescue') {
+                        return `<tr>
+                            <td><code>${f.video_id}</code></td>
+                            <td title="${f.path}"><small>${f.filename}</small></td>
+                            <td class="text-danger small">Missing from: ${f.ta_source}</td>
+                            <td><button class="btn btn-sm btn-danger" onclick="startRecovery('${cleanPath}')"><i class="bi bi-life-preserver"></i> RESCUE</button></td>
+                        </tr>`;
+                    }
+                    if (type === 'redundant') {
+                        return `<tr>
+                            <td><code>${f.video_id}</code></td>
+                            <td title="${f.path}"><small>${f.filename}</small></td>
+                            <td class="text-success small">Exists at: ${f.ta_source}</td>
+                            <td><button class="btn btn-sm btn-outline-secondary" onclick="deleteFile('${cleanPath}')"><i class="bi bi-trash"></i> Delete</button></td>
+                        </tr>`;
+                    }
+                };
 
-                data.files.forEach(f => {
-                    const tr = document.createElement('tr');
-                    tr.innerHTML = `
-                        <td><code>${f.video_id}</code></td>
-                        <td title="${f.path}" style="max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${f.filename}</td>
-                        <td>${f.size_mb} MB</td>
-                        <td>
-                            <button class="btn btn-sm btn-success" onclick="startRecovery('${f.path.replace(/\\/g, "\\\\").replace(/'/g, "\\'")}')">
-                                <i class="bi bi-cloud-arrow-up"></i> Recover
-                            </button>
-                        </td>
-                    `;
-                    tbody.appendChild(tr);
+                // Clear & Fill
+                ids.forEach(id => {
+                    const el = document.getElementById(id);
+                    if (el) el.innerHTML = '';
                 });
+
+                // Update Badges
+                document.getElementById('badge-unindexed').innerText = data.files.unindexed.length;
+                document.getElementById('badge-rescue').innerText = data.files.rescue.length;
+                document.getElementById('badge-redundant').innerText = data.files.redundant.length;
+
+                // Populate Tables
+                data.files.unindexed.forEach(f => document.getElementById('tbody-unindexed').innerHTML += renderRow(f, 'unindexed'));
+                data.files.rescue.forEach(f => document.getElementById('tbody-rescue').innerHTML += renderRow(f, 'rescue'));
+                data.files.redundant.forEach(f => document.getElementById('tbody-redundant').innerHTML += renderRow(f, 'redundant'));
+
+                if (data.files.unindexed.length === 0) document.getElementById('tbody-unindexed').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No unindexed files found.</td></tr>';
+                if (data.files.rescue.length === 0) document.getElementById('tbody-rescue').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No rescue candidates found.</td></tr>';
+                if (data.files.redundant.length === 0) document.getElementById('tbody-redundant').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No duplicates found.</td></tr>';
+
             } catch (e) {
-                tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">Error: ${e}</td></tr>`;
+                alert("Scan failed: " + e);
             }
         }
 
         async function startRecovery(filepath) {
             if (!confirm("Start recovery for this file? This will try to fetch metadata and move it to the Import folder.")) return;
-
             try {
                 const res = await fetch('/api/recovery/start', {
                     method: 'POST',
@@ -385,10 +499,25 @@
                 });
                 const data = await res.json();
                 alert(data.message || "Recovery started! Check logs.");
-                // Optionally remove the row
-            } catch (e) {
-                alert("Error starting recovery: " + e);
-            }
+            } catch (e) { alert("Error: " + e); }
+        }
+
+        async function deleteFile(filepath) {
+            if (!confirm("⚠️ DELETE WARNING: Are you sure you want to delete this file?\n\n" + filepath + "\n\nOnly click OK if you are sure TA has a copy.")) return;
+            try {
+                const res = await fetch('/api/recovery/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filepath })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert("File deleted.");
+                    scanRecoveryFiles(); // Refresh
+                } else {
+                    alert("Error: " + data.error);
+                }
+            } catch (e) { alert("Error: " + e); }
         }
 
         function clearLogs() {
