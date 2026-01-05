@@ -627,9 +627,9 @@
             } catch (e) { alert("Error: " + e); }
         }
 
-        async function startRecovery(filepath, btn) {
+        async function startRecovery(filepath, btn, isBatch = false) {
             console.log("startRecovery clicked for:", filepath);
-            if (!confirm("Start recovery for this file? This will try to fetch metadata and move it to the Import folder.")) return;
+            if (!isBatch && !confirm("Start recovery for this file? This will try to fetch metadata and move it to the Import folder.")) return;
 
             // Show loading state
             // If btn is not passed (legacy call), try to find it via event, closely.
@@ -651,15 +651,30 @@
                 });
                 const data = await res.json();
 
-                alert(data.message);
+                if (!isBatch) alert(data.message);
 
-                // Refresh the list to reflect changes (e.g. moved to Lost Media)
-                scanRecoveryFiles();
+                // If batch, we mark as done visually but don't rescan yet
+                if (btn && isBatch && data.success) {
+                    btn.innerHTML = '<i class="bi bi-check-lg"></i> Done';
+                    btn.classList.remove('btn-success');
+                    btn.classList.add('btn-secondary');
+                }
+
+                // Refresh the list only if NOT batch (batch does it at end)
+                if (!isBatch) scanRecoveryFiles();
+
+                return data.success; // Return status for batch loop
 
             } catch (e) {
-                alert("Error: " + e);
+                if (!isBatch) alert("Error: " + e);
+                if (btn && isBatch) {
+                    btn.innerHTML = '<i class="bi bi-x-lg"></i> Err';
+                    btn.classList.add('btn-danger');
+                }
+                return false;
             } finally {
-                if (btn) {
+                // Restore button only if NOT batch (batch keeps them marked done)
+                if (btn && !isBatch) {
                     btn.innerHTML = originalHtml;
                     btn.disabled = false;
                 }
@@ -776,7 +791,7 @@
                 if (match) {
                     const path = match[1];
                     try {
-                        await startRecovery(path, btn);
+                        await startRecovery(path, btn, true);
                         successCount++;
                     } catch (e) {
                         console.error("Batch error for " + path, e);
@@ -786,6 +801,7 @@
                 }
             }
             alert("Batch Complete! Processed: " + buttons.length);
+            scanRecoveryFiles();
         }
     </script>
 </body>
