@@ -1,14 +1,17 @@
 services:
   ta-organizer:
-    build: /mnt/user/appdata/dockerbuildings
+    # build: .  <-- Uncomment to build locally
+    image: ghcr.io/salpertio/ta-organizerr:latest
     container_name: ta-organizer
     volumes:
-      - /mnt/user/appdata/dockerbuildings/source:/app/source
-      - /mnt/user/appdata/dockerbuildings/target:/app/target
-      - /mnt/user/appdata/dockerbuildings/data:/app/data
+      - /path/to/your/source:/app/source
+      - /path/to/your/target:/app/target
+      - /path/to/your/data:/app/data
     ports:
       - "8002:5000"
     environment:
       - SCAN_INTERVAL=60
       - ALLOWED_IPS=127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12
-    env_file: /mnt/user/appdata/dockerbuildings/.env
+      # - UI_USERNAME=admin
+      # - UI_PASSWORD=password
+      # env_file: .env
