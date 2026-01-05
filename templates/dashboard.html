@@ -234,6 +234,12 @@
                                         id="badge-redundant">0</span>
                                 </button>
                             </li>
+                            <li class="nav-item">
+                                <button class="nav-link text-white" data-bs-toggle="tab" data-bs-target="#tab-lost">
+                                    <i class="bi bi-question-circle"></i> Lost Media <span
+                                        class="badge bg-secondary ms-1" id="badge-lost">0</span>
+                                </button>
+                            </li>
                         </ul>
 
                         <div class="tab-content">
@@ -301,6 +307,31 @@
                                             </tr>
                                         </thead>
                                         <tbody id="tbody-redundant">
+                                            <tr>
+                                                <td colspan="4" class="text-center text-muted">Click Scan to begin...
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <!-- Lost Media Files -->
+                            <div class="tab-pane fade" id="tab-lost">
+                                <p class="text-warning small"><strong>VIDEO DELETED:</strong> These files were not found
+                                    on YouTube.
+                                    You can Force Import them using offline metadata or Delete them.</p>
+                                <div class="table-responsive" style="max-height: 400px;">
+                                    <table class="table table-dark table-striped table-hover mb-0">
+                                        <thead>
+                                            <tr>
+                                                <th>Video ID</th>
+                                                <th>Filename</th>
+                                                <th>Size</th>
+                                                <th>Action</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody id="tbody-lost">
                                             <tr>
                                                 <td colspan="4" class="text-center text-muted">Click Scan to begin...
                                                 </td>
@@ -442,40 +473,49 @@
             recoveryModal.show();
         }
 
+        let recoveryPollInterval = null;
+
         async function scanRecoveryFiles() {
             const loadingRow = '<tr><td colspan="4" class="text-center"><div class="spinner-border text-primary" role="status"></div> Scanning in background... (This may take a minute)</td></tr>';
-            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
+            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant', 'tbody-lost'];
             ids.forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.innerHTML = loadingRow;
             });
+
+            // CLEAR EXISTING INTERVAL IF ANY
+            if (recoveryPollInterval) clearInterval(recoveryPollInterval);
 
             try {
                 // 1. Kick off the scan
                 await fetch('/api/recovery/scan', { method: 'POST' });
 
                 // 2. Poll for results
-                const pollInterval = setInterval(async () => {
+                recoveryPollInterval = setInterval(async () => {
                     try {
                         const res = await fetch('/api/recovery/poll');
                         const state = await res.json();
 
                         if (state.status === 'done') {
-                            clearInterval(pollInterval);
+                            clearInterval(recoveryPollInterval);
+                            recoveryPollInterval = null;
                             renderResults(state.results);
                         } else if (state.status === 'error') {
-                            clearInterval(pollInterval);
+                            clearInterval(recoveryPollInterval);
+                            recoveryPollInterval = null;
                             alert("Scan Error: " + state.results);
                             resetTables("Error: " + state.results);
                         } else if (state.status === 'idle') {
                             // Scan state lost (server restart?)
-                            clearInterval(pollInterval);
+                            clearInterval(recoveryPollInterval);
+                            recoveryPollInterval = null;
                             alert("Scan state lost (Server Restarted?). Please try again.");
                             resetTables("Scan stopped / State lost.");
                         }
                         // If 'scanning', keep polling...
                     } catch (e) {
-                        clearInterval(pollInterval);
+                        clearInterval(recoveryPollInterval);
+                        recoveryPollInterval = null;
                         console.error("Poll error", e);
                     }
                 }, 2000);
@@ -486,7 +526,7 @@
         }
 
         function resetTables(msg) {
-            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
+            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant', 'tbody-lost'];
             ids.forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.innerHTML = `<tr><td colspan="4" class="text-center text-muted">${msg}</td></tr>`;
@@ -502,7 +542,7 @@
                         <td><code>${f.video_id}</code></td>
                         <td title="${f.path}"><small>${f.filename}</small></td>
                         <td>${f.size_mb} MB</td>
-                        <td><button class="btn btn-sm btn-success" onclick="startRecovery('${cleanPath}')"><i class="bi bi-cloud-arrow-up"></i> Recover</button></td>
+                        <td><button class="btn btn-sm btn-success" onclick="startRecovery('${cleanPath}', this)"><i class="bi bi-cloud-arrow-up"></i> Recover</button></td>
                     </tr>`;
                 }
                 if (type === 'rescue') {
@@ -510,7 +550,7 @@
                         <td><code>${f.video_id}</code></td>
                         <td title="${f.path}"><small>${f.filename}</small></td>
                         <td class="text-danger small">Missing from: ${f.ta_source}</td>
-                        <td><button class="btn btn-sm btn-danger" onclick="startRecovery('${cleanPath}')"><i class="bi bi-life-preserver"></i> RESCUE</button></td>
+                        <td><button class="btn btn-sm btn-danger" onclick="startRecovery('${cleanPath}', this)"><i class="bi bi-life-preserver"></i> RESCUE</button></td>
                     </tr>`;
                 }
                 if (type === 'redundant') {
@@ -521,28 +561,84 @@
                         <td><button class="btn btn-sm btn-outline-secondary" onclick="deleteFile('${cleanPath}')"><i class="bi bi-trash"></i> Delete</button></td>
                     </tr>`;
                 }
+                if (type === 'lost') {
+                    return `<tr>
+                        <td><code>${f.video_id}</code></td>
+                        <td title="${f.path}"><small>${f.filename}</small></td>
+                        <td>${f.size_mb} MB</td>
+                        <td>
+                            <button class="btn btn-sm btn-warning" onclick="forceImport('${cleanPath}')" title="Generate offline metadata"><i class="bi bi-lightning-charge"></i> Force</button>
+                            <button class="btn btn-sm btn-outline-danger ms-1" onclick="deleteFile('${cleanPath}')"><i class="bi bi-trash"></i></button>
+                        </td>
+                    </tr>`;
+                }
             };
 
-            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant'];
-            ids.forEach(id => document.getElementById(id).innerHTML = '');
+            const ids = ['tbody-unindexed', 'tbody-rescue', 'tbody-redundant', 'tbody-lost'];
+            ids.forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = '';
+            });
 
             // Update Badges
-            document.getElementById('badge-unindexed').innerText = data.unindexed.length;
-            document.getElementById('badge-rescue').innerText = data.rescue.length;
-            document.getElementById('badge-redundant').innerText = data.redundant.length;
+            document.getElementById('badge-unindexed').innerText = data.unindexed ? data.unindexed.length : 0;
+            document.getElementById('badge-rescue').innerText = data.rescue ? data.rescue.length : 0;
+            document.getElementById('badge-redundant').innerText = data.redundant ? data.redundant.length : 0;
+            document.getElementById('badge-lost').innerText = data.lost ? data.lost.length : 0;
 
-            // Populate
-            data.unindexed.forEach(f => document.getElementById('tbody-unindexed').innerHTML += renderRow(f, 'unindexed'));
-            data.rescue.forEach(f => document.getElementById('tbody-rescue').innerHTML += renderRow(f, 'rescue'));
-            data.redundant.forEach(f => document.getElementById('tbody-redundant').innerHTML += renderRow(f, 'redundant'));
+            // Populate - OPTIMIZED (Build string once)
+            const unindexedRows = (data.unindexed || []).map(f => renderRow(f, 'unindexed')).join('');
+            document.getElementById('tbody-unindexed').innerHTML = unindexedRows;
 
-            if (data.unindexed.length === 0) document.getElementById('tbody-unindexed').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No unindexed files found.</td></tr>';
-            if (data.rescue.length === 0) document.getElementById('tbody-rescue').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No rescue candidates found.</td></tr>';
-            if (data.redundant.length === 0) document.getElementById('tbody-redundant').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No duplicates found.</td></tr>';
+            const rescueRows = (data.rescue || []).map(f => renderRow(f, 'rescue')).join('');
+            document.getElementById('tbody-rescue').innerHTML = rescueRows;
+
+            const redundantRows = (data.redundant || []).map(f => renderRow(f, 'redundant')).join('');
+            document.getElementById('tbody-redundant').innerHTML = redundantRows;
+
+            const lostRows = (data.lost || []).map(f => renderRow(f, 'lost')).join('');
+            if (document.getElementById('tbody-lost')) document.getElementById('tbody-lost').innerHTML = lostRows;
+
+            if (!data.unindexed || data.unindexed.length === 0) document.getElementById('tbody-unindexed').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No unindexed files found.</td></tr>';
+            if (!data.rescue || data.rescue.length === 0) document.getElementById('tbody-rescue').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No rescue candidates found.</td></tr>';
+            if (!data.redundant || data.redundant.length === 0) document.getElementById('tbody-redundant').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No duplicates found.</td></tr>';
+            if ((!data.lost || data.lost.length === 0) && document.getElementById('tbody-lost')) document.getElementById('tbody-lost').innerHTML = '<tr><td colspan="4" class="text-center text-muted">No lost media found.</td></tr>';
         }
 
-        async function startRecovery(filepath) {
+        async function forceImport(filepath) {
+            if (!confirm("FORCE IMPORT: Use offline metadata?\n\nThis will import the file even if it is deleted/private on YouTube. Metadata might be incomplete.")) return;
+            try {
+                const res = await fetch('/api/recovery/force', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filepath })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert("Force import successful! Refreshing list...");
+                    scanRecoveryFiles();
+                } else {
+                    alert("Error: " + (data.error || data.message));
+                }
+            } catch (e) { alert("Error: " + e); }
+        }
+
+        async function startRecovery(filepath, btn) {
+            console.log("startRecovery clicked for:", filepath);
             if (!confirm("Start recovery for this file? This will try to fetch metadata and move it to the Import folder.")) return;
+
+            // Show loading state
+            // If btn is not passed (legacy call), try to find it via event, closely.
+            if (!btn && typeof event !== 'undefined' && event) {
+                btn = event.target.closest('button');
+            }
+
+            const originalHtml = btn ? btn.innerHTML : 'Recover';
+            if (btn) {
+                btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span> ...';
+                btn.disabled = true;
+            }
+
             try {
                 const res = await fetch('/api/recovery/start', {
                     method: 'POST',
@@ -550,8 +646,20 @@
                     body: JSON.stringify({ filepath })
                 });
                 const data = await res.json();
-                alert(data.message || "Recovery started! Check logs.");
-            } catch (e) { alert("Error: " + e); }
+
+                alert(data.message);
+
+                // Refresh the list to reflect changes (e.g. moved to Lost Media)
+                scanRecoveryFiles();
+
+            } catch (e) {
+                alert("Error: " + e);
+            } finally {
+                if (btn) {
+                    btn.innerHTML = originalHtml;
+                    btn.disabled = false;
+                }
+            }
         }
 
         async function deleteFile(filepath) {

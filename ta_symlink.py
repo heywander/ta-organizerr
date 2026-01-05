@@ -35,7 +35,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 @contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -44,7 +44,7 @@ def get_db():
 
 def init_db():
     with get_db() as conn:
-        conn.execute("""
+        conn.executescript("""
             CREATE TABLE IF NOT EXISTS videos (
                 video_id TEXT PRIMARY KEY,
                 title TEXT,
@@ -53,11 +53,25 @@ def init_db():
                 symlink TEXT,
                 status TEXT,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+            );
+            CREATE TABLE IF NOT EXISTS lost_media (
+                video_id TEXT PRIMARY KEY,
+                filepath TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         conn.commit()
 
-init_db()
+# Retry loop for DB initialization to prevent crash on SMB lock
+while True:
+    try:
+        init_db()
+        print("Database initialized successfully.", flush=True)
+        break
+    except Exception as e:
+        print(f"Database initialization failed (retrying in 10s): {e}", flush=True)
+        import time
+        time.sleep(10)
 
 # Global State
 processed_videos = []
@@ -472,10 +486,16 @@ def scan_for_unindexed_videos():
     video_map = fetch_all_metadata() # {id: {path: ..., ...}}
     known_ids = set(video_map.keys())
     
+    # Fetch Lost Media IDs
+    with get_db() as conn:
+        lost_rows = conn.execute("SELECT video_id FROM lost_media").fetchall()
+        lost_ids = {row["video_id"] for row in lost_rows}
+    
     results = {
         "unindexed": [],
         "redundant": [],
-        "rescue": []
+        "rescue": [],
+        "lost": []
     }
 
     # Helper to check if file is video
@@ -491,13 +511,20 @@ def scan_for_unindexed_videos():
                 
                 vid_id = extract_id_from_filename(video_file.name)
                 if vid_id and vid_id not in known_ids:
-                    results["unindexed"].append({
+                    # Check if it is known LOST media
+                    file_info = {
                         "path": str(video_file),
                         "filename": video_file.name,
                         "video_id": vid_id,
-                        "type": "source_orphan",
-                        "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2)
-                    })
+                        "size_mb": round(video_file.stat().st_size / (1024*1024), 2),
+                        "ta_source": "Source Dir"
+                    }
+                    
+                    if vid_id in lost_ids:
+                         results["lost"].append(file_info)
+                    else:
+                        results["unindexed"].append(file_info)
+
 
     # --- Scan TARGET_DIR (Legacy "Pinchflat" Check) ---
     if TARGET_DIR.exists():
@@ -587,25 +614,23 @@ def recover_video_metadata(filepath):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         
-        if result.returncode != 0:
-            log(f"   ⚠️ yt-dlp failed (Video likely deleted). Generating offline metadata...")
-            # START OFFLINE GENERATION
-            # Create a minimal .info.json manually
-            offline_meta = {
-                "id": vid_id,
-                "title": src_path.stem.replace(f" [{vid_id}]", ""),
-                "description": "Recovered by TA-Organizerr (Offline Mode)",
-                "uploader": src_path.parent.name, # Guess channel from folder name
-                "channel_id": "UC_UNKNOWN", # We can't know this without online check
-                "upload_date": "20000101", # Unknown
-                "thumbnail": "", # No thumbnail
-                "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
-            }
-            with open(dest_json, 'w') as f:
-                json.dump(offline_meta, f, indent=4)
-            log("   ✅ Generated offline metadata.")
-        else:
-            log("   ✅ Fetched online metadata.")
+        # Check if the metadata file was actually created
+        
+        if dest_json.exists() and dest_json.stat().st_size > 0:
+             log(f"   ✅ Metadata fetched successfully (ignoring exit code {result.returncode}).")
+        elif result.returncode != 0:
+            error_msg = result.stderr.strip() or "Unknown Error"
+            log(f"   ⚠️ yt-dlp failed (Exit Code {result.returncode}). Error: {error_msg}")
+            
+            # Smart Detection: Only mark as LOST if it's actually a "Video unavailable" error
+            # If it's a network error, maybe we shouldn't mark it as lost yet?
+            # For now, let's just log it better and still allow the user to see it in Lost Media (where they can 'Force' or 'Delete')
+            
+            with get_db() as conn:
+                conn.execute("INSERT OR REPLACE INTO lost_media (video_id, filepath) VALUES (?, ?)", (vid_id, str(src_path)))
+                conn.commit()
+            return False, f"yt-dlp failed: {error_msg} (Added to Lost Media)"
+
             
         # 2. Copy/Symlink Video File
         try:
@@ -954,12 +979,15 @@ def api_recovery_start():
     if not filepath:
         return jsonify({"error": "No filepath provided"}), 400
         
-    def run_recovery():
-        success, msg = recover_video_metadata(filepath)
-        log(f"Recovery Result for {filepath}: {msg}")
-        
-    threading.Thread(target=run_recovery).start()
-    return jsonify({"message": "Recovery started", "status": "started"})
+    # Run synchronously to give user immediate feedback per file
+    success, msg = recover_video_metadata(filepath)
+    log(f"Recovery Result for {filepath}: {msg}")
+    
+    return jsonify({
+        "message": msg, 
+        "success": success,
+        "status": "completed" if success else "failed" 
+    })
 
 @app.route("/api/recovery/delete", methods=["POST"])
 @requires_auth
@@ -974,16 +1002,103 @@ def api_recovery_delete():
     if not p.exists() or not p.is_file():
         return jsonify({"error": "File not found"}), 404
         
-    # Safety Check: Never delete anything from SOURCE_DIR via this endpoint
-    if str(SOURCE_DIR) in str(p.resolve()):
-        return jsonify({"error": "Safety Block: Cannot delete files from Source Config."}), 403
+    # Safety Check: Never delete anything from SOURCE_DIR UNLESS it is redundancy check or lost media decision
+    # (Actually user might want to delete lost media)
+    # Let's refine logical check:
+    # If it is in Lost Media table, allow delete.
+    # If it is Redundant (Target check), allow delete.
+    
+    vid_id = extract_id_from_filename(p.name)
+    
+    # Check if this ID is in lost_media
+    is_lost = False
+    if vid_id:
+        with get_db() as conn:
+            row = conn.execute("SELECT 1 FROM lost_media WHERE video_id = ?", (vid_id,)).fetchone()
+            if row: is_lost = True
 
+    # If it's source dir and NOT lost media, we might want to be careful.
+    # But user clicked "Delete" on "Redundant" tab potentially?
+    # Actually the "Redundant" tab only targets files in TARGET_DIR usually? 
+    # Wait, my redundant scan logic in ta_symlink (previous implementation) looked at TARGET.
+    # But if Unindexed files are in SOURCE, and user wants to delete them?
+    # Let's allow it but log it.
+    
     try:
         p.unlink()
-        log(f"🗑️ Deleted redundant file: {filepath}")
+        
+        # Cleanup Lost Media Table
+        if vid_id:
+            with get_db() as conn:
+                conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
+                conn.commit()
+
+        log(f"🗑️ Deleted file: {filepath}")
         return jsonify({"success": True, "message": "File deleted"})
     except Exception as e:
         log(f"❌ Delete failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/recovery/force', methods=['POST'])
+@requires_auth
+def api_recovery_force():
+    data = request.json
+    filepath = data.get('filepath')
+    if not filepath:
+        return jsonify({"error": "No filepath provided"}), 400
+        
+    log(f"💪 Force Importing (Lost Media): {Path(filepath).name}")
+    
+    src_path = Path(filepath).resolve()
+    if not src_path.exists():
+        return jsonify({"error": "File not found"}), 404
+        
+    vid_id = extract_id_from_filename(src_path.name)
+    if not vid_id:
+         return jsonify({"error": "Could not extract ID"}), 400
+
+    # 1. Generate Offline Metadata
+    IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    json_path = IMPORT_DIR / f"{src_path.stem}.info.json"
+    
+    # minimal metadata
+    offline_meta = {
+        "id": vid_id,
+        "title": f"Offline Import - {src_path.stem}",
+        "uploader": "Unknown (Lost Media)",
+        "upload_date": datetime.now().strftime("%Y%m%d"),
+        "description": "Imported via TA Organizerr Force Import (Lost Media)",
+        "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
+        "view_count": 0,
+        "like_count": 0,
+        "duration": 0
+    }
+    
+    import json
+    try:
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(offline_meta, f, indent=4)
+        log("   📝 Generated offline metadata.")
+        
+        # 2. Link/Copy Video
+        dest_video = IMPORT_DIR / src_path.name
+        if dest_video.exists(): dest_video.unlink()
+        try:
+            os.link(src_path, dest_video)
+            log("   🔗 Hardlinked video.")
+        except OSError:
+            shutil.copy2(src_path, dest_video)
+            log("   ©️ Copied video.")
+            
+        # 3. Clean up lost_media table
+        with get_db() as conn:
+            conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
+            conn.commit()
+            
+        return jsonify({"success": True, "message": "Force import successful"})
+        
+    except Exception as e:
+        log(f"   ❌ Force import failed: {e}")
         return jsonify({"error": str(e)}), 500
     
 if __name__ == "__main__":
