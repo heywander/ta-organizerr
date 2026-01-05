@@ -447,8 +447,13 @@
                             clearInterval(pollInterval);
                             alert("Scan Error: " + state.results);
                             resetTables("Error: " + state.results);
+                        } else if (state.status === 'idle') {
+                            // Scan state lost (server restart?)
+                            clearInterval(pollInterval);
+                            alert("Scan state lost (Server Restarted?). Please try again.");
+                            resetTables("Scan stopped / State lost.");
                         }
-                        // If 'scanning' or 'idle', keep polling...
+                        // If 'scanning', keep polling...
                     } catch (e) {
                         clearInterval(pollInterval);
                         console.error("Poll error", e);
