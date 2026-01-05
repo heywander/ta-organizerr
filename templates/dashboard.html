@@ -78,6 +78,16 @@
             text-transform: uppercase;
             letter-spacing: 1px;
         }
+
+        @keyframes spin {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        .spin-anim {
+            animation: spin 0.5s linear;
+        }
     </style>
 </head>
 
@@ -91,6 +101,9 @@
                 <span class="badge bg-secondary" id="connection-status">Connecting...</span>
             </div>
             <div>
+                <button class="btn btn-outline-secondary me-2" onclick="refreshAll()">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
                 <a href="/transcode" class="btn btn-outline-primary">
                     <i class="bi bi-film"></i> Transcode Manager
                 </a>
@@ -341,12 +354,19 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // Poll for status every 2 seconds
-        setInterval(fetchStatus, 2000);
-        // Poll for logs every 1 second
-        setInterval(fetchLogs, 1000);
+        // Initial Fetch
+        document.addEventListener('DOMContentLoaded', refreshAll);
 
         let lastLogIndex = 0;
+
+        async function refreshAll() {
+            const btn = document.querySelector('button[onclick="refreshAll()"] i');
+            if (btn) btn.classList.add('spin-anim');
+
+            await Promise.all([fetchStatus(), fetchLogs()]);
+
+            if (btn) setTimeout(() => btn.classList.remove('spin-anim'), 500);
+        }
 
         async function fetchStatus() {
             try {
