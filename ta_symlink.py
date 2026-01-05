@@ -6,7 +6,8 @@ import sys
 import threading
 import time
 import ipaddress
-from flask import Flask, jsonify, render_template, request, abort
+from functools import wraps
+from flask import Flask, jsonify, render_template, request, abort, Response
 
 # Load config from environment variables
 API_URL = os.getenv("API_URL", "http://localhost:8457/api")
@@ -14,6 +15,8 @@ VIDEO_URL = os.getenv("VIDEO_URL", "http://localhost:8457/video/")
 API_TOKEN = os.getenv("API_TOKEN", "")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60)) # Default 60 minutes
 ALLOWED_IPS = [ip.strip() for ip in os.getenv("ALLOWED_IPS", "127.0.0.1").split(",")]
+UI_USERNAME = os.getenv("UI_USERNAME", "admin")
+UI_PASSWORD = os.getenv("UI_PASSWORD", "password")
 SOURCE_DIR = Path("/app/source")
 TARGET_DIR = Path("/app/target")
 HEADERS = {"Authorization": f"Token {API_TOKEN}"}
@@ -557,11 +560,33 @@ def limit_remote_addr():
         log(f"⛔ Invalid IP format: {client_ip}, Error: {e}")
         abort(403)
 
+def check_auth(username, password):
+    """Checks whether a username/password combination is valid."""
+    return username == UI_USERNAME and password == UI_PASSWORD
+
+def authenticate():
+    """Sends a 401 response that enables basic auth"""
+    return Response(
+    'Could not verify your access level for that URL.\n'
+    'You have to login with proper credentials', 401,
+    {'WWW-Authenticate': 'Basic realm="Login Required"'})
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route("/")
+@requires_auth
 def index():
     return render_template('dashboard.html')
 
 @app.route("/api/status")
+@requires_auth
 def api_status():
     with get_db() as conn:
         # Get all videos from DB
@@ -589,6 +614,7 @@ def api_status():
         })
 
 @app.route("/api/logs")
+@requires_auth
 def api_logs():
     start = request.args.get('start', 0, type=int)
     with log_lock:
@@ -598,26 +624,31 @@ def api_logs():
         })
 
 @app.route("/api/scan", methods=["POST"])
+@requires_auth
 def api_scan():
     # Run in background to avoid blocking
     threading.Thread(target=process_videos).start()
     return jsonify({"status": "started"})
 
 @app.route("/api/cleanup", methods=["POST"])
+@requires_auth
 def api_cleanup():
     threading.Thread(target=cleanup_old_folders).start()
     return jsonify({"status": "started"})
 
 @app.route("/api/check-orphans", methods=["POST"])
+@requires_auth
 def api_check_orphans():
     orphaned = check_orphaned_links()
     return jsonify({"status": "complete", "orphaned": orphaned, "count": len(orphaned)})
 
 @app.route("/transcode")
+@requires_auth
 def transcode_page():
     return render_template('transcoding.html')
 
 @app.route("/api/transcode/videos")
+@requires_auth
 def api_transcode_videos():
     """Get all videos that need transcoding."""
     page = request.args.get('page', 1, type=int)
@@ -650,6 +681,7 @@ def api_transcode_videos():
         })
 
 @app.route("/api/transcode/start", methods=["POST"])
+@requires_auth
 def api_transcode_start():
     """Start transcoding a video."""
     data = request.get_json()
@@ -669,6 +701,7 @@ def api_transcode_start():
     return jsonify({"message": "Transcode started", "encoder": encoder})
 
 @app.route("/api/transcode/logs")
+@requires_auth
 def api_transcode_logs():
     """Get transcode logs."""
     start = request.args.get('start', 0, type=int)
