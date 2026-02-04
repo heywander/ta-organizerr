@@ -3,4 +3,7 @@ data/videos.db
 .venv/
 __pycache__/
 *.pyc
+*.tar
+*.gz
+browser-extension/
 .env
