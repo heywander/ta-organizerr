@@ -9,7 +9,7 @@ import ipaddress
 import shutil
 from datetime import datetime
 from functools import wraps
-from flask import Flask, jsonify, render_template, request, abort, Response
+from flask import Flask, jsonify, render_template, request, abort, Response, send_from_directory
 
 # Load config from environment variables
 API_URL = os.getenv("API_URL", "http://localhost:8457/api")
@@ -24,7 +24,9 @@ TARGET_DIR = Path("/app/target")
 IMPORT_DIR = Path("/app/import")
 HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 
-app = Flask(__name__)
+# Serve static files from ui/dist
+STATIC_FOLDER = os.path.join(os.getcwd(), 'ui', 'dist')
+app = Flask(__name__, static_folder=STATIC_FOLDER, static_url_path='/')
 
 # Database setup
 import sqlite3
@@ -800,7 +802,12 @@ def requires_auth(f):
 @app.route("/")
 @requires_auth
 def index():
-    return render_template('dashboard.html')
+    return send_from_directory(app.static_folder, 'index.html')
+
+@app.route('/<path:path>')
+def serve_static(path):
+    # Only serve if file exists in static folder
+    return send_from_directory(app.static_folder, path)
 
 @app.route("/api/status")
 @requires_auth
@@ -862,7 +869,7 @@ def api_check_orphans():
 @app.route("/transcode")
 @requires_auth
 def transcode_page():
-    return render_template('transcoding.html')
+    return send_from_directory(app.static_folder, 'transcode/index.html')
 
 @app.route("/api/transcode/videos")
 @requires_auth

@@ -1,0 +1,8 @@
+---
+import Layout from "../layouts/Layout.astro";
+import TranscodeManager from "../components/TranscodeManager.svelte";
+---
+
+<Layout title="Transcoding">
+    <TranscodeManager client:only="svelte" />
+</Layout>

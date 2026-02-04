@@ -1,0 +1,75 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cyber-dark: #050510;
+  --color-cyber-darker: #020205;
+  --color-cyber-card: #0a0a1a;
+  --color-neon-cyan: #00f3ff;
+  --color-neon-pink: #ff00ff;
+  --color-neon-green: #39ff14;
+  --color-neon-yellow: #ffff00;
+}
+
+:root {
+  --bg-dark: #050510;
+  --bg-card: #0a0a1a;
+  --text-main: #e0e0e0;
+
+  --neon-cyan: #00f3ff;
+  --neon-pink: #ff00ff;
+  --neon-green: #39ff14;
+  --neon-yellow: #ffee00;
+}
+
+body {
+  background-color: var(--bg-dark);
+  color: var(--text-main);
+  font-family: 'Inter', system-ui, sans-serif;
+  overflow-x: hidden;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-dark);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--neon-cyan);
+}
+
+/* Utilities */
+.neon-border-cyan {
+  box-shadow: 0 0 5px var(--neon-cyan), inset 0 0 2px var(--neon-cyan);
+  border: 1px solid var(--neon-cyan);
+}
+
+.neon-text-cyan {
+  color: var(--neon-cyan);
+  text-shadow: 0 0 5px var(--neon-cyan);
+}
+
+.neon-border-pink {
+  box-shadow: 0 0 5px var(--neon-pink), inset 0 0 2px var(--neon-pink);
+  border: 1px solid var(--neon-pink);
+}
+
+.neon-text-pink {
+  color: var(--neon-pink);
+  text-shadow: 0 0 5px var(--neon-pink);
+}
+
+.glass-panel {
+  background: rgba(10, 10, 26, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}

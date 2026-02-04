@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TubeArchivist Companion</title>
+    <link rel="stylesheet" href="https://fonts.googleapi.com/css?family=Sen" type="text/css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="logo">
+            <a href="#" id="ta-url" target="_blank">
+                <img src="/images/logo.png" alt="ta-logo">
+            </a>
+            <span>v0.4.2</span>
+        </div>
+        <hr>
+        <form class="login-form">
+            <label for="full-url">Tube Archivist URL:</label>
+            <input type="text" id="full-url" name="url">
+            <label for="api-key">Tube Archivist API Key:</label>
+            <input type="password" id="api-key" name="api-key">
+        </form>
+        <div class="submit">
+            <button id="save-login">Save</button><span id="status-icon">&#9744;</span>
+        </div>
+        <div id="error-out"></div>
+        <hr>
+        <p>Cookies:</p>
+        <div class="options">
+            <div>
+                <p>TA cookies: <span id="sendCookiesStatus" /></p>
+            </div>
+            <div>
+                <input type="checkbox" id="continuous-sync" name="continuous-sync">
+                <span>Continuous Cookie Sync</span>
+            </div>
+            <button id="sendCookies">Copy Now</button>
+            <button id="showCookies">Show Cookie</button><br>
+            <textarea id="cookieLinesResponse" readonly></textarea>
+        </div>
+        <p>Download:</p>
+        <div class="options">
+            <div>
+                <input type="checkbox" id="autostart" name="autostart">
+                <span>Autostart Downloads</span>
+            </div>
+        </div>
+        <hr>
+        <div class="icons">
+            <div>
+                <a href="https://www.reddit.com/r/TubeArchivist/" target="_blank">
+                    <img src="/images/social/reddit.svg" alt="reddit-icon"></a>
+                <a href="https://www.tubearchivist.com/discord" target="_blank">
+                    <img src="/images/social/discord.svg" alt="discord-icon"></a>
+                <a href="https://github.com/tubearchivist/browser-extension/" target="_blank">
+                    <img src="/images/social/github.svg" alt="github-icon">
+                </a>
+            </div>
+            <div>
+                <a href="https://github.com/tubearchivist/browser-extension/issues">
+                    <img src="/images/question.svg" alt="question-icon">
+                </a>
+            </div>
+        </div>
+    </div>
+    <script type="text/javascript" src="popup.js"></script>
+</body>
+</html>

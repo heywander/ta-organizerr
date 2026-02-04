@@ -1,8 +1,6 @@
+fix_docker_state.sh
+data/videos.db
+.venv/
 __pycache__/
 *.pyc
 .env
-*.tar
-*.gz
-# Docker
-Dockerfile
-browser-extension/
