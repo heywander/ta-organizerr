@@ -13,10 +13,6 @@ services:
     environment:
       - SCAN_INTERVAL=60
       - ALLOWED_IPS=127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12
-      - API_URL=http://host.docker.internal:8457/api # Update this if Tube Archivist is on a different IP/Port
-      - VIDEO_URL=http://host.docker.internal:8457/video/
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
       # - UI_USERNAME=admin
       # - UI_PASSWORD=password
-      # env_file: .env
+    env_file: .env
