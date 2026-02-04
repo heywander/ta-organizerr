@@ -10,7 +10,7 @@
         if (!confirm("Start full library scan?")) return;
         scanning = true;
         try {
-            await fetch("http://localhost:8002/api/scan", { method: "POST" });
+            await fetch("/api/scan", { method: "POST" });
             dispatch("scan");
             // Reset scanning state after a bit since it's async background
             setTimeout(() => (scanning = false), 2000);
@@ -24,7 +24,7 @@
         checkingOrphans = true;
         orphanResult = "Measuring quantum fluctuations (scanning)...";
         try {
-            const res = await fetch("http://localhost:8002/api/check-orphans", {
+            const res = await fetch("/api/check-orphans", {
                 method: "POST",
             });
             const data = await res.json();

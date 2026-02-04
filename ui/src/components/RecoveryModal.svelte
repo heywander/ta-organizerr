@@ -11,7 +11,7 @@
     async function startScan() {
         scanning = true;
         try {
-            await fetch("http://localhost:8002/api/recovery/scan", {
+            await fetch("/api/recovery/scan", {
                 method: "POST",
             });
             pollResults();
@@ -25,9 +25,7 @@
         if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(async () => {
             try {
-                const res = await fetch(
-                    "http://localhost:8002/api/recovery/poll",
-                );
+                const res = await fetch("/api/recovery/poll");
                 const data = await res.json();
                 status = data.status;
                 if (data.status === "done") {
@@ -53,14 +51,11 @@
         // Implementation mirrors existing JS logic
         if (!isBatch && !confirm("Recover this file?")) return;
         try {
-            const res = await fetch(
-                "http://localhost:8002/api/recovery/start",
-                {
-                    method: "POST",
-                    body: JSON.stringify({ filepath: path }),
-                    headers: { "Content-Type": "application/json" },
-                },
-            );
+            const res = await fetch("/api/recovery/start", {
+                method: "POST",
+                body: JSON.stringify({ filepath: path }),
+                headers: { "Content-Type": "application/json" },
+            });
             const d = await res.json();
             if (!isBatch) {
                 alert(d.message);
@@ -74,14 +69,11 @@
     async function deleteFile(path: string) {
         if (!confirm("Delete file? This cannot be undone.")) return;
         try {
-            const res = await fetch(
-                "http://localhost:8002/api/recovery/delete",
-                {
-                    method: "POST",
-                    body: JSON.stringify({ filepath: path }),
-                    headers: { "Content-Type": "application/json" },
-                },
-            );
+            const res = await fetch("/api/recovery/delete", {
+                method: "POST",
+                body: JSON.stringify({ filepath: path }),
+                headers: { "Content-Type": "application/json" },
+            });
             const d = await res.json();
             if (d.success) {
                 alert("Deleted.");

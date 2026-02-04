@@ -12,7 +12,7 @@
         loading = true;
         try {
             const res = await fetch(
-                `http://localhost:8002/api/transcode/videos?page=${p}&per_page=100`,
+                `/api/transcode/videos?page=${p}&per_page=100`,
             );
             const data = await res.json();
             videos = data.videos || [];
@@ -29,14 +29,11 @@
     async function startTranscode(filepath: string) {
         if (!confirm("Start transcoding?")) return;
         try {
-            const res = await fetch(
-                "http://localhost:8002/api/transcode/start",
-                {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ filepath }),
-                },
-            );
+            const res = await fetch("/api/transcode/start", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ filepath }),
+            });
             const d = await res.json();
             alert(d.message);
         } catch (e) {
@@ -49,7 +46,7 @@
         if (!confirm("Scan for missing videos?")) return;
         loading = true;
         try {
-            const res = await fetch("http://localhost:8002/api/check-orphans", {
+            const res = await fetch("/api/check-orphans", {
                 method: "POST",
             });
             const d = await res.json();
@@ -179,10 +176,7 @@
         </div>
 
         <div class="lg:col-span-1">
-            <LogViewer
-                endpoint="http://localhost:8002/api/transcode/logs"
-                title="TRANSCODE_LOGS"
-            />
+            <LogViewer endpoint="/api/transcode/logs" title="TRANSCODE_LOGS" />
         </div>
     </div>
 </div>

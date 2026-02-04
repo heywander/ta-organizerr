@@ -21,7 +21,7 @@
 
     async function fetchData() {
         try {
-            const res = await fetch("http://localhost:8002/api/status");
+            const res = await fetch("/api/status");
             if (!res.ok) throw new Error("Failed to fetch status");
             const data = await res.json();
 

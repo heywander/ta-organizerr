@@ -30,7 +30,7 @@
 
     async function fetchStats() {
         try {
-            const res = await fetch("http://localhost:8002/api/status");
+            const res = await fetch("/api/status");
             if (!res.ok) return;
             const data = await res.json();
             stats = {

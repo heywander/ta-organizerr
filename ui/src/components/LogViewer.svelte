@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onMount, onDestroy } from "svelte";
 
-    export let endpoint = "http://localhost:8002/api/logs";
+    export let endpoint = "/api/logs";
     export let title = "SYSTEM_LOGS";
 
     let logs: string[] = [];
