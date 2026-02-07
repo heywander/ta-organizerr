@@ -715,6 +715,11 @@ def process_videos():
                 # Check if channel exists in the WRONG place and MOVE it (Migration/Toggle)
                 wrong_channel_dir = other_root / sanitized_channel_name
                 correct_channel_dir = target_root / sanitized_channel_name
+
+                # DEBUG LOGGING (Temporary)
+                if meta["channel_name"] in hidden_channels:
+                     log(f"DEBUG: Checking {meta['channel_name']} (Hidden). Wrong Dir: {wrong_channel_dir}, Exists? {wrong_channel_dir.exists()}")
+
                 
                 if wrong_channel_dir.exists():
                     try:
