@@ -21,6 +21,7 @@ UI_USERNAME = os.getenv("UI_USERNAME", "admin")
 UI_PASSWORD = os.getenv("UI_PASSWORD", "password")
 SOURCE_DIR = Path("/app/source")
 TARGET_DIR = Path("/app/target")
+HIDDEN_DIR = Path("/app/hidden")
 IMPORT_DIR = Path("/app/import")
 HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 
@@ -60,6 +61,9 @@ def init_db():
                 video_id TEXT PRIMARY KEY,
                 filepath TEXT,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS hidden_channels (
+                channel_name TEXT PRIMARY KEY
             );
         """)
         conn.commit()
@@ -667,7 +671,19 @@ def process_videos():
     # 1. Fetch all metadata first
     video_map = fetch_all_metadata()
     
-    # 2. Run cleanup
+    # Get hidden channels
+    hidden_channels = set()
+    with get_db() as conn:
+        rows = conn.execute("SELECT channel_name FROM hidden_channels").fetchall()
+        hidden_channels = {row["channel_name"] for row in rows}
+
+    # Ensure hidden directory exists
+    HIDDEN_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # 2. Run cleanup (On both target and hidden)
+    # We need to adapt cleanup to handle hidden too, or just run it on both explicitly if we update the function
+    # Let's keep it simple for now and rely on logic below to move things
+
     cleanup_old_folders()
     
     # Statistics
@@ -690,51 +706,69 @@ def process_videos():
                     if not meta:
                         continue
                     sanitized_channel_name = sanitize(meta["channel_name"])
-                    channel_dir = TARGET_DIR / sanitized_channel_name
-                    channel_dir.mkdir(parents=True, exist_ok=True)
-                    sanitized_title = sanitize(meta["title"])
-                    folder_name = f"{meta['published']} - {sanitized_title}"
-                    video_dir = channel_dir / folder_name
-                    video_dir.mkdir(parents=True, exist_ok=True)
-                    actual_file = next(channel_path.glob(f"{video_id}.*"), None)
-                    if not actual_file:
-                        continue
-                    host_path_root = Path("/mnt/user/tubearchives/bp")
-                    host_source_path = host_path_root / actual_file.relative_to(SOURCE_DIR)
-                    dest_file = video_dir / f"video{actual_file.suffix}"
+                
+                # Determine target root
+                is_hidden = meta["channel_name"] in hidden_channels
+                target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
+                other_root = TARGET_DIR if is_hidden else HIDDEN_DIR
+                
+                # Check if channel exists in the WRONG place and remove it (Migration/Toggle)
+                wrong_channel_dir = other_root / sanitized_channel_name
+                if wrong_channel_dir.exists():
                     try:
-                        if dest_file.exists():
-                            if dest_file.is_symlink():
-                                current_target = Path(os.readlink(dest_file))
-                                if current_target.resolve() != host_source_path.resolve():
-                                    dest_file.unlink()
-                                    os.symlink(host_source_path, dest_file)
-                                    log(f"   [FIX] Relinked: {folder_name}")
-                                    new_links += 1
-                                else:
-                                    verified_links += 1
+                        shutil.rmtree(wrong_channel_dir)
+                        log(f"   [MOVE] Removed {sanitized_channel_name} from {other_root.name} (Status Change)")
+                    except Exception as e:
+                        log(f"   ❌ Failed to move/delete {sanitized_channel_name} from old location: {e}")
+
+                channel_dir = target_root / sanitized_channel_name
+                channel_dir.mkdir(parents=True, exist_ok=True)
+                sanitized_title = sanitize(meta["title"])
+                folder_name = f"{meta['published']} - {sanitized_title}"
+                video_dir = channel_dir / folder_name
+                video_dir.mkdir(parents=True, exist_ok=True)
+                actual_file = next(channel_path.glob(f"{video_id}.*"), None)
+                if not actual_file:
+                    continue
+                host_path_root = Path("/mnt/user/tubearchives/bp")
+                host_source_path = host_path_root / actual_file.relative_to(SOURCE_DIR)
+                dest_file = video_dir / f"video{actual_file.suffix}"
+                try:
+                    if dest_file.exists():
+                        if dest_file.is_symlink():
+                            current_target = Path(os.readlink(dest_file))
+                            if current_target.resolve() != host_source_path.resolve():
+                                dest_file.unlink()
+                                os.symlink(host_source_path, dest_file)
+                                log(f"   [FIX] Relinked: {folder_name}")
+                                new_links += 1
+                            else:
+                                verified_links += 1
                         else:
-                            os.symlink(host_source_path, dest_file)
-                            log(f"   [NEW] Linked: {folder_name}")
-                            new_links += 1
-                    except Exception:
-                        pass
-                    
-                    # Store in database
-                    conn.execute("""
-                        INSERT OR REPLACE INTO videos 
-                        (video_id, title, channel, published, symlink, status)
-                        VALUES (?, ?, ?, ?, ?, 'linked')
-                    """, (video_id, meta["title"], meta["channel_name"], 
-                          meta["published"], str(dest_file)))
-                    
-                    processed_videos.append({
-                        "video_id": video_id,
-                        "title": meta["title"],
-                        "channel": meta["channel_name"],
-                        "published": meta["published"],
-                        "symlink": str(dest_file)
-                    })
+                            # It's a file or something else, replace it? No, unsafe.
+                            pass
+                    else:
+                        os.symlink(host_source_path, dest_file)
+                        log(f"   [NEW] Linked: {folder_name}")
+                        new_links += 1
+                except Exception:
+                    pass
+                
+                # Store in database
+                conn.execute("""
+                    INSERT OR REPLACE INTO videos 
+                    (video_id, title, channel, published, symlink, status)
+                    VALUES (?, ?, ?, ?, ?, 'linked')
+                """, (video_id, meta["title"], meta["channel_name"], 
+                        meta["published"], str(dest_file)))
+                
+                processed_videos.append({
+                    "video_id": video_id,
+                    "title": meta["title"],
+                    "channel": meta["channel_name"],
+                    "published": meta["published"],
+                    "symlink": str(dest_file)
+                })
         except Exception as e:
             conn.rollback()
             return str(e)
@@ -1104,9 +1138,46 @@ def api_recovery_force():
             
         return jsonify({"success": True, "message": "Force import successful"})
         
-    except Exception as e:
         log(f"   ❌ Force import failed: {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/hidden", methods=["GET"])
+@requires_auth
+def api_get_hidden():
+    with get_db() as conn:
+        rows = conn.execute("SELECT channel_name FROM hidden_channels ORDER BY channel_name").fetchall()
+        channels = [row["channel_name"] for row in rows]
+    return jsonify({"channels": channels})
+
+@app.route("/api/hidden", methods=["POST"])
+@requires_auth
+def api_add_hidden():
+    data = request.json
+    channel = data.get("channel")
+    if not channel:
+        return jsonify({"error": "No channel name provided"}), 400
+    
+    with get_db() as conn:
+        conn.execute("INSERT OR IGNORE INTO hidden_channels (channel_name) VALUES (?)", (channel,))
+        conn.commit()
+    
+    log(f"🙈 Added to hidden list: {channel}")
+    return jsonify({"success": True})
+
+@app.route("/api/hidden", methods=["DELETE"])
+@requires_auth
+def api_remove_hidden():
+    data = request.json
+    channel = data.get("channel")
+    if not channel:
+        return jsonify({"error": "No channel name provided"}), 400
+        
+    with get_db() as conn:
+        conn.execute("DELETE FROM hidden_channels WHERE channel_name = ?", (channel,))
+        conn.commit()
+    
+    log(f"👁️ Removed from hidden list: {channel}")
+    return jsonify({"success": True})
     
 if __name__ == "__main__":
     # Start scheduler in background thread

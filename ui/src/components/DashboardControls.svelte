@@ -75,6 +75,13 @@
         >
             <i class="bi bi-bandaid"></i> Recovery Mode
         </button>
+
+        <button
+            class="btn-cyber-secondary py-3 text-sm font-semibold border border-purple-500/30 text-purple-400 hover:bg-purple-500/10 transition-colors rounded-lg flex items-center justify-center gap-2 col-span-2"
+            on:click={() => dispatch("openHidden")}
+        >
+            <i class="bi bi-eye-slash"></i> Hidden Channels
+        </button>
     </div>
 
     {#if orphanResult}

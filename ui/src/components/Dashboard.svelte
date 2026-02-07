@@ -5,6 +5,7 @@
     import VideoTable from "./VideoTable.svelte";
     import DashboardControls from "./DashboardControls.svelte";
     import RecoveryModal from "./RecoveryModal.svelte";
+    import HiddenManager from "./HiddenManager.svelte";
 
     let stats = {
         total_videos: 0,
@@ -16,6 +17,7 @@
     let loading = true;
     let error: string | null = null;
     let showRecovery = false;
+    let showHiddenManager = false;
 
     let interval: ReturnType<typeof setInterval>;
 
@@ -102,6 +104,7 @@
                 <DashboardControls
                     on:scan={handleScanTriggered}
                     on:openRecovery={() => (showRecovery = true)}
+                    on:openHidden={() => (showHiddenManager = true)}
                 />
             </div>
 
@@ -115,5 +118,9 @@
 
     {#if showRecovery}
         <RecoveryModal on:close={() => (showRecovery = false)} />
+    {/if}
+
+    {#if showHiddenManager}
+        <HiddenManager on:close={() => (showHiddenManager = false)} />
     {/if}
 </div>

@@ -6,6 +6,7 @@ services:
     volumes:
       - ./source:/app/source
       - ./target:/app/target
+      - ./hidden:/app/hidden
       - ./data:/app/data
       - ./import:/app/import
     ports:
