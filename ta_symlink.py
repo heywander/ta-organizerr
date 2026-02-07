@@ -712,14 +712,42 @@ def process_videos():
                 target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
                 other_root = TARGET_DIR if is_hidden else HIDDEN_DIR
                 
-                # Check if channel exists in the WRONG place and remove it (Migration/Toggle)
+                # Check if channel exists in the WRONG place and MOVE it (Migration/Toggle)
                 wrong_channel_dir = other_root / sanitized_channel_name
+                correct_channel_dir = target_root / sanitized_channel_name
+                
                 if wrong_channel_dir.exists():
                     try:
-                        shutil.rmtree(wrong_channel_dir)
-                        log(f"   [MOVE] Removed {sanitized_channel_name} from {other_root.name} (Status Change)")
+                        # If destination already exists, we have a conflict.
+                        # Strategy: Merge move?
+                        # Simplest robust way: 
+                        # 1. Ensure dest exists
+                        # 2. Move contents?
+                        # Or just shutil.move(src, dst) which works if dst doesn't exist.
+                        
+                        if not correct_channel_dir.exists():
+                            shutil.move(str(wrong_channel_dir), str(correct_channel_dir))
+                            log(f"   [MOVE] Moved {sanitized_channel_name} to {target_root.name} (Status Change)")
+                        else:
+                            # Destination exists. We must merge.
+                            # Move items one by one.
+                            for item in wrong_channel_dir.iterdir():
+                                dest_item = correct_channel_dir / item.name
+                                if not dest_item.exists():
+                                    shutil.move(str(item), str(dest_item))
+                                else:
+                                    # Conflict. If it's a folder, we could recurse, but let's just log warning and skip?
+                                    # If it's a file/symlink, we skip (it will be regenerated/verified later by the loop)
+                                    pass
+                            
+                            # Now remove the empty source dir
+                            try:
+                                wrong_channel_dir.rmdir() 
+                            except OSError:
+                                log(f"   ⚠️ Could not remove old dir {wrong_channel_dir} (not empty?)")
+
                     except Exception as e:
-                        log(f"   ❌ Failed to move/delete {sanitized_channel_name} from old location: {e}")
+                        log(f"   ❌ Failed to move {sanitized_channel_name} from old location: {e}")
 
                 channel_dir = target_root / sanitized_channel_name
                 channel_dir.mkdir(parents=True, exist_ok=True)
@@ -1138,6 +1166,7 @@ def api_recovery_force():
             
         return jsonify({"success": True, "message": "Force import successful"})
         
+    except Exception as e:
         log(f"   ❌ Force import failed: {e}")
         return jsonify({"error": str(e)}), 500
 
