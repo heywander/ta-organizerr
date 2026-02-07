@@ -685,6 +685,74 @@ def process_videos():
     # Let's keep it simple for now and rely on logic below to move things
 
     cleanup_old_folders()
+
+    # 3. Enforce Hidden Logic (Independent of Source)
+    # This ensures that even if files aren't in source (e.g. preserved in target), they still get moved.
+    log("🙈 Enforcing hidden channel status...")
+    
+    # Move Hidden FROM Target TO Hidden
+    if TARGET_DIR.exists():
+        for channel_dir in TARGET_DIR.iterdir():
+            if not channel_dir.is_dir(): continue
+            
+            # We need to match the folder name to the channel name.
+            # Since folder names are sanitized, we might not know the original name easily.
+            # BUT, we can check if the folder name *matches the sanitized version* of any hidden channel.
+            
+            # Optimization: Create a set of sanitized hidden names
+            sanitized_hidden = {sanitize(name) for name in hidden_channels}
+            
+            if channel_dir.name in sanitized_hidden:
+                # It is hidden, but in target! Move it.
+                dest = HIDDEN_DIR / channel_dir.name
+                try:
+                    log(f"   [MOVE] Found hidden channel in Public: {channel_dir.name}")
+                    if not dest.exists():
+                        shutil.move(str(channel_dir), str(dest))
+                        log(f"   ---> Moved to Hidden")
+                    else:
+                        # Merge logic
+                        for item in channel_dir.iterdir():
+                            dest_item = dest / item.name
+                            if not dest_item.exists():
+                                shutil.move(str(item), str(dest_item))
+                        try:
+                            channel_dir.rmdir()
+                            log(f"   ---> Merged to Hidden")
+                        except:
+                            log(f"   ---> Merged to Hidden (Old dir not empty)")
+                except Exception as e:
+                    log(f"   ❌ Error moving {channel_dir.name}: {e}")
+
+    # Move Public FROM Hidden TO Target
+    if HIDDEN_DIR.exists():
+        for channel_dir in HIDDEN_DIR.iterdir():
+            if not channel_dir.is_dir(): continue
+            
+            # Optimization: Create a set of sanitized hidden names
+            sanitized_hidden = {sanitize(name) for name in hidden_channels}
+            
+            if channel_dir.name not in sanitized_hidden:
+                # It is NOT hidden, but needs to be in Public!
+                dest = TARGET_DIR / channel_dir.name
+                try:
+                    log(f"   [MOVE] Found public channel in Hidden: {channel_dir.name}")
+                    if not dest.exists():
+                        shutil.move(str(channel_dir), str(dest))
+                        log(f"   ---> Moved to Public")
+                    else:
+                        # Merge logic
+                        for item in channel_dir.iterdir():
+                            dest_item = dest / item.name
+                            if not dest_item.exists():
+                                shutil.move(str(item), str(dest_item))
+                        try:
+                            channel_dir.rmdir()
+                            log(f"   ---> Merged to Public")
+                        except:
+                            log(f"   ---> Merged to Public (Old dir not empty)")
+                except Exception as e:
+                    log(f"   ❌ Error moving {channel_dir.name}: {e}")
     
     # Statistics
     new_links = 0
