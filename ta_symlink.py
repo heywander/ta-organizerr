@@ -55,9 +55,9 @@ def init_db():
                 video_id TEXT PRIMARY KEY,
                 title TEXT,
                 channel TEXT,
-                published TEXT,
                 symlink TEXT,
                 status TEXT,
+                is_live BOOLEAN DEFAULT 0,
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS lost_media (
@@ -364,6 +364,7 @@ def fetch_all_metadata():
                     "title": title,
                     "channel_name": channel_name,
                     "published": published,
+                    "is_live": video.get("is_live", False),
                     "filesystem_path": video.get("path") or video.get("filesystem_path")
                 }
             
@@ -849,6 +850,11 @@ def process_videos():
 
                     # Folder Creation (Delay until link check)
                     channel_dir = target_root / sanitized_channel_name
+                    
+                    # Stream Organization
+                    if meta.get("is_live"):
+                        channel_dir = channel_dir / "#streams"
+                        
                     sanitized_title = sanitize(meta["title"])
                     folder_name = f"{meta['published']} - {sanitized_title}"
                     video_dir = channel_dir / folder_name
@@ -885,10 +891,10 @@ def process_videos():
                     # Store in database
                     conn.execute("""
                         INSERT OR REPLACE INTO videos 
-                        (video_id, title, channel, published, symlink, status)
-                        VALUES (?, ?, ?, ?, ?, 'linked')
+                        (video_id, title, channel, published, symlink, is_live, status)
+                        VALUES (?, ?, ?, ?, ?, ?, 'linked')
                     """, (video_id, meta["title"], meta["channel_name"], 
-                            meta["published"], str(dest_file)))
+                            meta["published"], str(dest_file), 1 if meta.get("is_live") else 0))
                     
                     processed_videos.append({
                         "video_id": video_id,
@@ -1443,7 +1449,8 @@ def api_get_channel_videos():
             "path": row['symlink'],
             "filename": Path(row['symlink']).name if row['symlink'] else meta.get('title'),
             "source_path": meta.get('filesystem_path'),
-            "ta_source": meta.get('channel_name', channel_name)
+            "ta_source": meta.get('channel_name', channel_name),
+            "is_live": bool(row.get('is_live', 0))
         })
         
     return jsonify(videos)
