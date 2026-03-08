@@ -55,6 +55,7 @@ def init_db():
                 video_id TEXT PRIMARY KEY,
                 title TEXT,
                 channel TEXT,
+                published TEXT,
                 symlink TEXT,
                 status TEXT,
                 is_live BOOLEAN DEFAULT 0,
@@ -69,6 +70,17 @@ def init_db():
                 channel_name TEXT PRIMARY KEY
             );
         """)
+        
+        # Migration: Add is_live if it doesn't exist
+        try:
+            conn.execute("ALTER TABLE videos ADD COLUMN is_live BOOLEAN DEFAULT 0")
+        except: pass
+
+        # Migration: Add published if it doesn't exist
+        try:
+            conn.execute("ALTER TABLE videos ADD COLUMN published TEXT")
+        except: pass
+
         conn.commit()
 
 # Retry loop for DB initialization to prevent crash on SMB lock
@@ -146,6 +158,12 @@ def tlog(msg):
         transcode_log_buffer.append(msg)
         if len(transcode_log_buffer) > 500:
             transcode_log_buffer.pop(0)
+
+# Helper to check if file is video
+def is_video(f):
+    if isinstance(f, str):
+        f = Path(f)
+    return f.suffix.lower() in ['.mp4', '.mkv', '.webm', '.mov', '.avi']
 
 def detect_encoder():
     """Detect best available hardware encoder."""
@@ -552,9 +570,12 @@ def scan_for_unindexed_videos():
         "lost": []
     }
 
-    # Helper to check if file is video
-    def is_video(f):
-        return f.suffix.lower() in ['.mp4', '.mkv', '.webm', '.mov']
+    results = {
+        "unindexed": [],
+        "redundant": [],
+        "rescue": [],
+        "lost": []
+    }
 
     # --- Scan SOURCE_DIR (Standard Orphan Check) ---
     if SOURCE_DIR.exists():
@@ -815,7 +836,14 @@ def process_videos():
                 if not channel_path.is_dir():
                     continue
                 for video_file in channel_path.glob("*.*"):
-                    video_id = video_file.stem
+                    if not is_video(video_file):
+                        continue
+                        
+                    # Robust ID Extraction
+                    video_id = extract_id_from_filename(video_file.name)
+                    if not video_id:
+                        # Fallback for old simple-name format
+                        video_id = video_file.stem
                     
                     # Lookup in local map
                     meta = video_map.get(video_id)
