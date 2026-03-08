@@ -344,53 +344,55 @@ def fetch_all_metadata():
 
 def cleanup_old_folders():
     """
-    Scans TARGET_DIR for folders containing '+00:00'.
-    Safely deletes them ONLY if they contain no real files (only symlinks or empty).
+    Scans both TARGET_DIR and HIDDEN_DIR for empty or orphaned folders.
+    Safely deletes them if they contain no real files.
     """
-    log("🧹 Starting cleanup. Scanning ONLY for folders containing '+00:00'...")
+    log("🧹 Starting aggressive cleanup of empty folders...")
     cleaned_count = 0
-    skipped_count = 0
     
-    if not TARGET_DIR.exists():
-        return
-
-    # Walk top-down
-    for channel_dir in TARGET_DIR.iterdir():
-        if not channel_dir.is_dir():
+    for root in [TARGET_DIR, HIDDEN_DIR]:
+        if not root.exists():
             continue
             
-        for video_dir in channel_dir.iterdir():
-            if not video_dir.is_dir():
+        # Walk top-down: Channels
+        for channel_dir in root.iterdir():
+            if not channel_dir.is_dir():
                 continue
                 
-            if "+00:00" in video_dir.name:
-                # Check safety
+            # Videos
+            for video_dir in list(channel_dir.iterdir()): # List to allow removal
+                if not video_dir.is_dir():
+                    continue
+                    
+                # Check if it contains any real files
                 safe_to_delete = True
-                reason = ""
-                
                 for item in video_dir.iterdir():
                     if not item.is_symlink():
-                        # Found a real file! Unsafe!
                         safe_to_delete = False
-                        reason = "Contains real files"
                         break
                 
                 if safe_to_delete:
                     try:
                         # Remove all symlinks first
-                        for item in video_dir.iterdir():
+                        for item in list(video_dir.iterdir()):
                             item.unlink()
-                        # Remove directory
+                        # Remove video directory
                         video_dir.rmdir()
-                        log(f"   [DELETED] {video_dir.name}")
+                        log(f"   [DELETED VIDEO] {video_dir.name}")
                         cleaned_count += 1
                     except Exception as e:
-                        log(f"   ❌ Failed to delete {video_dir.name}: {e}")
-                else:
-                    log(f"   ⚠️ SKIPPING {video_dir.name} - {reason}")
-                    skipped_count += 1
+                        pass # Likely not empty
+            
+            # After cleaning videos, try to clean the channel dir itself if empty
+            try:
+                if channel_dir.exists() and not any(channel_dir.iterdir()):
+                    channel_dir.rmdir()
+                    log(f"   [DELETED CHANNEL] {channel_dir.name}")
+                    cleaned_count += 1
+            except Exception:
+                pass
                     
-    log(f"🧹 Cleanup complete. Removed: {cleaned_count}, Skipped: {skipped_count}")
+    log(f"🧹 Cleanup complete. Removed {cleaned_count} empty/orphaned directories.")
 
 def check_orphaned_links():
     """
@@ -774,103 +776,82 @@ def process_videos():
                     meta = video_map.get(video_id)
                     if not meta:
                         continue
-                    sanitized_channel_name = sanitize(meta["channel_name"])
-                
-                # Determine target root
-                is_hidden = meta["channel_name"] in hidden_channels
-                target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
-                other_root = TARGET_DIR if is_hidden else HIDDEN_DIR
-                
-                # Check if channel exists in the WRONG place and MOVE it (Migration/Toggle)
-                wrong_channel_dir = other_root / sanitized_channel_name
-                correct_channel_dir = target_root / sanitized_channel_name
-
-                # DEBUG LOGGING (Temporary)
-                if meta["channel_name"] in hidden_channels:
-                     log(f"DEBUG: Checking {meta['channel_name']} (Hidden). Wrong Dir: {wrong_channel_dir}, Exists? {wrong_channel_dir.exists()}")
-
-                
-                if wrong_channel_dir.exists():
-                    try:
-                        # If destination already exists, we have a conflict.
-                        # Strategy: Merge move?
-                        # Simplest robust way: 
-                        # 1. Ensure dest exists
-                        # 2. Move contents?
-                        # Or just shutil.move(src, dst) which works if dst doesn't exist.
                         
-                        if not correct_channel_dir.exists():
-                            shutil.move(str(wrong_channel_dir), str(correct_channel_dir))
-                            log(f"   [MOVE] Moved {sanitized_channel_name} to {target_root.name} (Status Change)")
-                        else:
-                            # Destination exists. We must merge.
-                            # Move items one by one.
-                            for item in wrong_channel_dir.iterdir():
-                                dest_item = correct_channel_dir / item.name
-                                if not dest_item.exists():
-                                    shutil.move(str(item), str(dest_item))
-                                else:
-                                    # Conflict. If it's a folder, we could recurse, but let's just log warning and skip?
-                                    # If it's a file/symlink, we skip (it will be regenerated/verified later by the loop)
-                                    pass
-                            
-                            # Now remove the empty source dir
-                            try:
-                                wrong_channel_dir.rmdir() 
-                            except OSError:
-                                log(f"   ⚠️ Could not remove old dir {wrong_channel_dir} (not empty?)")
-
-                    except Exception as e:
-                        log(f"   ❌ Failed to move {sanitized_channel_name} from old location: {e}")
-
-                channel_dir = target_root / sanitized_channel_name
-                channel_dir.mkdir(parents=True, exist_ok=True)
-                sanitized_title = sanitize(meta["title"])
-                folder_name = f"{meta['published']} - {sanitized_title}"
-                video_dir = channel_dir / folder_name
-                video_dir.mkdir(parents=True, exist_ok=True)
-                actual_file = next(channel_path.glob(f"{video_id}.*"), None)
-                if not actual_file:
-                    continue
-                host_path_root = Path("/mnt/user/tubearchives/bp")
-                host_source_path = host_path_root / actual_file.relative_to(SOURCE_DIR)
-                dest_file = video_dir / f"video{actual_file.suffix}"
-                try:
-                    if dest_file.exists():
-                        if dest_file.is_symlink():
-                            current_target = Path(os.readlink(dest_file))
-                            if current_target.resolve() != host_source_path.resolve():
-                                dest_file.unlink()
-                                os.symlink(host_source_path, dest_file)
-                                log(f"   [FIX] Relinked: {folder_name}")
-                                new_links += 1
+                    sanitized_channel_name = sanitize(meta["channel_name"])
+                    is_hidden = meta["channel_name"] in hidden_channels
+                    target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
+                    other_root = TARGET_DIR if is_hidden else HIDDEN_DIR
+                    
+                    # Migration Logic
+                    wrong_channel_dir = other_root / sanitized_channel_name
+                    correct_channel_dir = target_root / sanitized_channel_name
+                    
+                    if wrong_channel_dir.exists():
+                        try:
+                            if not correct_channel_dir.exists():
+                                shutil.move(str(wrong_channel_dir), str(correct_channel_dir))
+                                log(f"   [MOVE] Migrated {sanitized_channel_name} to {target_root.name}")
                             else:
-                                verified_links += 1
+                                for item in list(wrong_channel_dir.iterdir()):
+                                    dest_item = correct_channel_dir / item.name
+                                    if not dest_item.exists():
+                                        shutil.move(str(item), str(dest_item))
+                                try:
+                                    wrong_channel_dir.rmdir() 
+                                except OSError:
+                                    pass
+                        except Exception as e:
+                            log(f"   ❌ Migration error for {sanitized_channel_name}: {e}")
+
+                    # Folder Creation & Linking
+                    channel_dir = target_root / sanitized_channel_name
+                    sanitized_title = sanitize(meta["title"])
+                    folder_name = f"{meta['published']} - {sanitized_title}"
+                    video_dir = channel_dir / folder_name
+                    
+                    # IMPORTANT: mkdir only when we are sure we have the file
+                    # actual_file is video_file
+                    
+                    channel_dir.mkdir(parents=True, exist_ok=True)
+                    video_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    host_path_root = Path("/mnt/user/tubearchives/bp")
+                    host_source_path = host_path_root / video_file.relative_to(SOURCE_DIR)
+                    dest_file = video_dir / f"video{video_file.suffix}"
+                    
+                    try:
+                        if dest_file.exists():
+                            if dest_file.is_symlink():
+                                current_target = Path(os.readlink(dest_file))
+                                if current_target.resolve() != host_source_path.resolve():
+                                    dest_file.unlink()
+                                    os.symlink(host_source_path, dest_file)
+                                    log(f"   [FIX] Relinked: {folder_name}")
+                                    new_links += 1
+                                else:
+                                    verified_links += 1
                         else:
-                            # It's a file or something else, replace it? No, unsafe.
-                            pass
-                    else:
-                        os.symlink(host_source_path, dest_file)
-                        log(f"   [NEW] Linked: {folder_name}")
-                        new_links += 1
-                except Exception:
-                    pass
-                
-                # Store in database
-                conn.execute("""
-                    INSERT OR REPLACE INTO videos 
-                    (video_id, title, channel, published, symlink, status)
-                    VALUES (?, ?, ?, ?, ?, 'linked')
-                """, (video_id, meta["title"], meta["channel_name"], 
-                        meta["published"], str(dest_file)))
-                
-                processed_videos.append({
-                    "video_id": video_id,
-                    "title": meta["title"],
-                    "channel": meta["channel_name"],
-                    "published": meta["published"],
-                    "symlink": str(dest_file)
-                })
+                            os.symlink(host_source_path, dest_file)
+                            log(f"   [NEW] Linked: {folder_name}")
+                            new_links += 1
+                    except Exception as e:
+                        log(f"   ❌ Link error for {folder_name}: {e}")
+                    
+                    # Store in database
+                    conn.execute("""
+                        INSERT OR REPLACE INTO videos 
+                        (video_id, title, channel, published, symlink, status)
+                        VALUES (?, ?, ?, ?, ?, 'linked')
+                    """, (video_id, meta["title"], meta["channel_name"], 
+                            meta["published"], str(dest_file)))
+                    
+                    processed_videos.append({
+                        "video_id": video_id,
+                        "title": meta["title"],
+                        "channel": meta["channel_name"],
+                        "published": meta["published"],
+                        "symlink": str(dest_file)
+                    })
         except Exception as e:
             conn.rollback()
             return str(e)
