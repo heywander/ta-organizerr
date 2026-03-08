@@ -320,7 +320,8 @@ def fetch_all_metadata():
                 video_map[vid_id] = {
                     "title": title,
                     "channel_name": channel_name,
-                    "published": published
+                    "published": published,
+                    "filesystem_path": video.get("path") or video.get("filesystem_path")
                 }
             
             # Check pagination to see if we are done
@@ -1133,6 +1134,67 @@ def api_recovery_start():
         "message": msg, 
         "success": success,
         "status": "completed" if success else "failed" 
+    })
+
+@app.route("/api/recovery/delete-batch", methods=["POST"])
+@requires_auth
+def api_recovery_delete_batch():
+    data = request.get_json()
+    filepaths = data.get('filepaths', [])
+    destruct_mode = data.get('destruct_mode', False)
+    
+    if not filepaths:
+        return jsonify({"error": "No filepaths provided"}), 400
+        
+    results = []
+    # Refresh metadata to ensure we have latest paths for destruct mode
+    video_map = fetch_all_metadata() if destruct_mode else {}
+    
+    for filepath in filepaths:
+        p = Path(filepath)
+        if not p.exists():
+            results.append({"path": filepath, "success": False, "error": "File not found"})
+            continue
+            
+        try:
+            vid_id = extract_id_from_filename(p.name)
+            
+            # DESTRUCT MODE: Delete source too
+            if destruct_mode and vid_id:
+                meta = video_map.get(vid_id)
+                if meta and meta.get('filesystem_path'):
+                    source_path = Path(meta['filesystem_path'])
+                    if source_path.exists():
+                        source_path.unlink()
+                        log(f"   [DESTRUCT] Deleted source: {source_path}")
+                
+                # Also check lost_media table
+                with get_db() as conn:
+                    conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
+                    conn.commit()
+
+            # DELETE TARGET (Symlink/Resource)
+            p.unlink()
+            
+            # Clean up empty parent folder if it's a video folder
+            parent = p.parent
+            if parent not in [TARGET_DIR, HIDDEN_DIR, SOURCE_DIR] and parent.name != "source":
+                try:
+                    if not any(parent.iterdir()):
+                        parent.rmdir()
+                        log(f"   [CLEANUP] Removed empty dir: {parent}")
+                except:
+                    pass
+            
+            results.append({"path": filepath, "success": True})
+        except Exception as e:
+            results.append({"path": filepath, "success": False, "error": str(e)})
+            log(f"❌ Failed to delete {filepath}: {e}")
+            
+    return jsonify({
+        "results": results,
+        "success_count": len([r for r in results if r["success"]]),
+        "fail_count": len([r for r in results if not r["success"]])
     })
 
 @app.route("/api/recovery/delete", methods=["POST"])
