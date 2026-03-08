@@ -1283,7 +1283,13 @@ def api_recovery_delete_batch():
                     p.unlink()
                 log(f"🗑️ Deleted target: {path}")
                 
-                # 3. Cleanup empty parent
+                # 3. Synchronize Database (Remove orphaned record)
+                with get_db() as conn:
+                    conn.execute("DELETE FROM videos WHERE symlink = ?", (path,))
+                    conn.commit()
+                log(f"💾 [SYNC] Removed DB record for: {path}")
+                
+                # 4. Cleanup empty parent
                 parent = p.parent
                 if parent != Path(TARGET_DIR) and parent != Path(HIDDEN_DIR):
                     if parent.exists() and not any(parent.iterdir()):
@@ -1396,6 +1402,8 @@ def api_recovery_delete():
         if vid_id:
             with get_db() as conn:
                 conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
+                # Also remove from main videos table if present
+                conn.execute("DELETE FROM videos WHERE symlink = ?", (filepath,))
                 conn.commit()
 
         log(f"🗑️ Deleted file: {filepath}")
