@@ -70,6 +70,12 @@ const { title } = Astro.props;
                             >
                                 <i class="bi bi-film mr-1"></i> Transcoding
                             </a>
+                            <button
+                                id="logout-btn"
+                                class="text-gray-500 hover:text-neon-pink hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors cursor-pointer"
+                            >
+                                <i class="bi bi-box-arrow-right mr-1"></i> Logout
+                            </button>
                         </div>
                     </div>
                     <div>
@@ -95,5 +101,16 @@ const { title } = Astro.props;
         >
             <p>TUBESORTER // SYSTEM_V2 // BUN_POWERED</p>
         </footer>
+        <script>
+            const logoutBtn = document.getElementById('logout-btn');
+            logoutBtn?.addEventListener('click', async () => {
+                try {
+                    const res = await fetch('/api/auth/logout', { method: 'POST' });
+                    if (res.ok) window.location.href = '/login';
+                } catch (err) {
+                    console.error('Logout failed', err);
+                }
+            });
+        </script>
     </body>
 </html>

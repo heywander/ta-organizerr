@@ -9,7 +9,7 @@ import ipaddress
 import shutil
 from datetime import datetime
 from functools import wraps
-from flask import Flask, jsonify, render_template, request, abort, Response, send_from_directory
+from flask import Flask, jsonify, render_template, request, abort, Response, send_from_directory, session, redirect, url_for
 
 # Load config from environment variables
 API_URL = os.getenv("API_URL", "http://localhost:8457/api")
@@ -28,6 +28,7 @@ HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 # Serve static files from ui/dist
 STATIC_FOLDER = os.path.join(os.getcwd(), 'ui', 'dist')
 app = Flask(__name__, static_folder=STATIC_FOLDER, static_url_path='/')
+app.secret_key = os.getenv("FLASK_SECRET_KEY", "tubesortermagicpika") # Change in production!
 
 # Database setup
 import sqlite3
@@ -918,21 +919,43 @@ def check_auth(username, password):
     """Checks whether a username/password combination is valid."""
     return username == UI_USERNAME and password == UI_PASSWORD
 
-def authenticate():
-    """Sends a 401 response that enables basic auth"""
-    return Response(
-    'Could not verify your access level for that URL.\n'
-    'You have to login with proper credentials', 401,
-    {'WWW-Authenticate': 'Basic realm="Login Required"'})
-
 def requires_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth = request.authorization
-        if not auth or not check_auth(auth.username, auth.password):
-            return authenticate()
+        if not session.get('logged_in'):
+            if request.path.startswith('/api/'):
+                return jsonify({"error": "Unauthorized"}), 401
+            return redirect('/login')
         return f(*args, **kwargs)
     return decorated
+
+@app.route("/api/auth/login", methods=["POST"])
+def api_login():
+    data = request.json
+    username = data.get("username")
+    password = data.get("password")
+    
+    if check_auth(username, password):
+        session['logged_in'] = True
+        session['username'] = username
+        return jsonify({"success": True})
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route("/api/auth/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return jsonify({"success": True})
+
+@app.route("/api/auth/status")
+def api_auth_status():
+    return jsonify({
+        "logged_in": session.get('logged_in', False),
+        "username": session.get('username')
+    })
+
+@app.route("/login")
+def login_page():
+    return send_from_directory(app.static_folder, 'login/index.html')
 
 @app.route("/")
 @requires_auth

@@ -24,6 +24,10 @@
     async function fetchData() {
         try {
             const res = await fetch("/api/status");
+            if (res.status === 401) {
+                window.location.href = "/login";
+                return;
+            }
             if (!res.ok) throw new Error("Failed to fetch status");
             const data = await res.json();
 
