@@ -805,23 +805,18 @@ def process_videos():
                         except Exception as e:
                             log(f"   ❌ Migration error for {sanitized_channel_name}: {e}")
 
-                    # Folder Creation & Linking
+                    # Folder Creation (Delay until link check)
                     channel_dir = target_root / sanitized_channel_name
                     sanitized_title = sanitize(meta["title"])
                     folder_name = f"{meta['published']} - {sanitized_title}"
                     video_dir = channel_dir / folder_name
-                    
-                    # IMPORTANT: mkdir only when we are sure we have the file
-                    # actual_file is video_file
-                    
-                    channel_dir.mkdir(parents=True, exist_ok=True)
-                    video_dir.mkdir(parents=True, exist_ok=True)
                     
                     host_path_root = Path("/mnt/user/tubearchives/bp")
                     host_source_path = host_path_root / video_file.relative_to(SOURCE_DIR)
                     dest_file = video_dir / f"video{video_file.suffix}"
                     
                     try:
+                        link_success = False
                         if dest_file.exists():
                             if dest_file.is_symlink():
                                 current_target = Path(os.readlink(dest_file))
@@ -830,12 +825,18 @@ def process_videos():
                                     os.symlink(host_source_path, dest_file)
                                     log(f"   [FIX] Relinked: {folder_name}")
                                     new_links += 1
+                                    link_success = True
                                 else:
                                     verified_links += 1
+                                    link_success = True
                         else:
+                            # Create directories ONLY NOW
+                            channel_dir.mkdir(parents=True, exist_ok=True)
+                            video_dir.mkdir(parents=True, exist_ok=True)
                             os.symlink(host_source_path, dest_file)
                             log(f"   [NEW] Linked: {folder_name}")
                             new_links += 1
+                            link_success = True
                     except Exception as e:
                         log(f"   ❌ Link error for {folder_name}: {e}")
                     
@@ -1151,31 +1152,47 @@ def api_recovery_delete_batch():
     log(f"🔥 Batch Delete started. Items: {len(paths)}, Destruct: {destruct}")
     
     # Refresh metadata for destruct mode
-    video_map = fetch_all_metadata() if destruct else {}
+    video_map = {}
+    if destruct:
+        # Optimization: only fetch if destruct is on
+        video_map = fetch_all_metadata() 
     
     for path in paths:
         try:
             # 1. Destruct Source if enabled
+            p = Path(path)
             if destruct:
                 source_deleted = False
-                for vid_id, meta in video_map.items():
-                    if meta.get('path') == path or meta.get('filesystem_path') == path:
-                        source_path = meta.get('filesystem_path')
-                        if source_path and os.path.exists(source_path):
-                            try:
-                                os.remove(source_path)
-                                log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
-                                source_deleted = True
-                                break
-                            except Exception as se:
-                                log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {se}")
-                                raise Exception(f"Source deletion failed: {se}")
+                # Try to find video_id from DB first (most reliable for library files)
+                vid_id = None
+                with get_db() as conn:
+                    row = conn.execute("SELECT video_id FROM videos WHERE symlink = ?", (path,)).fetchone()
+                    if row:
+                        vid_id = row['video_id']
+                
+                # Fallback: Extraction from filename
+                if not vid_id:
+                    vid_id = extract_id_from_filename(p.name)
+
+                if vid_id:
+                    meta = video_map.get(vid_id)
+                    if meta:
+                        source_path_raw = meta.get('filesystem_path')
+                        if source_path_raw:
+                            source_path = Path(source_path_raw)
+                            if source_path.exists():
+                                try:
+                                    source_path.unlink()
+                                    log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
+                                    source_deleted = True
+                                except Exception as se:
+                                    log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {se}")
+                                    raise Exception(f"Source deletion failed: {se}")
                 
                 if not source_deleted:
-                    log(f"⚠️ [DESTRUCT] Source not found for: {path}")
+                    log(f"⚠️ [DESTRUCT] Source file not found for: {path} (ID: {vid_id or 'unknown'})")
 
             # 2. Delete Target
-            p = Path(path)
             if p.exists():
                 if p.is_dir():
                     shutil.rmtree(p)
