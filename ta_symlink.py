@@ -1479,7 +1479,7 @@ def api_get_channel_videos():
             "filename": Path(row['symlink']).name if row['symlink'] else meta.get('title'),
             "source_path": meta.get('filesystem_path'),
             "ta_source": meta.get('channel_name', channel_name),
-            "is_live": bool(row['is_live']) if 'is_live' in [k[0] for k in row.description] else False
+            "is_live": bool(row['is_live']) if 'is_live' in row.keys() else False
         })
         
     return jsonify(videos)
