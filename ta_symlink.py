@@ -124,7 +124,8 @@ def translate_ta_path(ta_path):
     if len(parts) > 2 and parts[0] == '/':
         # Strip the / and the first directory (youtube or media)
         # and join with our SOURCE_DIR
-        relative_path = Path(*parts[2:])
+        relative_path_parts = parts[2:]
+        relative_path = Path(*relative_path_parts)
         translated = SOURCE_DIR / relative_path
         return translated
         
@@ -140,13 +141,13 @@ def translate_host_path(host_path):
     host_prefix = "/mnt/user/tubearchives/bp"
     
     if host_path_str.startswith(host_prefix):
-        rel = host_path_str[len(host_prefix):].lstrip("/")
+        rel = host_path_str[len(host_prefix):].replace("/", "", 1)
         return SOURCE_DIR / rel
         
     # Generic fallback: if it starts with the configured HOST_SOURCE_BASE
     host_base_str = str(HOST_SOURCE_BASE)
     if host_path_str.startswith(host_base_str):
-        rel = host_path_str[len(host_base_str):].lstrip("/")
+        rel = host_path_str[len(host_base_str):].replace("/", "", 1)
         return SOURCE_DIR / rel
         
     return Path(host_path)
@@ -1465,7 +1466,7 @@ def api_get_channel_videos():
     video_map = fetch_all_metadata()
     
     with get_db() as conn:
-        rows = conn.execute("SELECT video_id, title, symlink FROM videos WHERE channel = ? ORDER BY published DESC", (channel_name,)).fetchall()
+        rows = conn.execute("SELECT video_id, title, symlink, is_live FROM videos WHERE channel = ? ORDER BY published DESC", (channel_name,)).fetchall()
         
     videos = []
     for row in rows:
@@ -1478,7 +1479,7 @@ def api_get_channel_videos():
             "filename": Path(row['symlink']).name if row['symlink'] else meta.get('title'),
             "source_path": meta.get('filesystem_path'),
             "ta_source": meta.get('channel_name', channel_name),
-            "is_live": bool(row.get('is_live', 0))
+            "is_live": bool(row['is_live']) if 'is_live' in [k[0] for k in row.description] else False
         })
         
     return jsonify(videos)
