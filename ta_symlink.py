@@ -24,6 +24,7 @@ TARGET_DIR = Path("/app/target")
 HIDDEN_DIR = Path("/app/hidden")
 IMPORT_DIR = Path("/app/import")
 DATA_DIR = Path("/app/data")
+HOST_SOURCE_BASE = Path(os.getenv("HOST_SOURCE_BASE", "/mnt/user/tubearchives/bp"))
 HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 
 # Serve static files from ui/dist
@@ -128,6 +129,12 @@ def translate_host_path(host_path):
     
     if host_path_str.startswith(host_prefix):
         rel = host_path_str[len(host_prefix):].lstrip("/")
+        return SOURCE_DIR / rel
+        
+    # Generic fallback: if it starts with the configured HOST_SOURCE_BASE
+    host_base_str = str(HOST_SOURCE_BASE)
+    if host_path_str.startswith(host_base_str):
+        rel = host_path_str[len(host_base_str):].lstrip("/")
         return SOURCE_DIR / rel
         
     return Path(host_path)
@@ -846,7 +853,7 @@ def process_videos():
                     folder_name = f"{meta['published']} - {sanitized_title}"
                     video_dir = channel_dir / folder_name
                     
-                    host_path_root = Path("/mnt/user/tubearchives/bp")
+                    host_path_root = HOST_SOURCE_BASE
                     host_source_path = host_path_root / video_file.relative_to(SOURCE_DIR)
                     dest_file = video_dir / f"video{video_file.suffix}"
                     
@@ -1229,6 +1236,16 @@ def api_recovery_delete_batch():
                             if raw_ta_path:
                                 source_path = translate_ta_path(raw_ta_path)
                                 log(f"   [DESTRUCT] API Fallback Path: {source_path}")
+
+                # --- Method C: Recursive Search Fallback (Safety net) ---
+                if not source_path or not source_path.exists():
+                    log(f"   [DESTRUCT] Final fallback: recursive search for ID {vid_id or 'unknown'}")
+                    if vid_id:
+                        for candidate in SOURCE_DIR.rglob(f"*{vid_id}*"):
+                            if candidate.is_file():
+                                source_path = candidate
+                                log(f"   [DESTRUCT] Search found match: {source_path}")
+                                break
 
                 # --- Execution: Delete the identified source ---
                 if source_path and source_path.exists():
