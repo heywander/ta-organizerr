@@ -1,4 +1,4 @@
-# TA Organizer
+# TubeSorter
 
 📂 Automatically organizes TubeArchivist downloads into human-readable folder structures using symlinks and metadata.
 
@@ -47,8 +47,8 @@ VIDEO_URL=http://localhost:8457/video
 1. Clone this repo and navigate into it:
 
 ```bash
-git clone https://github.com/Salpertio/ta-organizer.git
-cd ta-organizer
+git clone https://github.com/Salpertio/tubesorter.git
+cd tubesorter
 ```
 
 2. Edit the `docker-compose.yml` to point to your source/target folders:

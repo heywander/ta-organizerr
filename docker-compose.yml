@@ -1,8 +1,8 @@
 services:
-  ta-organizer:
+  tubesorter:
     build: .
-    # image: ghcr.io/salpertio/ta-organizerr:latest
-    container_name: ta-organizer
+    # image: ghcr.io/salpertio/tubesorter:latest
+    container_name: tubesorter
     volumes:
       - ./source:/app/source
       - ./target:/app/target

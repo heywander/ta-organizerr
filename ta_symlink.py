@@ -1209,7 +1209,7 @@ def api_recovery_force():
         "title": f"Offline Import - {src_path.stem}",
         "uploader": "Unknown (Lost Media)",
         "upload_date": datetime.now().strftime("%Y%m%d"),
-        "description": "Imported via TA Organizerr Force Import (Lost Media)",
+        "description": "Imported via TubeSorterr Force Import (Lost Media)",
         "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
         "view_count": 0,
         "like_count": 0,

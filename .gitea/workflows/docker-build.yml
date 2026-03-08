@@ -8,7 +8,7 @@ on:
       - '.gitignore'
 
 env:
-  REGISTRY: ghcr.io
+  REGISTRY: git.unfilteredrealm.com
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
