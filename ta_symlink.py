@@ -97,6 +97,26 @@ def log(msg):
         if len(log_buffer) > 1000:
             log_buffer.pop(0)
 
+def translate_ta_path(ta_path):
+    """
+    Translates a path from TubeArchivist's internal filesystem (usually /youtube/...)
+    to the container's /app/source mount.
+    """
+    if not ta_path: return None
+    p = Path(ta_path)
+    parts = list(p.parts)
+    
+    # TA internal paths are often /youtube/Channel/Video.mp4
+    # parts[0] = '/', parts[1] = 'youtube', parts[2] = 'Channel'...
+    if len(parts) > 2 and parts[0] == '/':
+        # Strip the / and the first directory (youtube or media)
+        # and join with our SOURCE_DIR
+        relative_path = Path(*parts[2:])
+        translated = SOURCE_DIR / relative_path
+        return translated
+        
+    return p
+
 def tlog(msg):
     """Logs a message to the transcode log buffer."""
     print(f"[TRANSCODE] {msg}", flush=True)
@@ -1177,10 +1197,16 @@ def api_recovery_delete_batch():
                 if vid_id:
                     meta = video_map.get(vid_id)
                     if meta:
-                        source_path_raw = meta.get('filesystem_path')
-                        if source_path_raw:
-                            source_path = Path(source_path_raw)
-                            if source_path.exists():
+                        raw_ta_path = meta.get('filesystem_path')
+                        if raw_ta_path:
+                            # Translate internal TA path to our /app/source mount
+                            source_path = translate_ta_path(raw_ta_path)
+                            
+                            log(f"   [DESTRUCT] Attempting lookup for ID {vid_id}")
+                            log(f"   [DESTRUCT] TA Path: {raw_ta_path}")
+                            log(f"   [DESTRUCT] Local Path: {source_path}")
+
+                            if source_path and source_path.exists():
                                 try:
                                     source_path.unlink()
                                     log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
@@ -1188,12 +1214,14 @@ def api_recovery_delete_batch():
                                 except Exception as se:
                                     log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {se}")
                                     raise Exception(f"Source deletion failed: {se}")
+                            else:
+                                log(f"   [DESTRUCT] Local file NOT FOUND at: {source_path}")
                 
                 if not source_deleted:
                     log(f"⚠️ [DESTRUCT] Source file not found for: {path} (ID: {vid_id or 'unknown'})")
 
-            # 2. Delete Target
-            if p.exists():
+            # 2. Delete Target (Use lexists so we can delete broken symlinks!)
+            if os.path.lexists(p):
                 if p.is_dir():
                     shutil.rmtree(p)
                 else:
@@ -1208,6 +1236,8 @@ def api_recovery_delete_batch():
                             parent.rmdir()
                             log(f"🧹 [CLEANUP] Removed empty folder: {parent}")
                         except: pass
+            else:
+                log(f"❓ Target path does not exist (skipping): {path}")
 
             success_count += 1
         except Exception as e:
