@@ -2,7 +2,7 @@
     import { createEventDispatcher, onMount, onDestroy } from "svelte";
     const dispatch = createEventDispatcher();
 
-    let activeTab: "unindexed" | "rescue" | "redundant" | "lost" = "unindexed";
+    let activeTab: "unindexed" | "rescue" | "redundant" | "lost" | "channels" = "unindexed";
     let scanning = false;
     let status = "idle";
     let results: any = { unindexed: [], rescue: [], redundant: [], lost: [] };
@@ -11,6 +11,13 @@
     // New State for Destruct Mode & Multi-selection
     let destructMode = false;
     let selectedPaths = new Set<string>();
+
+    // Channel specific state
+    let channels: string[] = [];
+    let selectedChannel = "";
+    let channelVideos: any[] = [];
+    let loadingChannels = false;
+    let searchingVideos = false;
 
     async function startScan() {
         scanning = true;
@@ -47,6 +54,33 @@
         }, 2000);
     }
 
+    async function fetchChannels() {
+        loadingChannels = true;
+        try {
+            const res = await fetch("/api/channels");
+            channels = await res.json();
+        } catch (e) {
+            console.error("Failed to fetch channels", e);
+        } finally {
+            loadingChannels = false;
+        }
+    }
+
+    async function fetchChannelVideos(channel: string) {
+        if (!channel) return;
+        searchingVideos = true;
+        selectedChannel = channel;
+        selectedPaths = new Set();
+        try {
+            const res = await fetch(`/api/channels/videos?channel=${encodeURIComponent(channel)}`);
+            channelVideos = await res.json();
+        } catch (e) {
+            console.error("Failed to fetch channel videos", e);
+        } finally {
+            searchingVideos = false;
+        }
+    }
+
     onDestroy(() => {
         if (pollInterval) clearInterval(pollInterval);
     });
@@ -62,7 +96,8 @@
             const d = await res.json();
             if (!isBatch) {
                 alert(d.message);
-                startScan();
+                if (activeTab === "channels") fetchChannelVideos(selectedChannel);
+                else startScan();
             }
         } catch (e) {
             alert(e);
@@ -91,7 +126,8 @@
             const d = await res.json();
             if (d.success_count > 0) {
                 alert("Deleted.");
-                startScan();
+                if (activeTab === "channels") fetchChannelVideos(selectedChannel);
+                else startScan();
             } else alert("Error deleting file.");
         } catch (e) {
             alert(e);
@@ -121,7 +157,8 @@
             const d = await res.json();
             alert(`Batch complete. Success: ${d.success_count}, Failed: ${d.fail_count}`);
             selectedPaths = new Set();
-            startScan();
+            if (activeTab === "channels") fetchChannelVideos(selectedChannel);
+            else startScan();
         } catch (e) {
             alert("Batch delete failed: " + e);
         }
@@ -137,7 +174,7 @@
     }
 
     function toggleAll() {
-        const items = results[activeTab] || [];
+        const items = activeTab === "channels" ? channelVideos : (results[activeTab] || []);
         if (selectedPaths.size === items.length && items.length > 0) {
             selectedPaths = new Set();
         } else {
@@ -145,7 +182,11 @@
         }
     }
 
-    $: allSelected = results[activeTab]?.length > 0 && selectedPaths.size === results[activeTab]?.length;
+    $: allSelected = (activeTab === "channels" ? channelVideos : results[activeTab])?.length > 0 && selectedPaths.size === (activeTab === "channels" ? channelVideos : results[activeTab])?.length;
+
+    onMount(() => {
+        fetchChannels();
+    });
 </script>
 
 <div
@@ -209,7 +250,7 @@
 
         <!-- Tabs -->
         <div class="flex border-b border-gray-800 px-4">
-            {#each ["unindexed", "rescue", "redundant", "lost"] as tab}
+            {#each ["unindexed", "rescue", "redundant", "lost", "channels"] as tab}
                 <button
                     class="px-4 py-3 text-sm font-semibold capitalize border-b-2 transition-colors flex items-center gap-2
                     {activeTab === tab
@@ -218,16 +259,99 @@
                     on:click={() => { activeTab = tab as any; selectedPaths = new Set(); }}
                 >
                     {tab}
-                    <span class="bg-gray-800 text-xs px-1.5 rounded-full"
-                        >{results[tab]?.length || 0}</span
-                    >
+                    {#if tab !== 'channels'}
+                        <span class="bg-gray-800 text-xs px-1.5 rounded-full"
+                            >{results[tab]?.length || 0}</span
+                        >
+                    {/if}
                 </button>
             {/each}
         </div>
 
         <!-- Content -->
         <div class="flex-grow overflow-y-auto p-4 bg-black/30">
-            {#if scanning && (!results[activeTab] || results[activeTab].length === 0)}
+            {#if activeTab === "channels"}
+                <div class="flex flex-col h-full gap-4">
+                    <!-- Channel Selector -->
+                    <div class="flex gap-4 items-end">
+                        <div class="flex-grow">
+                            <label class="block text-xs text-gray-500 mb-1">Select Channel</label>
+                            <select 
+                                class="w-full bg-gray-900 border border-gray-700 rounded p-2 text-white outline-none focus:border-neon-cyan"
+                                value={selectedChannel}
+                                on:change={(e) => fetchChannelVideos(e.currentTarget.value)}
+                            >
+                                <option value="">-- Choose a Channel --</option>
+                                {#each channels as channel}
+                                    <option value={channel}>{channel}</option>
+                                {/each}
+                            </select>
+                        </div>
+                        <button 
+                            class="btn-secondary px-4 py-2 rounded bg-gray-800 text-white hover:bg-gray-700"
+                            on:click={fetchChannels}
+                        >
+                            <i class="bi bi-arrow-clockwise"></i>
+                        </button>
+                    </div>
+
+                    <!-- Video Table -->
+                    <div class="flex-grow overflow-y-auto border border-gray-800 rounded">
+                        {#if searchingVideos}
+                            <div class="flex items-center justify-center h-full text-neon-cyan animate-pulse">
+                                Fetching videos...
+                            </div>
+                        {:else if channelVideos.length > 0}
+                            <table class="w-full text-left text-xs text-gray-300 font-mono border-collapse">
+                                <thead class="sticky top-0 bg-cyber-card z-10 shadow-sm">
+                                    <tr class="text-gray-500 border-b border-gray-800">
+                                        <th class="p-3 w-10">
+                                            <input 
+                                                type="checkbox" 
+                                                checked={allSelected} 
+                                                on:change={toggleAll}
+                                                class="accent-neon-cyan"
+                                            >
+                                        </th>
+                                        <th class="p-3">Video ID</th>
+                                        <th class="p-3">Title</th>
+                                        <th class="p-3 text-right">Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {#each channelVideos as item}
+                                        <tr class="border-b border-gray-800/50 hover:bg-white/5 transition-colors {selectedPaths.has(item.path) ? 'bg-neon-cyan/5' : ''}">
+                                            <td class="p-3 text-center">
+                                                <input 
+                                                    type="checkbox" 
+                                                    checked={selectedPaths.has(item.path)} 
+                                                    on:change={() => toggleSelect(item.path)}
+                                                    class="accent-neon-cyan"
+                                                >
+                                            </td>
+                                            <td class="p-3 text-neon-pink font-bold">{item.video_id}</td>
+                                            <td class="p-3 truncate max-w-[400px]" title={item.title}>{item.title}</td>
+                                            <td class="p-3 text-right">
+                                                <button
+                                                    class="text-red-500 hover:underline flex items-center gap-1 ml-auto"
+                                                    on:click={() => deleteFile(item.path)}
+                                                >
+                                                    <i class="bi bi-trash"></i> Delete
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    {/each}
+                                </tbody>
+                            </table>
+                        {:else}
+                            <div class="flex flex-col items-center justify-center h-full text-gray-600 gap-2">
+                                <i class="bi bi-search text-3xl opacity-20"></i>
+                                Select a channel to view its videos.
+                            </div>
+                        {/if}
+                    </div>
+                </div>
+            {:else if scanning && (!results[activeTab] || results[activeTab].length === 0)}
                 <div
                     class="flex flex-col items-center justify-center h-full text-neon-cyan gap-4"
                 >

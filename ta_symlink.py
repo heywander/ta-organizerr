@@ -1247,6 +1247,42 @@ def api_recovery_delete():
         log(f"❌ Delete failed: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/channels", methods=["GET"])
+@requires_auth
+def api_get_channels():
+    with get_db() as conn:
+        rows = conn.execute("SELECT DISTINCT channel FROM videos WHERE channel IS NOT NULL ORDER BY channel ASC").fetchall()
+        channels = [row['channel'] for row in rows if row['channel']]
+    return jsonify(channels)
+
+@app.route("/api/channels/videos", methods=["GET"])
+@requires_auth
+def api_get_channel_videos():
+    channel_name = request.args.get('channel')
+    if not channel_name:
+        return jsonify({"error": "No channel name provided"}), 400
+        
+    # Refresh metadata to get filesystem paths
+    video_map = fetch_all_metadata()
+    
+    with get_db() as conn:
+        rows = conn.execute("SELECT video_id, title, symlink FROM videos WHERE channel = ? ORDER BY published DESC", (channel_name,)).fetchall()
+        
+    videos = []
+    for row in rows:
+        vid_id = row['video_id']
+        meta = video_map.get(vid_id, {})
+        videos.append({
+            "video_id": vid_id,
+            "title": row['title'],
+            "path": row['symlink'],
+            "filename": Path(row['symlink']).name if row['symlink'] else meta.get('title'),
+            "source_path": meta.get('filesystem_path'),
+            "ta_source": meta.get('channel_name', channel_name)
+        })
+        
+    return jsonify(videos)
+
 @app.route('/api/recovery/force', methods=['POST'])
 @requires_auth
 def api_recovery_force():
