@@ -1241,7 +1241,15 @@ def api_recovery_delete_batch():
                 if not source_path or not source_path.exists():
                     log(f"   [DESTRUCT] Final fallback: recursive search for ID {vid_id or 'unknown'}")
                     if vid_id:
+                        video_extensions = {".mp4", ".mkv", ".webm", ".avi", ".mov"}
+                        # Search SOURCE_DIR but skip 'tcconf' and only match video files
                         for candidate in SOURCE_DIR.rglob(f"*{vid_id}*"):
+                            # Safety check: Skip tcconf directory and non-video extensions
+                            if "tcconf" in candidate.parts:
+                                continue
+                            if candidate.suffix.lower() not in video_extensions:
+                                continue
+                                
                             if candidate.is_file():
                                 source_path = candidate
                                 log(f"   [DESTRUCT] Search found match: {source_path}")
