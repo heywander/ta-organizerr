@@ -383,7 +383,7 @@ def fetch_all_metadata():
                     "title": title,
                     "channel_name": channel_name,
                     "published": published,
-                    "is_live": video.get("is_live", False),
+                    "is_live": video.get("vid_type") == "streams",
                     "filesystem_path": video.get("path") or video.get("filesystem_path")
                 }
             
