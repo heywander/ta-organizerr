@@ -23,6 +23,7 @@ SOURCE_DIR = Path("/app/source")
 TARGET_DIR = Path("/app/target")
 HIDDEN_DIR = Path("/app/hidden")
 IMPORT_DIR = Path("/app/import")
+DATA_DIR = Path("/app/data")
 HEADERS = {"Authorization": f"Token {API_TOKEN}"}
 
 # Serve static files from ui/dist
@@ -1147,6 +1148,8 @@ def api_recovery_delete_batch():
     fail_count = 0
     errors = []
     
+    log(f"🔥 Batch Delete started. Items: {len(paths)}, Destruct: {destruct}")
+    
     # Refresh metadata for destruct mode
     video_map = fetch_all_metadata() if destruct else {}
     
@@ -1159,10 +1162,15 @@ def api_recovery_delete_batch():
                     if meta.get('path') == path or meta.get('filesystem_path') == path:
                         source_path = meta.get('filesystem_path')
                         if source_path and os.path.exists(source_path):
-                            os.remove(source_path)
-                            log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
-                            source_deleted = True
-                            break
+                            try:
+                                os.remove(source_path)
+                                log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
+                                source_deleted = True
+                                break
+                            except Exception as se:
+                                log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {se}")
+                                raise Exception(f"Source deletion failed: {se}")
+                
                 if not source_deleted:
                     log(f"⚠️ [DESTRUCT] Source not found for: {path}")
 
@@ -1173,13 +1181,16 @@ def api_recovery_delete_batch():
                     shutil.rmtree(p)
                 else:
                     p.unlink()
+                log(f"🗑️ Deleted target: {path}")
                 
                 # 3. Cleanup empty parent
                 parent = p.parent
                 if parent != Path(TARGET_DIR) and parent != Path(HIDDEN_DIR):
                     if parent.exists() and not any(parent.iterdir()):
-                        parent.rmdir()
-                        log(f"🧹 [CLEANUP] Removed empty folder: {parent}")
+                        try:
+                            parent.rmdir()
+                            log(f"🧹 [CLEANUP] Removed empty folder: {parent}")
+                        except: pass
 
             success_count += 1
         except Exception as e:
@@ -1194,6 +1205,52 @@ def api_recovery_delete_batch():
         "fail_count": fail_count,
         "errors": errors[:5]
     })
+
+@app.route("/api/system/check-permissions", methods=["GET"])
+@requires_auth
+def api_check_permissions():
+    results = {}
+    test_dirs = [
+        ("source", SOURCE_DIR), 
+        ("target", TARGET_DIR), 
+        ("hidden", HIDDEN_DIR), 
+        ("data", DATA_DIR)
+    ]
+    
+    log("🔍 Running System Permission Check...")
+    
+    for name, path in test_dirs:
+        if not path:
+            results[name] = {"status": "unset", "writeable": False}
+            continue
+            
+        p = Path(path)
+        if not p.exists():
+            results[name] = {"status": "missing", "writeable": False, "message": "Directory does not exist"}
+            log(f"  ❌ {name} ({path}): MISSING")
+            continue
+
+        test_file = p / f".write_test_{os.getpid()}"
+        try:
+            # Try to write
+            log(f"  🧪 Testing write on {name}...")
+            if test_file.exists(): test_file.unlink() # Cleanup old failure
+            with open(test_file, "w") as f:
+                f.write("test")
+            # Try to delete
+            test_file.unlink()
+            
+            results[name] = {"status": "ok", "writeable": True}
+            log(f"  ✅ {name} ({path}): WRITEABLE")
+        except Exception as e:
+            msg = str(e)
+            results[name] = {"status": "error", "writeable": False, "message": msg}
+            log(f"  ❌ {name} ({path}): READ-ONLY or PERMISSION DENIED - {msg}")
+            # Identify if it is literally "Read-only file system"
+            if "Read-only file system" in msg:
+                log(f"  🚨 POSITIVE R/O MOUNT DETECTED for {name}")
+            
+    return jsonify(results)
 
 @app.route("/api/recovery/delete", methods=["POST"])
 @requires_auth

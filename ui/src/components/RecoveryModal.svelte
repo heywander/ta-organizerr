@@ -248,11 +248,14 @@
                 <div class="text-xs text-red-200">
                     <span class="font-bold uppercase">Filesystem Alert:</span>
                     {#if sourceRO && targetRO}
-                        Both Source AND Target directories are currently <span class="text-white underline">READ-ONLY</span>. Deletion and reorganization will fail.
+                        Both Source AND Target directories are currently <span class="text-white underline">READ-ONLY</span>.
+                        <div class="mt-1 opacity-70 italic">Errors: {permissions?.source?.message} | {permissions?.target?.message}</div>
                     {:else if sourceRO}
                         Source archive is <span class="text-white underline">READ-ONLY</span>. Destruct Mode will fail.
+                        <div class="mt-1 opacity-70 italic">Error: {permissions?.source?.message}</div>
                     {:else}
                         Target library is <span class="text-white underline">READ-ONLY</span>. Symlink cleanup will fail.
+                        <div class="mt-1 opacity-70 italic">Error: {permissions?.target?.message}</div>
                     {/if}
                 </div>
                 <button on:click={checkPermissions} class="ml-auto text-[10px] bg-red-500/20 hover:bg-red-500/40 px-2 py-1 rounded border border-red-500/30 transition-colors">
