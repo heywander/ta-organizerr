@@ -117,6 +117,21 @@ def translate_ta_path(ta_path):
         
     return p
 
+def translate_host_path(host_path):
+    """
+    Translates a path from the Host filesystem (e.g. /mnt/user/tubearchives/bp/...)
+    to the container's /app/source mount.
+    """
+    if not host_path: return None
+    host_path_str = str(host_path)
+    host_prefix = "/mnt/user/tubearchives/bp"
+    
+    if host_path_str.startswith(host_prefix):
+        rel = host_path_str[len(host_prefix):].lstrip("/")
+        return SOURCE_DIR / rel
+        
+    return Path(host_path)
+
 def tlog(msg):
     """Logs a message to the transcode log buffer."""
     print(f"[TRANSCODE] {msg}", flush=True)
@@ -1183,42 +1198,57 @@ def api_recovery_delete_batch():
             p = Path(path)
             if destruct:
                 source_deleted = False
-                # Try to find video_id from DB first (most reliable for library files)
-                vid_id = None
-                with get_db() as conn:
-                    row = conn.execute("SELECT video_id FROM videos WHERE symlink = ?", (path,)).fetchone()
-                    if row:
-                        vid_id = row['video_id']
+                source_path = None
                 
-                # Fallback: Extraction from filename
-                if not vid_id:
-                    vid_id = extract_id_from_filename(p.name)
+                # --- Method A: Symlink Resolution (Highest reliability for library files) ---
+                if os.path.islink(p):
+                    try:
+                        target_raw = os.readlink(p)
+                        log(f"   [DESTRUCT] Symlink target: {target_raw}")
+                        source_path = translate_host_path(target_raw)
+                        log(f"   [DESTRUCT] Translated source: {source_path}")
+                    except Exception as eread:
+                        log(f"   [DESTRUCT] Warning: Could not read symlink {p}: {eread}")
 
-                if vid_id:
-                    meta = video_map.get(vid_id)
-                    if meta:
-                        raw_ta_path = meta.get('filesystem_path')
-                        if raw_ta_path:
-                            # Translate internal TA path to our /app/source mount
-                            source_path = translate_ta_path(raw_ta_path)
-                            
-                            log(f"   [DESTRUCT] Attempting lookup for ID {vid_id}")
-                            log(f"   [DESTRUCT] TA Path: {raw_ta_path}")
-                            log(f"   [DESTRUCT] Local Path: {source_path}")
+                # --- Method B: Database/TA Metadata Fallback ---
+                if not source_path or not source_path.exists():
+                    # Try to find video_id from DB
+                    vid_id = None
+                    with get_db() as conn:
+                        row = conn.execute("SELECT video_id FROM videos WHERE symlink = ?", (path,)).fetchone()
+                        if row:
+                            vid_id = row['video_id']
+                    
+                    if not vid_id:
+                        vid_id = extract_id_from_filename(p.name)
 
-                            if source_path and source_path.exists():
-                                try:
-                                    source_path.unlink()
-                                    log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
-                                    source_deleted = True
-                                except Exception as se:
-                                    log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {se}")
-                                    raise Exception(f"Source deletion failed: {se}")
-                            else:
-                                log(f"   [DESTRUCT] Local file NOT FOUND at: {source_path}")
+                    if vid_id:
+                        meta = video_map.get(vid_id)
+                        if meta:
+                            raw_ta_path = meta.get('filesystem_path')
+                            if raw_ta_path:
+                                source_path = translate_ta_path(raw_ta_path)
+                                log(f"   [DESTRUCT] API Fallback Path: {source_path}")
+
+                # --- Execution: Delete the identified source ---
+                if source_path and source_path.exists():
+                    try:
+                        source_path.unlink()
+                        log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
+                        source_deleted = True
+                    except Exception as se:
+                        log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {se}")
+                        raise Exception(f"Source deletion failed: {se}")
+                else:
+                    log(f"⚠️ [DESTRUCT] Source file NOT FOUND (Tried symlink resolution and API lookup)")
                 
                 if not source_deleted:
-                    log(f"⚠️ [DESTRUCT] Source file not found for: {path} (ID: {vid_id or 'unknown'})")
+                    # Log IDs to help debug if it still fails
+                    vid_id_debug = "?"
+                    with get_db() as conn:
+                        row = conn.execute("SELECT video_id FROM videos WHERE symlink = ?", (path,)).fetchone()
+                        if row: vid_id_debug = row['video_id']
+                    log(f"⚠️ [DESTRUCT] Source file not found for: {path} (ID: {vid_id_debug})")
 
             # 2. Delete Target (Use lexists so we can delete broken symlinks!)
             if os.path.lexists(p):
