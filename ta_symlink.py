@@ -408,10 +408,10 @@ def fetch_all_metadata():
 
 def cleanup_old_folders():
     """
-    Scans both TARGET_DIR and HIDDEN_DIR for empty or orphaned folders.
-    Safely deletes them if they contain no real files or only broken symlinks.
+    Scans both TARGET_DIR and HIDDEN_DIR for empty folders.
+    Safely deletes them if they contain no files or directories.
     """
-    log("🧹 Starting cleanup of empty/orphaned folders...")
+    log("🧹 Starting cleanup of empty folders...")
     cleaned_count = 0
     
     for root in [TARGET_DIR, HIDDEN_DIR]:
@@ -428,35 +428,15 @@ def cleanup_old_folders():
                 if not video_dir.is_dir():
                     continue
                     
-                # Check if folder contains any valid (non-broken) symlinks or real files
-                has_valid_content = False
-                for item in video_dir.iterdir():
-                    if item.is_symlink():
-                        # Check if symlink target exists
-                        try:
-                            target = Path(os.readlink(item))
-                            if target.exists():
-                                has_valid_content = True
-                                break
-                        except:
-                            pass  # Broken symlink, don't count as valid
-                    elif item.is_file() or item.is_dir():
-                        # Real file or directory = valid content
-                        has_valid_content = True
-                        break
-                
-                # Only delete if no valid content (empty or all symlinks broken)
-                if not has_valid_content:
-                    try:
-                        # Remove all items first (symlinks or otherwise)
-                        for item in list(video_dir.iterdir()):
-                            item.unlink()
-                        # Remove video directory
+                # Check if folder is completely empty
+                try:
+                    if not any(video_dir.iterdir()):
+                        # Directory is empty, remove it
                         video_dir.rmdir()
-                        log(f"   [DELETED ORPHAN] {video_dir.name}")
+                        log(f"   [DELETED EMPTY] {video_dir.name}")
                         cleaned_count += 1
-                    except Exception as e:
-                        pass # Likely not empty
+                except Exception:
+                    pass  # Directory not empty or permission issue
             
             # After cleaning videos, try to clean the channel dir itself if empty
             try:
@@ -467,7 +447,7 @@ def cleanup_old_folders():
             except Exception:
                 pass
                     
-    log(f"🧹 Cleanup complete. Removed {cleaned_count} empty/orphaned directories.")
+    log(f"🧹 Cleanup complete. Removed {cleaned_count} empty directories.")
 
 def check_orphaned_links():
     """
@@ -945,6 +925,9 @@ def process_videos():
                     })
         except Exception as e:
             conn.rollback()
+            log(f"❌❌❌ CRITICAL ERROR in process_videos: {e}")
+            import traceback
+            log(f"Traceback: {traceback.format_exc()}")
             return str(e)
         
         conn.commit()
