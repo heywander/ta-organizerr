@@ -409,9 +409,9 @@ def fetch_all_metadata():
 def cleanup_old_folders():
     """
     Scans both TARGET_DIR and HIDDEN_DIR for empty or orphaned folders.
-    Safely deletes them if they contain no real files.
+    Safely deletes them if they contain no real files or only broken symlinks.
     """
-    log("🧹 Starting aggressive cleanup of empty folders...")
+    log("🧹 Starting cleanup of empty/orphaned folders...")
     cleaned_count = 0
     
     for root in [TARGET_DIR, HIDDEN_DIR]:
@@ -428,21 +428,32 @@ def cleanup_old_folders():
                 if not video_dir.is_dir():
                     continue
                     
-                # Check if it contains any real files
-                safe_to_delete = True
+                # Check if folder contains any valid (non-broken) symlinks or real files
+                has_valid_content = False
                 for item in video_dir.iterdir():
-                    if not item.is_symlink():
-                        safe_to_delete = False
+                    if item.is_symlink():
+                        # Check if symlink target exists
+                        try:
+                            target = Path(os.readlink(item))
+                            if target.exists():
+                                has_valid_content = True
+                                break
+                        except:
+                            pass  # Broken symlink, don't count as valid
+                    elif item.is_file() or item.is_dir():
+                        # Real file or directory = valid content
+                        has_valid_content = True
                         break
                 
-                if safe_to_delete:
+                # Only delete if no valid content (empty or all symlinks broken)
+                if not has_valid_content:
                     try:
-                        # Remove all symlinks first
+                        # Remove all items first (symlinks or otherwise)
                         for item in list(video_dir.iterdir()):
                             item.unlink()
                         # Remove video directory
                         video_dir.rmdir()
-                        log(f"   [DELETED VIDEO] {video_dir.name}")
+                        log(f"   [DELETED ORPHAN] {video_dir.name}")
                         cleaned_count += 1
                     except Exception as e:
                         pass # Likely not empty
