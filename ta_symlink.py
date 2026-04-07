@@ -415,7 +415,12 @@ def cleanup_old_folders():
     cleaned_count = 0
     
     for root in [TARGET_DIR, HIDDEN_DIR]:
-        if not root.exists():
+        # Check if root exists with error handling for network issues
+        try:
+            if not root.exists():
+                continue
+        except OSError as e:
+            log(f"   ⚠️ Cannot access {root}: {e}")
             continue
             
         # Walk top-down: Channels
