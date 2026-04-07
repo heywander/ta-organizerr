@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      DOCKER_HOST: tcp://dind-daemon:2375
+      DOCKER_HOST: tcp://172.17.0.2:2375
     permissions:
       contents: read
       packages: write
