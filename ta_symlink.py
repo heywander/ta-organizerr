@@ -1078,11 +1078,66 @@ def api_cleanup():
     threading.Thread(target=cleanup_old_folders).start()
     return jsonify({"status": "started"})
 
-@app.route("/api/check-orphans", methods=["POST"])
+def fix_broken_symlinks():
+    """
+    Scans TARGET_DIR and HIDDEN_DIR for video.mp4 files that are NOT symlinks
+    (like the 0-byte files left by crashed symlink creation) and deletes them.
+    Returns list of cleaned up paths.
+    """
+    log("🔧 Scanning for broken/invalid symlinks...")
+    fixed = []
+    
+    for root in [TARGET_DIR, HIDDEN_DIR]:
+        try:
+            if not root.exists():
+                continue
+        except OSError:
+            continue
+            
+        for channel_dir in root.iterdir():
+            if not channel_dir.is_dir():
+                continue
+                
+            for video_dir in channel_dir.iterdir():
+                if not video_dir.is_dir():
+                    continue
+                    
+                video_file = video_dir / "video.mp4"
+                try:
+                    if video_file.exists() and not video_file.is_symlink():
+                        # This is a regular file (likely 0-byte from crash) - delete it
+                        size = video_file.stat().st_size
+                        video_file.unlink()
+                        log(f"   [FIXED] Deleted invalid file: {video_file} (was {size} bytes)")
+                        fixed.append(str(video_file))
+                except Exception as e:
+                    log(f"   ⚠️ Error checking {video_file}: {e}")
+                    
+    log(f"🔧 Cleanup complete. Removed {len(fixed)} invalid files.")
+    return fixed
+
+@app.route("/api/maintenance/fix-symlinks", methods=["POST"])
 @requires_auth
-def api_check_orphans():
-    orphaned = check_orphaned_links()
-    return jsonify({"status": "complete", "orphaned": orphaned, "count": len(orphaned)})
+def api_fix_symlinks():
+    """
+    Maintenance endpoint to clean up 0-byte files and broken symlinks
+    that were left by interrupted/crashed symlink creation.
+    """
+    def run_fix():
+        fixed = fix_broken_symlinks()
+        log(f"✅ Maintenance complete. Fixed {len(fixed)} entries.")
+        # After cleanup, trigger a scan to recreate proper symlinks
+        if fixed:
+            log("🔄 Triggering rescan to recreate symlinks...")
+            process_videos()
+    
+    threading.Thread(target=run_fix).start()
+    return jsonify({"status": "started", "message": "Symlink repair running in background"})
+
+@app.route("/maintenance")
+@requires_auth
+def maintenance_page():
+    return send_from_directory(app.static_folder, 'maintenance/index.html')
 
 @app.route("/transcode")
 @requires_auth
