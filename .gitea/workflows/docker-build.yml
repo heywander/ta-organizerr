@@ -12,6 +12,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      DOCKER_HOST: tcp://dind-daemon:2375
     permissions:
       contents: read
       packages: write
@@ -24,7 +26,7 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: git.unfilteredrealm.com
-          username: ${{ github.actor }}
+          username: ${{ gitea.actor }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
       - name: Extract metadata (tags, labels) for Docker
