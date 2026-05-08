@@ -10,10 +10,17 @@ from flask import Blueprint, jsonify
 from ..auth import requires_auth
 from ..config import DATA_DIR, HIDDEN_DIR, SOURCE_DIR, TARGET_DIR
 from ..logging_util import log
-from ..symlinks import fix_broken_symlinks, process_videos
+from ..symlinks import check_orphaned_links, fix_broken_symlinks, process_videos
 
 
 bp = Blueprint("maintenance", __name__, url_prefix="/api")
+
+
+@bp.route("/check-orphans", methods=["POST"])
+@requires_auth
+def api_check_orphans():
+    orphans = check_orphaned_links()
+    return jsonify({"count": len(orphans), "orphans": orphans})
 
 
 @bp.route("/maintenance/fix-symlinks", methods=["POST"])
