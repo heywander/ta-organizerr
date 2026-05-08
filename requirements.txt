@@ -1,2 +1,6 @@
-flask
-requests
+flask==3.0.3
+requests==2.32.3
+gunicorn==23.0.0
+flask-limiter==3.8.0
+werkzeug==3.0.4
+yt-dlp==2025.10.26

@@ -70,6 +70,11 @@ import Layout from "../layouts/Layout.astro";
     const errorMsg = document.getElementById('error-message');
     const submitBtn = document.getElementById('submit-btn');
 
+    // If no admin exists yet, send the user to first-run setup.
+    fetch('/api/auth/setup-status').then(r => r.json()).then(data => {
+        if (data.setup_required) window.location.href = '/setup';
+    }).catch(() => {});
+
     form?.addEventListener('submit', async (e) => {
         e.preventDefault();
         errorMsg?.classList.add('hidden');

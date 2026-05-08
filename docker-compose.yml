@@ -1,8 +1,8 @@
 services:
   tubesorter:
     build: .
-    # image: ghcr.io/salpertio/tubesorter:latest
     container_name: tubesorter
+    restart: unless-stopped
     volumes:
       - ./source:/app/source
       - ./target:/app/target
@@ -14,6 +14,14 @@ services:
     environment:
       - SCAN_INTERVAL=60
       - ALLOWED_IPS=127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12
-      # - UI_USERNAME=admin
-      # - UI_PASSWORD=password
-    env_file: .env
+      # First-run setup: hit the UI, you'll be redirected to /setup to create
+      # the admin account. Credentials are hashed and stored in /app/data/videos.db.
+      # FLASK_SECRET_KEY is auto-generated and persisted in the same DB on
+      # first boot. Override here if you'd rather rotate it externally:
+      # - FLASK_SECRET_KEY=change-me-to-a-random-48-byte-secret
+      # Set to "true" only when serving over HTTPS (e.g. behind a reverse proxy
+      # that terminates TLS) — it forces the Secure flag on the session cookie.
+      - SESSION_COOKIE_SECURE=false
+    env_file:
+      - path: .env
+        required: false
