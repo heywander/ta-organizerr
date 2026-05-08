@@ -12,6 +12,11 @@ services:
     ports:
       - "8002:5000"
     environment:
+      # PUID/PGID set the runtime uid/gid the app drops to. Match these to the
+      # host user that owns ./data, ./target, ./hidden, ./import. On Unraid,
+      # the standard pair is 99:100 (nobody:users). Defaults to 1000:1000.
+      - PUID=99
+      - PGID=100
       - SCAN_INTERVAL=60
       - ALLOWED_IPS=127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12
       # First-run setup: hit the UI, you'll be redirected to /setup to create
