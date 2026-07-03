@@ -2,7 +2,8 @@ name: Docker Build
 
 on:
   push:
-    branches: [ "main" , "feature/ui-login-rework"]
+    branches: [ "main", "test", "feature/**" ]
+    tags: [ "v*" ]
     paths-ignore:
       - 'README.md'
       - '.gitignore'
@@ -31,34 +32,62 @@ jobs:
 
       - name: Show image tags
         run: |
-          echo "git.unfilteredrealm.com/wander/ta-organizerr:latest"
-          echo "git.unfilteredrealm.com/wander/ta-organizerr:main"
-          echo "git.unfilteredrealm.com/wander/ta-organizerr:${{ github.sha }}"
+          IMAGE="git.unfilteredrealm.com/wander/ta-organizerr"
+          REF_TYPE="${GITHUB_REF_TYPE:-branch}"
+          REF_NAME="${GITHUB_REF_NAME:-main}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          elif [ "$REF_NAME" = "main" ]; then
+            TAG="latest"
+          else
+            TAG="$(printf '%s' "$REF_NAME" | tr '[:upper:]/' '[:lower:]-')"
+          fi
+          echo "${IMAGE}:${TAG}"
 
       - name: Build Docker image
         run: |
           IMAGE="git.unfilteredrealm.com/wander/ta-organizerr"
-          SHA="${{ github.sha }}"
+          REF_TYPE="${GITHUB_REF_TYPE:-branch}"
+          REF_NAME="${GITHUB_REF_NAME:-main}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          elif [ "$REF_NAME" = "main" ]; then
+            TAG="latest"
+          else
+            TAG="$(printf '%s' "$REF_NAME" | tr '[:upper:]/' '[:lower:]-')"
+          fi
           docker build \
             --label "org.opencontainers.image.source=https://git.unfilteredrealm.com/wander/ta-organizerr" \
-            --label "org.opencontainers.image.revision=${SHA}" \
-            -t "${IMAGE}:latest" \
-            -t "${IMAGE}:main" \
-            -t "${IMAGE}:${SHA}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            -t "${IMAGE}:${TAG}" \
             .
-          docker image inspect "${IMAGE}:${SHA}" --format 'Built image {{.Id}} for revision {{index .Config.Labels "org.opencontainers.image.revision"}}'
+          docker image inspect "${IMAGE}:${TAG}" --format 'Built image {{.Id}} for revision {{index .Config.Labels "org.opencontainers.image.revision"}}'
 
       - name: Push Docker image
         run: |
           IMAGE="git.unfilteredrealm.com/wander/ta-organizerr"
-          SHA="${{ github.sha }}"
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:main"
-          docker push "${IMAGE}:${SHA}"
+          REF_TYPE="${GITHUB_REF_TYPE:-branch}"
+          REF_NAME="${GITHUB_REF_NAME:-main}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          elif [ "$REF_NAME" = "main" ]; then
+            TAG="latest"
+          else
+            TAG="$(printf '%s' "$REF_NAME" | tr '[:upper:]/' '[:lower:]-')"
+          fi
+          docker push "${IMAGE}:${TAG}"
 
       - name: Verify published image
         run: |
           IMAGE="git.unfilteredrealm.com/wander/ta-organizerr"
-          SHA="${{ github.sha }}"
-          docker manifest inspect "${IMAGE}:${SHA}" >/tmp/published-manifest.json
+          REF_TYPE="${GITHUB_REF_TYPE:-branch}"
+          REF_NAME="${GITHUB_REF_NAME:-main}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          elif [ "$REF_NAME" = "main" ]; then
+            TAG="latest"
+          else
+            TAG="$(printf '%s' "$REF_NAME" | tr '[:upper:]/' '[:lower:]-')"
+          fi
+          docker manifest inspect "${IMAGE}:${TAG}" >/tmp/published-manifest.json
           cat /tmp/published-manifest.json
