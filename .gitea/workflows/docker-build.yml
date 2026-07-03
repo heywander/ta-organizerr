@@ -34,7 +34,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: git.unfilteredrealm.com/${{ github.repository }}
-          tags: type=raw,value=latest
+          tags: |
+            type=raw,value=latest
+            type=ref,event=branch
+            type=sha,prefix=sha-
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
