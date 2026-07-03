@@ -29,20 +29,18 @@ jobs:
           username: ${{ gitea.actor }}
           password: ${{ secrets.DOCKER_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: git.unfilteredrealm.com/${{ github.repository }}
-          tags: |
-            type=raw,value=latest
-            type=ref,event=branch
-            type=sha,prefix=sha-
+      - name: Show image tags
+        run: |
+          echo "git.unfilteredrealm.com/wander/ta-organizerr:latest"
+          echo "git.unfilteredrealm.com/wander/ta-organizerr:main"
+          echo "git.unfilteredrealm.com/wander/ta-organizerr:${{ github.sha }}"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            git.unfilteredrealm.com/wander/ta-organizerr:latest
+            git.unfilteredrealm.com/wander/ta-organizerr:main
+            git.unfilteredrealm.com/wander/ta-organizerr:${{ github.sha }}
