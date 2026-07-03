@@ -19,12 +19,14 @@ from ..recovery import (
     recover_video_metadata,
     scan_for_unindexed_videos,
 )
-from ..ta_api import fetch_all_metadata
+from ..ta_api import MetadataFetchError, fetch_all_metadata
 from ..utils import (
     extract_id_from_filename,
     is_valid_youtube_id,
+    path_in_allowed_tree,
     path_within,
-    translate_host_path,
+    resolve_media_source,
+    translated_symlink_target,
     translate_ta_path,
 )
 
@@ -38,6 +40,25 @@ SCAN_CACHE: dict[str, object] = {
     "last_run": None,
 }
 _SCAN_LOCK = threading.Lock()
+
+
+def _validated_entry_path(filepath: str | None) -> tuple[Path | None, tuple[object, int] | None]:
+    if not filepath:
+        return None, (jsonify({"error": "No filepath provided"}), 400)
+    path = Path(filepath)
+    if not path_in_allowed_tree(path, RECOVERY_ALLOWED_BASES):
+        return None, (jsonify({"error": "Path outside allowed directories"}), 400)
+    return path, None
+
+
+def _validated_media_source(filepath: str | None) -> tuple[Path | None, tuple[object, int] | None]:
+    path, error = _validated_entry_path(filepath)
+    if error:
+        return None, error
+    source = resolve_media_source(path)
+    if not source or not path_within(source, RECOVERY_ALLOWED_BASES):
+        return None, (jsonify({"error": "Resolved media path outside allowed directories"}), 400)
+    return source, None
 
 
 @bp.route("/scan", methods=["POST"])
@@ -74,13 +95,11 @@ def api_recovery_poll():
 @requires_auth
 def api_recovery_start():
     data = request.get_json(silent=True) or {}
-    filepath = data.get("filepath")
-    if not filepath:
-        return jsonify({"error": "No filepath provided"}), 400
-    if not path_within(Path(filepath), RECOVERY_ALLOWED_BASES):
-        return jsonify({"error": "Path outside allowed directories"}), 400
-    success, msg = recover_video_metadata(filepath)
-    log(f"Recovery Result for {filepath}: {msg}")
+    media_path, error = _validated_media_source(data.get("filepath"))
+    if error:
+        return error
+    success, msg = recover_video_metadata(str(media_path))
+    log(f"Recovery Result for {media_path}: {msg}")
     return jsonify({
         "message": msg,
         "success": success,
@@ -92,13 +111,11 @@ def api_recovery_start():
 @requires_auth
 def api_recovery_force():
     data = request.get_json(silent=True) or {}
-    filepath = data.get("filepath")
-    if not filepath:
-        return jsonify({"error": "No filepath provided"}), 400
-    if not path_within(Path(filepath), RECOVERY_ALLOWED_BASES):
-        return jsonify({"error": "Path outside allowed directories"}), 400
-    log(f"💪 Force Importing (Lost Media): {Path(filepath).name}")
-    success, msg = force_import(filepath)
+    media_path, error = _validated_media_source(data.get("filepath"))
+    if error:
+        return error
+    log(f"💪 Force Importing (Lost Media): {media_path.name}")
+    success, msg = force_import(str(media_path))
     if success:
         return jsonify({"success": True, "message": msg})
     # 404 if the file is missing, 400/500 otherwise.
@@ -109,14 +126,11 @@ def api_recovery_force():
 @requires_auth
 def api_recovery_delete():
     data = request.get_json(silent=True) or {}
-    filepath = data.get("filepath")
-    if not filepath:
-        return jsonify({"error": "No filepath provided"}), 400
-    if not path_within(Path(filepath), RECOVERY_ALLOWED_BASES):
-        return jsonify({"error": "Path outside allowed directories"}), 400
+    p, error = _validated_entry_path(data.get("filepath"))
+    if error:
+        return error
 
-    p = Path(filepath)
-    if not p.exists() or not p.is_file():
+    if not os.path.lexists(p) or p.is_dir():
         return jsonify({"error": "File not found"}), 404
 
     vid_id = extract_id_from_filename(p.name)
@@ -125,9 +139,9 @@ def api_recovery_delete():
         if vid_id and is_valid_youtube_id(vid_id):
             with get_db() as conn:
                 conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
-                conn.execute("DELETE FROM videos WHERE symlink = ?", (filepath,))
+                conn.execute("DELETE FROM videos WHERE symlink = ?", (str(p),))
                 conn.commit()
-        log(f"🗑️ Deleted file: {filepath}")
+        log(f"🗑️ Deleted file: {p}")
         return jsonify({"success": True, "message": "File deleted"})
     except OSError as exc:
         log(f"❌ Delete failed: {exc}")
@@ -142,7 +156,7 @@ def _resolve_destruct_source(p: Path, vid_id: str | None, video_map: dict) -> Pa
         try:
             target_raw = os.readlink(p)
             log(f"   [DESTRUCT] Symlink target: {target_raw}")
-            candidates.append(translate_host_path(target_raw))
+            candidates.append(translated_symlink_target(p))
         except OSError as exc:
             log(f"   [DESTRUCT] Warning: Could not read symlink {p}: {exc}")
 
@@ -187,12 +201,16 @@ def api_recovery_delete_batch():
 
     log(f"🔥 Batch Delete started. Items: {len(paths)}, Destruct: {destruct}")
 
-    video_map = fetch_all_metadata() if destruct else {}
+    try:
+        video_map = fetch_all_metadata() if destruct else {}
+    except MetadataFetchError as exc:
+        log(f"❌ Batch delete aborted before changes; metadata fetch failed: {exc}")
+        return jsonify({"error": "Could not fetch TubeArchivist metadata"}), 502
 
     for path in paths:
         try:
             p = Path(path)
-            if not path_within(p, RECOVERY_ALLOWED_BASES):
+            if not path_in_allowed_tree(p, RECOVERY_ALLOWED_BASES):
                 fail_count += 1
                 err = f"Path outside allowed directories: {path}"
                 log(f"⛔ {err}")

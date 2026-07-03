@@ -11,7 +11,7 @@ from ..db import get_db
 from ..logging_util import transcode_log_buffer, transcode_log_lock, tlog
 from ..recovery import RECOVERY_ALLOWED_BASES
 from ..transcode import detect_encoder, transcode_video
-from ..utils import clamp_pagination, path_within
+from ..utils import clamp_pagination, path_in_allowed_tree
 
 
 bp = Blueprint("transcode", __name__, url_prefix="/api/transcode")
@@ -54,7 +54,7 @@ def api_transcode_start():
     filepath = data.get("filepath")
     if not filepath:
         return jsonify({"error": "No filepath provided"}), 400
-    if not path_within(Path(filepath), RECOVERY_ALLOWED_BASES):
+    if not path_in_allowed_tree(Path(filepath), RECOVERY_ALLOWED_BASES):
         return jsonify({"error": "Path outside allowed directories"}), 400
 
     encoder = detect_encoder()

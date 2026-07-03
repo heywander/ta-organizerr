@@ -17,7 +17,16 @@ from .utils import (
     extract_id_from_filename,
     is_valid_youtube_id,
     is_video,
+    translate_ta_path,
 )
+
+
+def _iter_video_files(root: Path):
+    if not root.exists():
+        return
+    for path in root.rglob("*"):
+        if path.is_file() and is_video(path):
+            yield path
 
 
 def scan_for_unindexed_videos() -> dict[str, list[dict[str, Any]]]:
@@ -36,56 +45,49 @@ def scan_for_unindexed_videos() -> dict[str, list[dict[str, Any]]]:
         "lost": [],
     }
 
-    if SOURCE_DIR.exists():
-        for channel_path in SOURCE_DIR.iterdir():
-            if not channel_path.is_dir():
+    for video_file in _iter_video_files(SOURCE_DIR):
+        vid_id = extract_id_from_filename(video_file.name)
+        if not vid_id or vid_id in known_ids:
+            continue
+        info = {
+            "path": str(video_file),
+            "filename": video_file.name,
+            "video_id": vid_id,
+            "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2),
+            "ta_source": "Source Dir",
+        }
+        bucket = "lost" if vid_id in lost_ids else "unindexed"
+        results[bucket].append(info)
+
+    for root, source_label in ((TARGET_DIR, "Target Dir"), (HIDDEN_DIR, "Hidden Dir")):
+        for video_file in _iter_video_files(root):
+            if video_file.is_symlink():
                 continue
-            for video_file in channel_path.glob("*.*"):
-                if not is_video(video_file):
-                    continue
-                vid_id = extract_id_from_filename(video_file.name)
-                if not vid_id or vid_id in known_ids:
-                    continue
-                info = {
+            vid_id = extract_id_from_filename(video_file.name)
+            if not vid_id:
+                continue
+            size_mb = round(video_file.stat().st_size / (1024 * 1024), 2)
+            if vid_id not in known_ids:
+                results["unindexed"].append({
                     "path": str(video_file),
                     "filename": video_file.name,
                     "video_id": vid_id,
-                    "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2),
-                    "ta_source": "Source Dir",
-                }
-                bucket = "lost" if vid_id in lost_ids else "unindexed"
-                results[bucket].append(info)
-
-    if TARGET_DIR.exists():
-        for channel_path in TARGET_DIR.iterdir():
-            if not channel_path.is_dir():
-                continue
-            for video_file in channel_path.glob("*.*"):
-                if not is_video(video_file) or video_file.is_symlink():
-                    continue
-                vid_id = extract_id_from_filename(video_file.name)
-                if not vid_id:
-                    continue
-                size_mb = round(video_file.stat().st_size / (1024 * 1024), 2)
-                if vid_id not in known_ids:
-                    results["unindexed"].append({
-                        "path": str(video_file),
-                        "filename": video_file.name,
-                        "video_id": vid_id,
-                        "type": "target_realfile",
-                        "size_mb": size_mb,
-                    })
-                    continue
-
-                ta_source_path = Path(video_map[vid_id]["filesystem_path"]) if video_map[vid_id].get("filesystem_path") else None
-                bucket = "redundant" if (ta_source_path and ta_source_path.exists()) else "rescue"
-                results[bucket].append({
-                    "path": str(video_file),
-                    "filename": video_file.name,
-                    "video_id": vid_id,
-                    "ta_source": str(ta_source_path) if ta_source_path else None,
+                    "type": "target_realfile",
+                    "ta_source": source_label,
                     "size_mb": size_mb,
                 })
+                continue
+
+            raw_source = video_map[vid_id].get("filesystem_path")
+            ta_source_path = translate_ta_path(raw_source) if raw_source else None
+            bucket = "redundant" if (ta_source_path and ta_source_path.exists()) else "rescue"
+            results[bucket].append({
+                "path": str(video_file),
+                "filename": video_file.name,
+                "video_id": vid_id,
+                "ta_source": str(ta_source_path) if ta_source_path else None,
+                "size_mb": size_mb,
+            })
 
     log(
         f"✅ Scan complete. Unindexed: {len(results['unindexed'])}, "

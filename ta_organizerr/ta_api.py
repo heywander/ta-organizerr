@@ -7,6 +7,10 @@ from .config import API_URL, HEADERS
 from .logging_util import log
 
 
+class MetadataFetchError(RuntimeError):
+    """Raised when TubeArchivist metadata could not be fetched completely."""
+
+
 def fetch_all_metadata() -> dict[str, dict]:
     """Walk the TA paginated video endpoint and return ``{video_id: metadata}``."""
     log("📥 Fetching all video metadata...")
@@ -18,11 +22,17 @@ def fetch_all_metadata() -> dict[str, dict]:
             response = requests.get(url, headers=HEADERS, timeout=30)
             response.raise_for_status()
             data = response.json()
-        except requests.RequestException as exc:
-            log(f"❌ Error fetching page {page}: {exc}")
-            break
+        except (requests.RequestException, ValueError) as exc:
+            msg = f"Error fetching TubeArchivist metadata page {page}: {exc}"
+            log(f"❌ {msg}")
+            raise MetadataFetchError(msg) from exc
 
-        if "data" not in data or not data["data"]:
+        if not isinstance(data, dict) or "data" not in data:
+            msg = f"Unexpected TubeArchivist response on page {page}"
+            log(f"❌ {msg}")
+            raise MetadataFetchError(msg)
+
+        if not data["data"]:
             break
 
         for video in data["data"]:

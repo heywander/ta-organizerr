@@ -1,11 +1,12 @@
 """Hardware/software transcoding via ffmpeg."""
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
+from .config import HIDDEN_DIR, IMPORT_DIR, SOURCE_DIR, TARGET_DIR
 from .logging_util import tlog
+from .utils import path_within, resolve_media_source
 
 
 def detect_encoder() -> str:
@@ -49,27 +50,6 @@ def probe_codecs(filepath: str) -> tuple[str | None, str | None]:
     return _probe("v:0"), _probe("a:0")
 
 
-def _resolve_symlink_to_container(filepath: str) -> str | None:
-    original = Path(filepath)
-    if original.is_symlink():
-        try:
-            actual = Path(os.readlink(original)).resolve()
-        except OSError as exc:
-            tlog(f"Error resolving symlink: {exc}")
-            return None
-        tlog(f"Following symlink: {filepath} -> {actual}")
-        actual_str = str(actual)
-        if actual_str.startswith("/mnt/user/tubearchives/bp"):
-            container = actual_str.replace("/mnt/user/tubearchives/bp", "/app/source", 1)
-            tlog(f"Translated path: {actual} -> {container}")
-            return container
-        return actual_str
-    if not original.exists():
-        tlog(f"File not found: {filepath}")
-        return None
-    return filepath
-
-
 def _build_cmd(filepath: str, temp_file: str, video_codec: str | None, encoder: str) -> list[str]:
     base = ["ffmpeg", "-v", "error", "-stats"]
     audio_args = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-y", temp_file]
@@ -94,11 +74,15 @@ def _build_cmd(filepath: str, temp_file: str, video_codec: str | None, encoder: 
 
 
 def transcode_video(filepath: str, encoder: str = "libx264") -> bool:
-    resolved = _resolve_symlink_to_container(filepath)
-    if not resolved:
+    resolved_path = resolve_media_source(filepath)
+    allowed_bases = (SOURCE_DIR, TARGET_DIR, HIDDEN_DIR, IMPORT_DIR)
+    if not resolved_path or not path_within(resolved_path, allowed_bases):
+        tlog(f"Rejected path outside allowed directories: {filepath}")
         return False
-    filepath = resolved
-    if not Path(filepath).exists():
+    if Path(filepath) != resolved_path:
+        tlog(f"Resolved media path: {filepath} -> {resolved_path}")
+    filepath = str(resolved_path)
+    if not resolved_path.exists():
         tlog(f"Source file not found: {filepath}")
         return False
 

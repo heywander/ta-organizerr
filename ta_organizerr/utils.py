@@ -1,6 +1,7 @@
 """Pure helpers: filename parsing, sanitization, path translation, validation."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Iterable, Optional
@@ -40,11 +41,25 @@ def sanitize(text: str) -> str:
     return text.strip()
 
 
+def _relative_to(candidate: Path, base: Path) -> Path | None:
+    try:
+        return candidate.relative_to(base)
+    except ValueError:
+        return None
+
+
 def translate_ta_path(ta_path: Optional[str | Path]) -> Optional[Path]:
     """Map a TubeArchivist-internal path (``/youtube/Channel/...``) into ``SOURCE_DIR``."""
     if not ta_path:
         return None
     p = Path(ta_path)
+    host_path = translate_host_path(p)
+    if host_path != p:
+        return host_path
+    if _relative_to(p, SOURCE_DIR) is not None:
+        return p
+    if not p.is_absolute():
+        return SOURCE_DIR / p
     parts = list(p.parts)
     if len(parts) > 2 and parts[0] == "/":
         return SOURCE_DIR / Path(*parts[2:])
@@ -55,22 +70,43 @@ def translate_host_path(host_path: Optional[str | Path]) -> Optional[Path]:
     """Map a host filesystem path (``HOST_SOURCE_BASE/...``) into ``SOURCE_DIR``."""
     if not host_path:
         return None
-    host_path_str = str(host_path)
-    fixed_prefix = "/mnt/user/tubearchives/bp"
-    if host_path_str.startswith(fixed_prefix):
-        rel = host_path_str[len(fixed_prefix):].lstrip("/")
-        return SOURCE_DIR / rel
-    host_base_str = str(HOST_SOURCE_BASE)
-    if host_path_str.startswith(host_base_str):
-        rel = host_path_str[len(host_base_str):].lstrip("/")
-        return SOURCE_DIR / rel
-    return Path(host_path)
+    p = Path(host_path)
+    if _relative_to(p, SOURCE_DIR) is not None:
+        return p
+    for prefix in (Path("/mnt/user/tubearchives/bp"), HOST_SOURCE_BASE):
+        rel = _relative_to(p, prefix)
+        if rel is not None:
+            return SOURCE_DIR / rel
+    return p
 
 
-def path_within(candidate: Path, allowed_bases: Iterable[Path]) -> bool:
-    """Return True iff ``candidate`` (after symlink resolution) lives inside one of ``allowed_bases``."""
+def translated_symlink_target(path: Path) -> Optional[Path]:
+    """Return a symlink target translated into container paths when possible."""
     try:
-        resolved = candidate.resolve(strict=False)
+        raw_target = Path(os.readlink(path))
+    except OSError:
+        return None
+    if not raw_target.is_absolute():
+        raw_target = path.parent / raw_target
+    return translate_host_path(raw_target)
+
+
+def resolve_media_source(path: str | Path) -> Optional[Path]:
+    """Resolve a user-facing media path to the file the app should read/write."""
+    candidate = Path(path)
+    if os.path.islink(candidate):
+        return translated_symlink_target(candidate)
+    return translate_host_path(candidate)
+
+
+def path_within(candidate: Path, allowed_bases: Iterable[Path], *, follow_symlinks: bool = True) -> bool:
+    """Return True iff ``candidate`` lives inside one of ``allowed_bases``.
+
+    ``follow_symlinks=False`` validates the path entry itself, which is needed
+    for operations that delete or inspect a symlink without trusting its target.
+    """
+    try:
+        resolved = candidate.resolve(strict=False) if follow_symlinks else Path(os.path.abspath(candidate))
     except OSError:
         return False
     for base in allowed_bases:
@@ -80,6 +116,11 @@ def path_within(candidate: Path, allowed_bases: Iterable[Path]) -> bool:
         except ValueError:
             continue
     return False
+
+
+def path_in_allowed_tree(candidate: Path, allowed_bases: Iterable[Path]) -> bool:
+    """Validate the directory entry without following the final symlink."""
+    return path_within(candidate, allowed_bases, follow_symlinks=False)
 
 
 def clamp_pagination(page: object, per_page: object, default_per_page: int = 100) -> tuple[int, int]:

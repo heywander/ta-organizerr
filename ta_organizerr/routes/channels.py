@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request
 
 from ..auth import requires_auth
 from ..db import get_db
-from ..ta_api import fetch_all_metadata
+from ..ta_api import MetadataFetchError, fetch_all_metadata
 
 
 bp = Blueprint("channels", __name__, url_prefix="/api/channels")
@@ -31,7 +31,10 @@ def api_get_channel_videos():
     if not channel_name:
         return jsonify({"error": "No channel name provided"}), 400
 
-    video_map = fetch_all_metadata()
+    try:
+        video_map = fetch_all_metadata()
+    except MetadataFetchError as exc:
+        return jsonify({"error": str(exc)}), 502
     with get_db() as conn:
         rows = conn.execute(
             "SELECT video_id, title, symlink, is_live FROM videos WHERE channel = ? ORDER BY published DESC",

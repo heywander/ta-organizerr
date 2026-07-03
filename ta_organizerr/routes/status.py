@@ -8,7 +8,7 @@ from flask import Blueprint, jsonify, request
 from ..auth import requires_auth
 from ..db import get_db
 from ..logging_util import log_buffer, log_lock
-from ..symlinks import cleanup_old_folders, process_videos
+from ..symlinks import cleanup_old_folders, process_videos, scan_is_running
 
 
 bp = Blueprint("status", __name__, url_prefix="/api")
@@ -30,7 +30,7 @@ def api_status():
             })
     total = len(videos)
     linked = sum(1 for v in videos if v["status"] == "linked")
-    missing = sum(1 for v in videos if v["status"] == "missing")
+    missing = sum(1 for v in videos if v["status"] != "linked")
     return jsonify({
         "total_videos": total,
         "verified_links": linked,
@@ -56,6 +56,8 @@ def api_logs():
 @bp.route("/scan", methods=["POST"])
 @requires_auth
 def api_scan():
+    if scan_is_running():
+        return jsonify({"status": "running", "message": "Scan already in progress"}), 202
     threading.Thread(target=process_videos, daemon=True).start()
     return jsonify({"status": "started"})
 

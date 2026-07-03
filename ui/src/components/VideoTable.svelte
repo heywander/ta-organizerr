@@ -14,7 +14,11 @@
             searchTerm === "" ||
             v.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
             v.video_id.includes(searchTerm);
-        const matchStatus = statusFilter === "" || v.status === statusFilter;
+        const matchStatus =
+            statusFilter === "" ||
+            (statusFilter === "problem"
+                ? v.status !== "linked"
+                : v.status === statusFilter);
         const matchChannel =
             channelFilter === "" || v.channel === channelFilter;
         return matchSearch && matchStatus && matchChannel;
@@ -38,7 +42,7 @@
             >
                 <option value="">All Status</option>
                 <option value="linked">Linked</option>
-                <option value="missing">Missing</option>
+                <option value="problem">Missing / Error</option>
             </select>
 
             <select
