@@ -6,109 +6,99 @@ interface Props {
 }
 
 const { title } = Astro.props;
+const path = Astro.url.pathname.replace(/\/+$/, "") || "/";
+const isAuthPage = path === "/login" || path === "/setup";
 ---
 
 <!doctype html>
 <html lang="en">
     <head>
         <meta charset="UTF-8" />
-        <meta name="description" content="TubeSorterr Dashboard" />
-        <meta name="viewport" content="width=device-width" />
+        <meta
+            name="description"
+            content="TubeSorter — organized access to a TubeArchivist library"
+        />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
         <meta name="generator" content={Astro.generator} />
-        <title>{title} | TubeSorterr</title>
-        <link
-            href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;600;800&display=swap"
-            rel="stylesheet"
-        />
-        <link
-            rel="stylesheet"
-            href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css"
-        />
+        <title>{title} | TubeSorter</title>
     </head>
-    <body
-        class="min-h-screen flex flex-col relative selection:bg-neon-pink selection:text-white"
-    >
-        <!-- Background Grid Effect -->
-        <div
-            class="fixed inset-0 z-[-1] opacity-20 pointer-events-none"
-            style="background-image: linear-gradient(rgba(0, 243, 255, 0.1) 1px, transparent 1px), linear-gradient(90deg, rgba(0, 243, 255, 0.1) 1px, transparent 1px); background-size: 50px 50px;"
-        >
-        </div>
-
-        <nav
-            class="border-b border-gray-800 bg-cyber-dark/80 backdrop-blur-md sticky top-0 z-50"
-        >
-            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                <div class="flex items-center justify-between h-16">
-                    <div class="flex items-center">
-                        <a
-                            href="/"
-                            class="flex items-center group hover:opacity-80 transition-opacity"
-                        >
-                            <i
-                                class="bi bi-collection-play-fill mr-2 text-neon-cyan text-2xl group-hover:text-neon-pink transition-colors"
-                            ></i>
-                            <span
-                                class="text-2xl font-bold tracking-tighter italic bg-clip-text text-transparent bg-gradient-to-r from-neon-cyan to-neon-pink pr-2 pb-1"
-                            >
-                                TUBESORTER
-                            </span>
-                        </a>
-                    </div>
-                    <div class="hidden md:block">
-                        <div class="ml-10 flex items-baseline space-x-4">
-                            <a
-                                href="/"
-                                class="text-gray-300 hover:text-neon-cyan hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors"
-                            >
-                                <i class="bi bi-speedometer2 mr-1"></i> Dashboard
-                            </a>
-                            <a
-                                href="/transcode"
-                                class="text-gray-300 hover:text-neon-pink hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors"
-                            >
-                                <i class="bi bi-film mr-1"></i> Transcoding
-                            </a>
-                            <button
-                                id="logout-btn"
-                                class="text-gray-500 hover:text-neon-pink hover:bg-white/5 px-3 py-2 rounded-md text-sm font-medium transition-colors cursor-pointer"
-                            >
-                                <i class="bi bi-box-arrow-right mr-1"></i> Logout
-                            </button>
-                        </div>
-                    </div>
-                    <div>
-                        <span
-                            class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-900/30 text-neon-green border border-neon-green/30 shadow-[0_0_10px_rgba(57,255,20,0.2)]"
-                        >
-                            <span
-                                class="w-2 h-2 mr-1 bg-neon-green rounded-full animate-pulse"
-                            ></span>
-                            Online
+    <body>
+        <div class="app-frame">
+            <header class="app-header">
+                <div class="app-header__row">
+                    <a class="brand" href={isAuthPage ? "/login" : "/"}>
+                        <i class="bi bi-collection-play-fill brand__mark"></i>
+                        <span>
+                            <span class="brand__name">TubeSorter</span>
+                            <span class="brand__meta">Archive organizer</span>
                         </span>
+                    </a>
+
+                    {
+                        !isAuthPage && (
+                            <nav class="nav-tabs" aria-label="Primary navigation">
+                                <a
+                                    href="/"
+                                    aria-label="Library"
+                                    aria-current={path === "/" ? "page" : undefined}
+                                >
+                                    <i class="bi bi-grid-1x2-fill"></i>
+                                    <span class="nav-label">Library</span>
+                                </a>
+                                <a
+                                    href="/transcode"
+                                    aria-label="Transcode"
+                                    aria-current={path === "/transcode" ? "page" : undefined}
+                                >
+                                    <i class="bi bi-film"></i>
+                                    <span class="nav-label">Transcode</span>
+                                </a>
+                                <a
+                                    href="/maintenance"
+                                    aria-label="Maintenance"
+                                    aria-current={path === "/maintenance" ? "page" : undefined}
+                                >
+                                    <i class="bi bi-tools"></i>
+                                    <span class="nav-label">Maintenance</span>
+                                </a>
+                                <a
+                                    href="/reconciliation"
+                                    aria-label="Link Reconciliation"
+                                    aria-current={path === "/reconciliation" ? "page" : undefined}
+                                >
+                                    <i class="bi bi-link-45deg"></i>
+                                    <span class="nav-label">Links</span>
+                                </a>
+                                <button id="logout-btn" type="button" aria-label="Sign out">
+                                    <i class="bi bi-box-arrow-right"></i>
+                                    <span class="nav-label">Sign out</span>
+                                </button>
+                            </nav>
+                        )
+                    }
+
+                    <div class="connection-state" aria-label="Session state">
+                        <span class="connection-state__dot"></span>
+                        <span>{isAuthPage ? "Local access" : "Session active"}</span>
                     </div>
                 </div>
-            </div>
-        </nav>
+            </header>
 
-        <main class="flex-grow container mx-auto px-4 py-8">
-            <slot />
-        </main>
+            <main class="app-main">
+                <slot />
+            </main>
 
-        <footer
-            class="border-t border-gray-800 py-6 mt-8 text-center text-gray-500 text-sm"
-        >
-            <p>TUBESORTER // SYSTEM_V2 // BUN_POWERED</p>
-        </footer>
+        </div>
+
         <script>
-            const logoutBtn = document.getElementById('logout-btn');
-            logoutBtn?.addEventListener('click', async () => {
+            const logoutBtn = document.getElementById("logout-btn");
+            logoutBtn?.addEventListener("click", async () => {
                 try {
-                    const res = await fetch('/api/auth/logout', { method: 'POST' });
-                    if (res.ok) window.location.href = '/login';
+                    const res = await fetch("/api/auth/logout", { method: "POST" });
+                    if (res.ok) window.location.href = "/login";
                 } catch (err) {
-                    console.error('Logout failed', err);
+                    console.error("Logout failed", err);
                 }
             });
         </script>

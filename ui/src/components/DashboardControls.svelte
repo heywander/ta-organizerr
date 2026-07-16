@@ -1,124 +1,191 @@
 <script lang="ts">
     import { createEventDispatcher } from "svelte";
+
     const dispatch = createEventDispatcher();
 
     let scanning = false;
+    let scanResult: string | null = null;
+    let scanState: "neutral" | "error" = "neutral";
     let checkingOrphans = false;
     let orphanResult: string | null = null;
+    let orphanState: "neutral" | "success" | "warning" | "error" = "neutral";
 
     async function readResponse(res: Response): Promise<any> {
         const body = await res.json().catch(() => ({}));
         if (!res.ok) {
             throw new Error(
-                body.error || body.message || `Request failed with status ${res.status}`,
+                body.error ||
+                    body.message ||
+                    `Request failed with status ${res.status}`,
             );
         }
         return body;
     }
 
     async function triggerScan() {
-        if (!confirm("Start full library scan?")) return;
+        if (!confirm("Start a full library scan?")) return;
         scanning = true;
+        scanResult = null;
+        scanState = "neutral";
         try {
             const res = await fetch("/api/scan", { method: "POST" });
-            await readResponse(res);
+            const data = await readResponse(res);
+            scanResult =
+                data.status === "running"
+                    ? "A full scan is already running. Follow the system log for progress."
+                    : "Full scan started in the background. Follow the system log for progress.";
             dispatch("scan");
-            // Reset scanning state after a bit since it's async background
-            setTimeout(() => (scanning = false), 2000);
-        } catch (e) {
-            alert("Error: " + e);
+        } catch (error) {
+            scanResult = "Scan request failed: " + error;
+            scanState = "error";
+        } finally {
             scanning = false;
         }
     }
 
     async function checkOrphans() {
         checkingOrphans = true;
-        orphanResult = "Measuring quantum fluctuations (scanning)...";
+        orphanResult = "Checking for orphaned links…";
+        orphanState = "neutral";
         try {
             const res = await fetch("/api/check-orphans", {
                 method: "POST",
             });
             const data = await readResponse(res);
             if (data.count === 0) {
-                orphanResult = "✅ All systems nominal. No orphans.";
+                orphanResult = "No orphaned links found.";
+                orphanState = "success";
             } else {
-                orphanResult = `⚠️ Found ${data.count} orphaned links!`;
+                orphanResult = `${data.count} orphaned ${data.count === 1 ? "link" : "links"} found.`;
+                orphanState = "warning";
             }
-        } catch (e) {
-            orphanResult = "❌ Sensor Error: " + e;
+        } catch (error) {
+            orphanResult = "Orphan check failed: " + error;
+            orphanState = "error";
         } finally {
             checkingOrphans = false;
         }
     }
 </script>
 
-<div class="flex flex-col gap-4">
+<div class="operations-grid">
     <button
-        class="btn-cyber-primary w-full py-4 text-lg font-bold uppercase tracking-wider shadow-lg flex items-center justify-center gap-2 group relative overflow-hidden"
+        class="button-primary operation-primary"
         on:click={triggerScan}
         disabled={scanning}
     >
-        {#if scanning}
-            <span class="animate-spin"><i class="bi bi-arrow-repeat"></i></span>
-            Scanning...
-        {:else}
-            <div
-                class="absolute inset-0 bg-neon-cyan/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300"
-            ></div>
-            <i
-                class="bi bi-arrow-repeat group-hover:rotate-180 transition-transform duration-500"
-            ></i> Run Full Scan
-        {/if}
+        <i
+            class={`bi ${scanning ? "bi-arrow-repeat operation-spinner" : "bi-arrow-clockwise"}`}
+            aria-hidden="true"
+        ></i>
+        {scanning ? "Submitting…" : "Run full scan"}
     </button>
 
-    <div class="grid grid-cols-2 gap-3">
-        <button
-            class="btn-cyber-secondary py-3 text-sm font-semibold border border-neon-yellow/30 text-neon-yellow hover:bg-neon-yellow/10 transition-colors rounded-lg flex items-center justify-center gap-2"
-            on:click={checkOrphans}
-            disabled={checkingOrphans}
-        >
-            <i class="bi bi-binoculars"></i> Check Orphans
+    <div class="operation-segments">
+        <button class="button" on:click={checkOrphans} disabled={checkingOrphans}>
+            <i class="bi bi-link-45deg" aria-hidden="true"></i>
+            {checkingOrphans ? "Checking…" : "Check links"}
         </button>
-
-        <button
-            class="btn-cyber-secondary py-3 text-sm font-semibold border border-neon-pink/30 text-neon-pink hover:bg-neon-pink/10 transition-colors rounded-lg flex items-center justify-center gap-2"
-            on:click={() => dispatch("openRecovery")}
-        >
-            <i class="bi bi-bandaid"></i> Recovery Mode
+        <button class="button" on:click={() => dispatch("openRecovery")}>
+            <i class="bi bi-life-preserver" aria-hidden="true"></i>
+            Recovery
         </button>
-
-        <button
-            class="btn-cyber-secondary py-3 text-sm font-semibold border border-purple-500/30 text-purple-400 hover:bg-purple-500/10 transition-colors rounded-lg flex items-center justify-center gap-2 col-span-2"
-            on:click={() => dispatch("openHidden")}
-        >
-            <i class="bi bi-eye-slash"></i> Hidden Channels
+        <button class="button" on:click={() => dispatch("openHidden")}>
+            <i class="bi bi-eye-slash" aria-hidden="true"></i>
+            Hidden
         </button>
     </div>
 
+    {#if scanResult}
+        <div
+            class="operation-result"
+            data-state={scanState}
+            role={scanState === "error" ? "alert" : "status"}
+        >
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>{scanResult}</span>
+        </div>
+    {/if}
+
     {#if orphanResult}
         <div
-            class="mt-2 p-3 rounded bg-black/40 border border-gray-700 text-xs font-mono"
+            class="operation-result"
+            data-state={orphanState}
+            role={orphanState === "error" ? "alert" : "status"}
         >
-            {orphanResult}
+            <span class="status-dot" aria-hidden="true"></span>
+            <span>{orphanResult}</span>
         </div>
     {/if}
 </div>
 
 <style>
-    .btn-cyber-primary {
-        background: linear-gradient(45deg, #00f3ff, #0066ff);
-        color: black;
-        border: none;
-        border-radius: 0.5rem;
-        transition: all 0.3s ease;
+    .operations-grid {
+        display: grid;
+        gap: 8px;
     }
-    .btn-cyber-primary:hover {
-        filter: brightness(1.2);
-        box-shadow: 0 0 20px rgba(0, 243, 255, 0.4);
+
+    .operation-primary {
+        width: 100%;
     }
-    .btn-cyber-primary:disabled {
-        background: #333;
-        color: #666;
-        cursor: not-allowed;
+
+    .operation-segments {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .operation-segments :global(.button) {
+        min-width: 0;
+        padding-inline: 6px;
+        border-right-width: 0;
+        font-size: 11px;
+    }
+
+    .operation-segments :global(.button:last-child) {
+        border-right-width: 1px;
+    }
+
+    .operation-result {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        min-height: 32px;
+        padding: 7px 9px;
+        border: 1px solid var(--line-soft);
+        background: var(--page-deep);
+        color: var(--text-soft);
+        font-size: 11px;
+    }
+
+    .operation-result .status-dot {
+        flex: 0 0 auto;
+        margin-top: 4px;
+    }
+
+    .operation-result[data-state="warning"] .status-dot {
+        background: var(--warning);
+    }
+
+    .operation-result[data-state="neutral"] .status-dot {
+        background: var(--accent);
+    }
+
+    .operation-result[data-state="error"] {
+        border-color: var(--danger);
+        color: #f0d4ce;
+    }
+
+    .operation-result[data-state="error"] .status-dot {
+        background: var(--danger);
+    }
+
+    .operation-spinner {
+        animation: operation-spin 900ms linear infinite;
+    }
+
+    @keyframes operation-spin {
+        to {
+            transform: rotate(360deg);
+        }
     }
 </style>

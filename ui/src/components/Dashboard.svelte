@@ -61,14 +61,12 @@
     }
 
     function handleScanTriggered() {
-        // Maybe show a toast or log
-        // Refetch data soon
         setTimeout(fetchData, 2000);
     }
 
     onMount(() => {
         fetchData();
-        interval = setInterval(fetchData, 10000); // reduced polling for full list
+        interval = setInterval(fetchData, 10000);
     });
 
     onDestroy(() => {
@@ -76,13 +74,12 @@
         clearInterval(interval);
     });
 
-    $: systemStatus = loading ? "CHECKING" : error ? "OFFLINE" : "ONLINE";
-    $: systemColor = error ? "red" : loading ? "yellow" : "pink";
+    $: systemStatus = loading ? "Checking" : error ? "Unavailable" : "Available";
+    $: systemColor = error ? "red" : loading ? "yellow" : "green";
 </script>
 
-<div class="space-y-8">
-    <!-- Stats Row -->
-    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+<div class="space-y-3">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
         <StatsCard
             title="Total Videos"
             value={stats.total_videos}
@@ -101,9 +98,8 @@
             color="red"
             icon="bi-exclamation-triangle"
         />
-        <!-- Placeholder for symmetry or future stat -->
         <StatsCard
-            title="System Status"
+            title="Service"
             value={systemStatus}
             color={systemColor}
             icon="bi-cpu"
@@ -111,40 +107,34 @@
     </div>
 
     {#if error}
-        <div
-            class="rounded border border-red-500/40 bg-red-900/20 px-4 py-3 text-sm text-red-300"
-            role="alert"
-        >
+        <div class="notice notice--error" role="alert">
             Status refresh failed: {error}
         </div>
     {/if}
 
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div class="lg:col-span-1 space-y-6">
-            <div
-                class="bg-cyber-card border border-gray-800 rounded-xl p-6 shadow-lg relative overflow-hidden group"
-            >
-                <div
-                    class="absolute inset-0 bg-neon-cyan/5 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"
-                ></div>
-                <h3
-                    class="text-lg font-bold mb-4 flex items-center text-white neon-text-cyan"
-                >
-                    <i class="bi bi-joystick mr-2"></i> Control Deck
-                </h3>
+    <div class="dashboard-grid">
+        <section class="panel dashboard-actions">
+            <div class="panel-header">
+                <h2 class="section-title">
+                    <i class="bi bi-sliders"></i> Actions
+                </h2>
+            </div>
+            <div class="p-3">
                 <DashboardControls
                     on:scan={handleScanTriggered}
                     on:openRecovery={() => (showRecovery = true)}
                     on:openHidden={() => (showHiddenManager = true)}
                 />
             </div>
+        </section>
 
-            <LogViewer />
-        </div>
-
-        <div class="lg:col-span-2">
+        <section class="dashboard-library">
             <VideoTable {videos} {loading} />
-        </div>
+        </section>
+
+        <aside class="dashboard-log">
+            <LogViewer />
+        </aside>
     </div>
 
     {#if showRecovery}
@@ -155,3 +145,39 @@
         <HiddenManager on:close={() => (showHiddenManager = false)} />
     {/if}
 </div>
+
+<style>
+    .dashboard-grid {
+        display: grid;
+        grid-template-areas:
+            "actions library"
+            "log library";
+        grid-template-columns: 300px minmax(0, 1fr);
+        gap: 12px;
+        align-items: start;
+    }
+
+    .dashboard-actions {
+        grid-area: actions;
+    }
+
+    .dashboard-library {
+        grid-area: library;
+        min-width: 0;
+    }
+
+    .dashboard-log {
+        grid-area: log;
+        min-width: 0;
+    }
+
+    @media (max-width: 1023px) {
+        .dashboard-grid {
+            grid-template-areas:
+                "actions"
+                "library"
+                "log";
+            grid-template-columns: minmax(0, 1fr);
+        }
+    }
+</style>

@@ -52,10 +52,11 @@ def _apply_security_headers(response):
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; img-src 'self' data: https:; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; "
-        "font-src 'self' data: https://fonts.gstatic.com https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline'; "
+        "font-src 'self' data:; "
         "script-src 'self' 'unsafe-inline'; "
         "connect-src 'self'; "
+        "media-src 'self'; "
         "frame-ancestors 'none'",
     )
     if SESSION_COOKIE_SECURE:
@@ -100,6 +101,7 @@ def create_app(initialize_db: bool = True) -> Flask:
     from .routes.maintenance import bp as maintenance_bp
     from .routes.pages import bp as pages_bp
     from .routes.recovery import bp as recovery_bp
+    from .routes.reconciliation import bp as reconciliation_bp
     from .routes.status import bp as status_bp
     from .routes.transcode import bp as transcode_bp
 
@@ -108,6 +110,7 @@ def create_app(initialize_db: bool = True) -> Flask:
     app.register_blueprint(maintenance_bp)
     app.register_blueprint(transcode_bp)
     app.register_blueprint(recovery_bp)
+    app.register_blueprint(reconciliation_bp)
     app.register_blueprint(channels_bp)
     app.register_blueprint(hidden_bp)
     app.register_blueprint(pages_bp)  # last — has the static catch-all

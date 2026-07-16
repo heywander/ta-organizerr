@@ -10,6 +10,7 @@ from flask import Blueprint, jsonify
 from ..auth import requires_auth
 from ..config import DATA_DIR, HIDDEN_DIR, IMPORT_DIR, SOURCE_DIR, TARGET_DIR
 from ..logging_util import log
+from ..library_lock import LIBRARY_MUTATION_LOCK
 from ..symlinks import check_orphaned_links, fix_broken_symlinks, process_videos
 
 
@@ -19,7 +20,8 @@ bp = Blueprint("maintenance", __name__, url_prefix="/api")
 @bp.route("/check-orphans", methods=["POST"])
 @requires_auth
 def api_check_orphans():
-    orphans = check_orphaned_links()
+    with LIBRARY_MUTATION_LOCK:
+        orphans = check_orphaned_links()
     return jsonify({"count": len(orphans), "orphans": orphans})
 
 
@@ -27,8 +29,11 @@ def api_check_orphans():
 @requires_auth
 def api_fix_symlinks():
     def run_fix():
-        fixed = fix_broken_symlinks()
-        log(f"✅ Maintenance complete. Fixed {len(fixed)} entries.")
+        with LIBRARY_MUTATION_LOCK:
+            fixed = fix_broken_symlinks()
+            log(f"✅ Maintenance complete. Fixed {len(fixed)} entries.")
+        # Never acquire the normal scan lock while holding the library lock:
+        # process_videos intentionally acquires them in the opposite order.
         if fixed:
             log("🔄 Triggering rescan to recreate symlinks...")
             process_videos()

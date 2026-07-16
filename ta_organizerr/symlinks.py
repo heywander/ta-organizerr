@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import threading
 import traceback
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
+from .library_lock import LIBRARY_MUTATION_LOCK
 from .ta_api import MetadataFetchError, fetch_all_metadata
 from .utils import (
     channel_component,
@@ -111,9 +113,17 @@ def check_orphaned_links() -> list[dict]:
         with get_db() as conn:
             conn.executemany(
                 """
-                INSERT OR REPLACE INTO videos
+                INSERT INTO videos
                 (video_id, title, channel, published, symlink, status)
                 VALUES (?, ?, ?, ?, ?, 'missing')
+                ON CONFLICT(video_id) DO UPDATE SET
+                    title = excluded.title,
+                    channel = excluded.channel,
+                    published = excluded.published,
+                    symlink = excluded.symlink,
+                    status = excluded.status,
+                    last_updated = CURRENT_TIMESTAMP
+                WHERE videos.adopted_real = 0
                 """,
                 missing_rows,
             )
@@ -125,6 +135,15 @@ def check_orphaned_links() -> list[dict]:
 def fix_broken_symlinks() -> list[str]:
     log("🔧 Scanning for broken/invalid symlinks...")
     fixed: list[str] = []
+    with get_db() as conn:
+        adopted_rows = conn.execute(
+            "SELECT symlink FROM videos WHERE adopted_real = 1 AND symlink IS NOT NULL"
+        ).fetchall()
+    adopted_entries = {
+        str(Path(row["symlink"]).parent.resolve(strict=False) / Path(row["symlink"]).name)
+        for row in adopted_rows
+        if isinstance(row["symlink"], str)
+    }
     for root in (TARGET_DIR, HIDDEN_DIR):
         try:
             if not root.exists():
@@ -135,6 +154,10 @@ def fix_broken_symlinks() -> list[str]:
             if video_file.is_symlink() or not video_file.is_file():
                 continue
             try:
+                entry_key = str(video_file.parent.resolve(strict=False) / video_file.name)
+                if entry_key in adopted_entries:
+                    log(f"   [PRESERVED] Explicitly adopted real media: {video_file}")
+                    continue
                 size = video_file.stat().st_size
                 if size == 0:
                     video_file.unlink()
@@ -260,6 +283,32 @@ def _index_managed_links(db_rows) -> dict[str, list[Path]]:
     return result
 
 
+def _paired_managed_path(path: Path) -> Path | None:
+    """Return the same relative entry in the opposite public/hidden root."""
+    try:
+        entry = path.parent.resolve(strict=False) / path.name
+        target_root = TARGET_DIR.resolve(strict=False)
+        hidden_root = HIDDEN_DIR.resolve(strict=False)
+        if entry.is_relative_to(target_root):
+            return HIDDEN_DIR / entry.relative_to(target_root)
+        if entry.is_relative_to(hidden_root):
+            return TARGET_DIR / entry.relative_to(hidden_root)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return None
+
+
+def _real_managed_entry(path: Path) -> bool:
+    try:
+        entry_stat = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(entry_stat.st_mode)
+        and path_in_allowed_tree(path, (TARGET_DIR, HIDDEN_DIR))
+    )
+
+
 def _remove_stale_managed_links(
     video_id: str,
     current_link: Path,
@@ -355,7 +404,10 @@ def process_videos() -> str | None:
         log(f"⏳ {msg}; skipping duplicate request.")
         return msg
     try:
-        return _process_videos_unlocked()
+        # Lock ordering is always scan lock, then the shared filesystem lock.
+        # Reconciliation never acquires the scan lock, preventing inversion.
+        with LIBRARY_MUTATION_LOCK:
+            return _process_videos_unlocked()
     finally:
         _SCAN_LOCK.release()
 
@@ -379,7 +431,7 @@ def _process_videos_unlocked() -> str | None:
     with get_db() as conn:
         rows = conn.execute("SELECT channel_name FROM hidden_channels").fetchall()
         prior_link_rows = conn.execute(
-            "SELECT video_id, symlink FROM videos WHERE symlink IS NOT NULL"
+            "SELECT video_id, symlink, adopted_real FROM videos WHERE symlink IS NOT NULL"
         ).fetchall()
     hidden_channels = {row["channel_name"] for row in rows}
     all_channel_names = {
@@ -393,6 +445,42 @@ def _process_videos_unlocked() -> str | None:
     cleanup_old_folders()
     _enforce_hidden_locations(hidden_channels, component_map)
     managed_link_index = _index_managed_links(prior_link_rows)
+    adopted_paths: dict[str, Path] = {}
+    adopted_updates: list[tuple[str, str, str]] = []
+    for row in prior_link_rows:
+        if (
+            "adopted_real" not in row.keys()
+            or not row["adopted_real"]
+            or not isinstance(row["symlink"], str)
+        ):
+            continue
+        stored = Path(row["symlink"])
+        paired = _paired_managed_path(stored)
+        current = next(
+            (candidate for candidate in (stored, paired) if candidate and _real_managed_entry(candidate)),
+            None,
+        )
+        if current is None:
+            continue
+        adopted_paths[row["video_id"]] = current
+        if str(current) != row["symlink"]:
+            adopted_updates.append((str(current), row["video_id"], row["symlink"]))
+
+    # Hidden/public migration must update adopted records even when a
+    # terminated video is absent from current TubeArchivist metadata and never
+    # enters the source-processing loop below.
+    if adopted_updates:
+        with get_db() as conn:
+            conn.executemany(
+                """
+                UPDATE videos SET symlink = ?, status = 'adopted',
+                                  adopted_real = 1,
+                                  last_updated = CURRENT_TIMESTAMP
+                WHERE video_id = ? AND symlink = ? AND adopted_real = 1
+                """,
+                adopted_updates,
+            )
+            conn.commit()
 
     new_links = 0
     verified_links = 0
@@ -431,8 +519,22 @@ def _process_videos_unlocked() -> str | None:
             )
 
             link_error = None
+            is_adopted = False
             try:
-                if not path_in_allowed_tree(dest_file, (target_root,)):
+                adopted_path = adopted_paths.get(video_id)
+                if adopted_path is not None:
+                    current_adopted = adopted_path if _real_managed_entry(adopted_path) else None
+                    if current_adopted is not None:
+                        # Adoption is an explicit operator decision. Preserve
+                        # the real file in place rather than replacing it on a
+                        # later normal scan.
+                        dest_file = current_adopted
+                        video_dir = current_adopted.parent
+                        is_adopted = True
+                        verified_links += 1
+                if is_adopted:
+                    pass
+                elif not path_in_allowed_tree(dest_file, (target_root,)):
                     link_error = f"Destination escapes target root: {dest_file}"
                 else:
                     is_new, is_verified, link_error = _ensure_symlink(
@@ -446,12 +548,12 @@ def _process_videos_unlocked() -> str | None:
                         log(f"   [NEW/FIX] Linked: {folder_name}")
                     elif is_verified:
                         verified_links += 1
-                    if not link_error:
+                    if not link_error and not is_adopted:
                         stale_link_retirements.append((video_id, dest_file))
             except OSError as exc:
                 link_error = str(exc)
 
-            row_status = "error" if link_error else "linked"
+            row_status = "error" if link_error else ("adopted" if is_adopted else "linked")
             if link_error:
                 log(f"   ❌ Link error for {folder_name}: {link_error}")
 
@@ -463,6 +565,7 @@ def _process_videos_unlocked() -> str | None:
                 str(dest_file),
                 1 if meta.get("is_live") else 0,
                 row_status,
+                1 if is_adopted else 0,
             ))
             processed_videos.append({
                 "video_id": video_id,
@@ -471,6 +574,7 @@ def _process_videos_unlocked() -> str | None:
                 "published": meta["published"],
                 "symlink": str(dest_file),
                 "status": row_status,
+                "adopted_real": is_adopted,
             })
     except Exception as exc:  # noqa: BLE001 — leave the previous DB snapshot intact
         log(f"❌❌❌ CRITICAL ERROR in process_videos: {exc}")
@@ -483,8 +587,8 @@ def _process_videos_unlocked() -> str | None:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO videos
-                (video_id, title, channel, published, symlink, is_live, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (video_id, title, channel, published, symlink, is_live, status, adopted_real)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 db_rows,
             )

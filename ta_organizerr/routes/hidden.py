@@ -6,6 +6,7 @@ from flask import Blueprint, jsonify, request
 from ..auth import requires_auth
 from ..db import get_db
 from ..logging_util import log
+from ..library_lock import LIBRARY_MUTATION_LOCK
 
 
 bp = Blueprint("hidden", __name__, url_prefix="/api/hidden")
@@ -31,9 +32,10 @@ def api_add_hidden():
     channel = raw_channel.strip() if isinstance(raw_channel, str) else ""
     if not channel:
         return jsonify({"error": "No channel name provided"}), 400
-    with get_db() as conn:
-        conn.execute("INSERT OR IGNORE INTO hidden_channels (channel_name) VALUES (?)", (channel,))
-        conn.commit()
+    with LIBRARY_MUTATION_LOCK:
+        with get_db() as conn:
+            conn.execute("INSERT OR IGNORE INTO hidden_channels (channel_name) VALUES (?)", (channel,))
+            conn.commit()
     log(f"🙈 Added to hidden list: {channel}")
     return jsonify({"success": True})
 
@@ -48,8 +50,9 @@ def api_remove_hidden():
     channel = raw_channel.strip() if isinstance(raw_channel, str) else ""
     if not channel:
         return jsonify({"error": "No channel name provided"}), 400
-    with get_db() as conn:
-        conn.execute("DELETE FROM hidden_channels WHERE channel_name = ?", (channel,))
-        conn.commit()
+    with LIBRARY_MUTATION_LOCK:
+        with get_db() as conn:
+            conn.execute("DELETE FROM hidden_channels WHERE channel_name = ?", (channel,))
+            conn.commit()
     log(f"👁️ Removed from hidden list: {channel}")
     return jsonify({"success": True})

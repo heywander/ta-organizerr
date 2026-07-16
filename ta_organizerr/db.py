@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS videos (
     symlink TEXT,
     status TEXT,
     is_live BOOLEAN DEFAULT 0,
+    adopted_real BOOLEAN DEFAULT 0,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS lost_media (
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS app_config (
 _MIGRATIONS = [
     "ALTER TABLE videos ADD COLUMN is_live BOOLEAN DEFAULT 0",
     "ALTER TABLE videos ADD COLUMN published TEXT",
+    "ALTER TABLE videos ADD COLUMN adopted_real BOOLEAN DEFAULT 0",
 ]
 
 

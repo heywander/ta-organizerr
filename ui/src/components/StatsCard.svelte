@@ -1,39 +1,65 @@
 <script lang="ts">
-  export let title: string;
-  export let value: number | string;
-  export let color: 'cyan' | 'green' | 'pink' | 'yellow' | 'red' = 'cyan';
-  export let icon: string = 'bi-activity';
-
-  const colors = {
-    cyan: 'border-neon-cyan/30 text-neon-cyan shadow-neon-cyan/20',
-    green: 'border-neon-green/30 text-neon-green shadow-neon-green/20',
-    pink: 'border-neon-pink/30 text-neon-pink shadow-neon-pink/20',
-    yellow: 'border-neon-yellow/30 text-neon-yellow shadow-neon-yellow/20',
-    red: 'border-red-500/30 text-red-500 shadow-red-500/20'
-  };
-
-  const bgColors = {
-    cyan: 'bg-neon-cyan/5 hover:bg-neon-cyan/10',
-    green: 'bg-neon-green/5 hover:bg-neon-green/10',
-    pink: 'bg-neon-pink/5 hover:bg-neon-pink/10',
-    yellow: 'bg-neon-yellow/5 hover:bg-neon-yellow/10',
-    red: 'bg-red-500/5 hover:bg-red-500/10'
-  };
-
-  $: baseColor = colors[color];
-  $: bgColor = bgColors[color];
+    export let title: string;
+    export let value: number | string;
+    export let color: "cyan" | "green" | "pink" | "yellow" | "red" =
+        "cyan";
+    export let icon = "bi-activity";
 </script>
 
-<div class="rounded-xl border backdrop-blur-sm p-5 transition-all duration-300 hover:scale-[1.02] hover:shadow-[0_0_15px_rgba(0,0,0,0.3)] {baseColor} {bgColor}">
-  <div class="flex justify-between items-start">
+<div class="stat-tile" data-tone={color}>
     <div>
-      <h3 class="text-gray-400 text-xs font-bold uppercase tracking-widest mb-1">{title}</h3>
-      <div class="text-4xl font-black tracking-tighter tabular-nums drop-shadow-md">
-        {value}
-      </div>
+        <div class="stat-tile__label">{title}</div>
+        <div class="stat-tile__value">{value}</div>
     </div>
-    <div class="p-2 rounded-lg bg-black/20 text-xl">
-      <i class="bi {icon}"></i>
-    </div>
-  </div>
+    <i class="bi {icon} stat-tile__icon" aria-hidden="true"></i>
 </div>
+
+<style>
+    .stat-tile {
+        display: flex;
+        min-height: 66px;
+        align-items: center;
+        justify-content: space-between;
+        padding: 9px 11px;
+        border: 1px solid var(--line-soft);
+        border-top: 2px solid var(--text-muted);
+        background: var(--surface);
+    }
+
+    .stat-tile[data-tone="green"] {
+        border-top-color: var(--success);
+    }
+
+    .stat-tile[data-tone="yellow"] {
+        border-top-color: var(--warning);
+    }
+
+    .stat-tile[data-tone="red"] {
+        border-top-color: var(--danger);
+    }
+
+    .stat-tile[data-tone="pink"] {
+        border-top-color: var(--accent);
+    }
+
+    .stat-tile__label {
+        color: var(--text-muted);
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+    }
+
+    .stat-tile__value {
+        margin-top: 3px;
+        color: var(--text);
+        font-size: clamp(18px, 2.5vw, 21px);
+        font-weight: 650;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .stat-tile__icon {
+        color: var(--text-muted);
+        font-size: 17px;
+    }
+</style>

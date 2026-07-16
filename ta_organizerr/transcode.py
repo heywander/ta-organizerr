@@ -18,6 +18,7 @@ from .config import (
     TARGET_DIR,
 )
 from .logging_util import tlog
+from .library_lock import LIBRARY_MUTATION_LOCK
 from .utils import path_within, resolve_media_source
 
 
@@ -199,13 +200,15 @@ def _release(source: Path) -> None:
 
 def delete_source_if_idle(source: Path) -> None:
     """Delete a source entry atomically with respect to transcode reservation."""
-    canonical = source.resolve(strict=True)
-    source_stat = source.stat()
-    identity = (source_stat.st_dev, source_stat.st_ino)
-    with _active_transcodes_lock:
-        if canonical in _active_transcodes or identity in _active_transcodes.values():
-            raise OSError(f"Source is currently being transcoded: {source}")
-        source.unlink()
+    # Global ordering for mutating paths is library lock, then transcode lock.
+    with LIBRARY_MUTATION_LOCK:
+        canonical = source.resolve(strict=True)
+        source_stat = source.stat()
+        identity = (source_stat.st_dev, source_stat.st_ino)
+        with _active_transcodes_lock:
+            if canonical in _active_transcodes or identity in _active_transcodes.values():
+                raise OSError(f"Source is currently being transcoded: {source}")
+            source.unlink()
 
 
 def _temporary_output(source: Path) -> Path:
@@ -229,24 +232,25 @@ def _commit_output(
             tlog(f"❌ ffmpeg produced no output for: {source}")
             return False
         temp_file.chmod(stat.S_IMODE(original_stat.st_mode))
-        with _active_transcodes_lock:
-            current_stat = source.stat()
-            original_identity = (
-                original_stat.st_dev,
-                original_stat.st_ino,
-                original_stat.st_size,
-                original_stat.st_mtime_ns,
-            )
-            current_identity = (
-                current_stat.st_dev,
-                current_stat.st_ino,
-                current_stat.st_size,
-                current_stat.st_mtime_ns,
-            )
-            if current_identity != original_identity:
-                tlog(f"❌ Source changed during transcode; refusing replacement: {source}")
-                return False
-            os.replace(temp_file, source)
+        with LIBRARY_MUTATION_LOCK:
+            with _active_transcodes_lock:
+                current_stat = source.stat()
+                original_identity = (
+                    original_stat.st_dev,
+                    original_stat.st_ino,
+                    original_stat.st_size,
+                    original_stat.st_mtime_ns,
+                )
+                current_identity = (
+                    current_stat.st_dev,
+                    current_stat.st_ino,
+                    current_stat.st_size,
+                    current_stat.st_mtime_ns,
+                )
+                if current_identity != original_identity:
+                    tlog(f"❌ Source changed during transcode; refusing replacement: {source}")
+                    return False
+                os.replace(temp_file, source)
     except OSError as exc:
         tlog(f"❌ Could not atomically replace {source}: {exc}")
         return False

@@ -61,6 +61,12 @@ def transcode_page():
     return _send("transcode/index.html")
 
 
+@bp.route("/reconciliation")
+@requires_auth
+def reconciliation_page():
+    return _send("reconciliation/index.html")
+
+
 @bp.route("/<path:path>")
 def static_assets(path):
     """Catch-all for built static files. Whitelist by extension."""

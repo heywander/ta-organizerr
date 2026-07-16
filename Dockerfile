@@ -1,5 +1,5 @@
 # --- Stage 1: Frontend Build (Bun) ---
-FROM oven/bun:1.1.34 AS frontend
+FROM oven/bun:1.3.14 AS frontend
 WORKDIR /app/ui
 
 COPY ui/package.json ui/bun.lock ./

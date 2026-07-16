@@ -5,137 +5,308 @@
     let searchTerm = "";
     let statusFilter = "";
 
-    // Channels derived from videos
-    $: channels = [...new Set(videos.map((v) => v.channel))].sort();
+    function isHealthyStatus(status: unknown): boolean {
+        return status === "linked" || status === "adopted";
+    }
+
+    $: channels = [
+        ...new Set(
+            videos
+                .map((video) => String(video.channel || "").trim())
+                .filter(Boolean),
+        ),
+    ].sort((a, b) => a.localeCompare(b));
     let channelFilter = "";
 
     $: filteredVideos = videos.filter((v) => {
         const matchSearch =
             searchTerm === "" ||
-            v.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            v.video_id.includes(searchTerm);
+            String(v.title || "")
+                .toLowerCase()
+                .includes(searchTerm.toLowerCase()) ||
+            String(v.video_id || "").includes(searchTerm);
         const matchStatus =
             statusFilter === "" ||
             (statusFilter === "problem"
-                ? v.status !== "linked"
-                : v.status === statusFilter);
+                ? !isHealthyStatus(v.status)
+                : statusFilter === "healthy"
+                  ? isHealthyStatus(v.status)
+                  : v.status === statusFilter);
         const matchChannel =
-            channelFilter === "" || v.channel === channelFilter;
+            channelFilter === "" || String(v.channel || "") === channelFilter;
         return matchSearch && matchStatus && matchChannel;
     });
 </script>
 
-<div
-    class="bg-cyber-card border border-gray-800 rounded-xl shadow-lg flex flex-col h-full overflow-hidden"
->
-    <div
-        class="p-4 border-b border-gray-800 bg-gray-900/50 flex flex-col sm:flex-row gap-3 justify-between items-center"
-    >
-        <h3 class="font-bold text-white flex items-center gap-2">
-            <i class="bi bi-grid-3x3"></i> Video Matrix
-        </h3>
+<section class="panel video-index" aria-labelledby="video-index-heading">
+    <header class="section-header video-index__header">
+        <div>
+            <h2 id="video-index-heading" class="section-title">
+                <i class="bi bi-collection-play" aria-hidden="true"></i>
+                Library index
+            </h2>
+            <p class="section-description">
+                {filteredVideos.length} of {videos.length} videos shown
+            </p>
+        </div>
 
-        <div class="flex gap-2 w-full sm:w-auto overflow-x-auto">
+        <div class="video-index__filters" role="group" aria-label="Video filters">
             <select
                 bind:value={statusFilter}
-                class="bg-black border border-gray-700 text-gray-300 text-xs rounded px-2 py-1 focus:border-neon-cyan focus:outline-none"
+                aria-label="Filter by link status"
+                title="Filter by link status"
             >
-                <option value="">All Status</option>
-                <option value="linked">Linked</option>
-                <option value="problem">Missing / Error</option>
+                <option value="">All statuses</option>
+                <option value="healthy">Linked or adopted</option>
+                <option value="problem">Missing or error</option>
             </select>
 
             <select
                 bind:value={channelFilter}
-                class="bg-black border border-gray-700 text-gray-300 text-xs rounded px-2 py-1 focus:border-neon-cyan focus:outline-none max-w-[150px]"
+                aria-label="Filter by channel"
+                title="Filter by channel"
             >
-                <option value="">All Channels</option>
+                <option value="">All channels</option>
                 {#each channels as ch}
                     <option value={ch}>{ch}</option>
                 {/each}
             </select>
 
-            <div class="relative">
+            <label class="video-index__search">
+                <span class="sr-only">Search videos</span>
+                <i class="bi bi-search" aria-hidden="true"></i>
                 <input
                     type="text"
                     bind:value={searchTerm}
-                    placeholder="Search..."
-                    class="bg-black border border-gray-700 text-gray-300 text-xs rounded pl-8 pr-2 py-1 w-full sm:w-40 focus:border-neon-cyan focus:outline-none transition-all focus:w-48"
+                    placeholder="Search title or ID"
                 />
-                <i
-                    class="bi bi-search absolute left-2 top-1.5 text-gray-500 text-xs"
-                ></i>
-            </div>
+            </label>
         </div>
-    </div>
+    </header>
 
-    <div
-        class="overflow-auto flex-grow max-h-[500px] scrollbar-thin scrollbar-thumb-gray-800"
-    >
-        <table class="w-full table-fixed text-left text-[11px] font-mono">
-            <thead
-                class="bg-black/50 text-gray-500 sticky top-0 backdrop-blur-sm z-10"
-            >
+    <div class="video-index__table-wrap">
+        <table class="video-index__table">
+            <thead>
                 <tr>
-                    <th class="px-2 py-2 w-7">St</th>
-                    <th class="px-2 py-2 w-20">Published</th>
-                    <th class="px-2 py-2 w-[28%]">Channel</th>
-                    <th class="px-2 py-2">Title</th>
-                    <th class="px-2 py-2 w-28">ID</th>
+                    <th class="status-column"><span class="sr-only">Status</span></th>
+                    <th class="published-column">Published</th>
+                    <th class="channel-column">Channel</th>
+                    <th>Title</th>
+                    <th class="id-column">Video ID</th>
                 </tr>
             </thead>
             <tbody>
                 {#if loading}
-                    <tr
-                        ><td
-                            colspan="5"
-                            class="p-8 text-center text-gray-500 animate-pulse"
-                            >Scanning matrix...</td
-                        ></tr
-                    >
+                    <tr>
+                        <td colspan="5" class="table-message">Loading library…</td>
+                    </tr>
                 {:else if filteredVideos.length === 0}
-                    <tr
-                        ><td colspan="5" class="p-8 text-center text-gray-500"
-                            >No signals found.</td
-                        ></tr
-                    >
+                    <tr>
+                        <td colspan="5" class="table-message">No videos match these filters.</td>
+                    </tr>
                 {:else}
                     {#each filteredVideos as v}
-                        <tr
-                            class="border-b border-gray-800/50 hover:bg-white/5 transition-colors group"
-                        >
-                            <td class="px-2 py-2">
-                                <div
-                                    class="w-2 h-2 rounded-full {v.status ===
-                                    'linked'
-                                        ? 'bg-neon-green shadow-[0_0_5px_rgba(57,255,20,0.5)]'
-                                        : 'bg-red-500 shadow-[0_0_5px_rgba(239,68,68,0.5)]'}"
-                                ></div>
+                        <tr>
+                            <td class="status-column">
+                                <span
+                                    class:status-dot--problem={!isHealthyStatus(v.status)}
+                                    class="status-dot"
+                                    role="img"
+                                    aria-label={v.status === "adopted" ? "Adopted real file" : isHealthyStatus(v.status) ? "Linked" : "Missing or errored"}
+                                    title={v.status === "adopted" ? "Adopted real file" : isHealthyStatus(v.status) ? "Linked" : "Missing or errored"}
+                                ></span>
                             </td>
-                            <td class="px-2 py-2 text-gray-400 tabular-nums leading-tight break-words"
-                                >{v.published}</td
-                            >
-                            <td
-                                class="px-2 py-2 text-neon-cyan/80 truncate"
-                                title={v.channel}>{v.channel}</td
-                            >
-                            <td
-                                class="px-2 py-2 font-semibold text-white group-hover:text-neon-pink transition-colors truncate"
-                                title={v.title}>{v.title}</td
-                            >
-                            <td class="px-2 py-2 text-gray-600 select-all break-all"
-                                >{v.video_id}</td
-                            >
+                            <td class="published-column tabular-nums">{v.published}</td>
+                            <td class="channel-column" title={v.channel}>{v.channel}</td>
+                            <td class="title-column" title={v.title}>
+                                <i class="bi bi-file-earmark-play" aria-hidden="true"></i>
+                                <span>{v.title}</span>
+                            </td>
+                            <td class="id-column" title={v.video_id}>{v.video_id}</td>
                         </tr>
                     {/each}
                 {/if}
             </tbody>
         </table>
     </div>
+</section>
 
-    <div
-        class="p-2 border-t border-gray-800 bg-black/30 text-right text-[10px] text-gray-500"
-    >
-        Showing {filteredVideos.length} / {videos.length} videos
-    </div>
-</div>
+<style>
+    .video-index {
+        display: flex;
+        min-height: 420px;
+        height: 100%;
+        flex-direction: column;
+        overflow: hidden;
+    }
+
+    .video-index__header {
+        align-items: flex-start;
+    }
+
+    .video-index__filters {
+        display: flex;
+        max-width: 100%;
+        gap: 6px;
+    }
+
+    .video-index__filters select {
+        width: auto;
+        max-width: 150px;
+        padding: 4px 24px 4px 8px;
+        font-size: 11px;
+    }
+
+    .video-index__search {
+        position: relative;
+        min-width: 170px;
+    }
+
+    .video-index__search i {
+        position: absolute;
+        top: 50%;
+        left: 9px;
+        z-index: 1;
+        color: var(--text-muted);
+        font-size: 11px;
+        transform: translateY(-50%);
+        pointer-events: none;
+    }
+
+    .video-index__search input {
+        width: 100%;
+        padding: 4px 8px 4px 28px;
+        font-size: 11px;
+    }
+
+    .video-index__table-wrap {
+        max-height: 500px;
+        flex: 1;
+        overflow: auto;
+    }
+
+    .video-index__table {
+        width: 100%;
+        table-layout: fixed;
+        text-align: left;
+        font-size: 11px;
+    }
+
+    .video-index__table thead {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+    }
+
+    .video-index__table th,
+    .video-index__table td {
+        height: 31px;
+        padding: 5px 9px;
+        border-bottom: 1px solid var(--line-soft);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .video-index__table th {
+        height: 29px;
+    }
+
+    .status-column {
+        width: 30px;
+        padding-right: 2px !important;
+        text-align: center;
+    }
+
+    .status-dot--problem {
+        border-color: color-mix(in srgb, var(--danger) 75%, var(--text-soft));
+        background: var(--danger);
+    }
+
+    .published-column {
+        width: 92px;
+        color: var(--text-muted);
+    }
+
+    .channel-column {
+        width: 27%;
+        color: var(--text-soft);
+    }
+
+    .title-column {
+        color: var(--text);
+    }
+
+    .title-column i {
+        margin-right: 7px;
+        color: var(--accent);
+    }
+
+    .title-column span {
+        font-weight: 600;
+    }
+
+    .id-column {
+        width: 118px;
+        color: var(--text-muted);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 10px;
+        user-select: all;
+    }
+
+    .table-message {
+        height: 112px !important;
+        color: var(--text-muted);
+        text-align: center;
+    }
+
+    @media (max-width: 720px) {
+        .video-index__header {
+            flex-direction: column;
+        }
+
+        .video-index__filters {
+            width: 100%;
+            overflow-x: auto;
+        }
+
+        .video-index__search {
+            min-width: 180px;
+            flex: 1;
+        }
+
+        .id-column {
+            display: none;
+        }
+
+        .channel-column {
+            width: 34%;
+        }
+    }
+
+    @media (max-width: 500px) {
+        .video-index__filters {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            overflow: visible;
+        }
+
+        .video-index__filters select {
+            width: 100%;
+            max-width: none;
+        }
+
+        .video-index__search {
+            min-width: 0;
+            grid-column: 1 / -1;
+        }
+
+        .published-column {
+            display: none;
+        }
+
+        .channel-column {
+            width: 38%;
+        }
+    }
+</style>

@@ -19,6 +19,10 @@ management, and optional FFmpeg transcoding.
 - Provides dashboard stats, logs, scan controls, and channel filters.
 - Checks and repairs broken symlinks and empty folders.
 - Scans for unindexed, redundant, rescue, and lost media.
+- Lets an authenticated administrator watch or listen to recovery candidates
+  in the browser before deciding how to classify or recover them.
+- Reconciles tracked records, organized links, source media, and unindexed
+  real files on a dedicated page before declaring a broken link truly missing.
 - Stages recovered videos and metadata into `/app/import`.
 - Can transcode media to H.264/AAC with FFmpeg.
 - Supports Docker and Unraid-style `PUID`/`PGID` ownership.
@@ -33,7 +37,7 @@ For local development without Docker:
 
 - Python 3.11+
 - Bun, for building the Astro/Svelte UI
-- FFmpeg and ffprobe, if using transcoding
+- FFmpeg and ffprobe, if using transcoding or Listen only recovery previews
 
 ## Configuration
 
@@ -168,6 +172,18 @@ migration.
 - Maintenance can remove empty folders and zero-byte invalid `video.*` files.
 - Orphan checks scan both target and hidden folders recursively.
 - Recovery can stage files plus `.info.json` metadata for TubeArchivist import.
+- Advanced Recovery can preview an allowed archive file without changing it.
+  Preview requests are authenticated, confined to configured media roots, and
+  streamed with byte-range support. Watching the original still depends on the
+  browser's container and codec support. **Listen only** provides a compatibility
+  fallback by converting the first audio track to a non-seekable MP3 stream with
+  FFmpeg; one compatibility stream can run at a time.
+- Link Reconciliation classifies healthy links, exact-ID repairs, ambiguous
+  matches, invalid media, real files where links were expected, and truly
+  missing entries. Repair is limited to one case-sensitive exact video-ID match;
+  similar titles and filenames are never used for automatic repair. Candidates
+  are checked as non-empty regular media files with `ffprobe` and can be watched
+  or heard before a decision.
 - Transcoding replaces the resolved source media file in place after FFmpeg
   completes successfully. It is limited to MP4, Matroska (`.mkv`), and MOV
   containers. It maps every input stream, copies metadata/chapters and
@@ -193,6 +209,14 @@ bin and the filesystem and SQLite changes are not one atomic transaction, so a
 partially successful batch is possible. Confirm the displayed paths, review the
 returned per-item errors, keep a current backup, and test with one disposable
 video before running a large batch.
+
+Link Reconciliation has narrower guarded actions. **Remove Broken Link** accepts
+only a currently broken symlink with one exact database owner, removes that link
+and row, and refuses a real file. **Forget Stale Record** changes SQLite only.
+**Adopt Existing Real File** records the existing file in place; it does not move
+or remove the media. Every reconciliation mutation checks the current inventory
+token and revalidates paths and media at action time. Successful mutations write
+an audit log entry and trigger an immediate inventory refresh.
 
 The maintenance repair removes only zero-byte invalid `video.*` files, but it is
 still wise to stop the service and snapshot `/app/data` before upgrades or bulk

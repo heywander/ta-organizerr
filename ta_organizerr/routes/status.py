@@ -8,6 +8,7 @@ from flask import Blueprint, jsonify, request
 from ..auth import requires_auth
 from ..db import get_db
 from ..logging_util import read_logs
+from ..library_lock import LIBRARY_MUTATION_LOCK
 from ..symlinks import cleanup_old_folders, process_videos, scan_is_running
 
 
@@ -29,8 +30,9 @@ def api_status():
                 "status": row["status"],
             })
     total = len(videos)
-    linked = sum(1 for v in videos if v["status"] == "linked")
-    missing = sum(1 for v in videos if v["status"] != "linked")
+    healthy_statuses = {"linked", "adopted"}
+    linked = sum(1 for v in videos if v["status"] in healthy_statuses)
+    missing = sum(1 for v in videos if v["status"] not in healthy_statuses)
     return jsonify({
         "total_videos": total,
         "verified_links": linked,
@@ -62,5 +64,9 @@ def api_scan():
 @bp.route("/cleanup", methods=["POST"])
 @requires_auth
 def api_cleanup():
-    threading.Thread(target=cleanup_old_folders, daemon=True).start()
+    def run_cleanup():
+        with LIBRARY_MUTATION_LOCK:
+            cleanup_old_folders()
+
+    threading.Thread(target=run_cleanup, daemon=True).start()
     return jsonify({"status": "started"})
