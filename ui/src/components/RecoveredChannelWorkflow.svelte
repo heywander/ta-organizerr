@@ -1893,8 +1893,10 @@
 <style>
     .channel-workflow {
         display: flex;
-        min-height: 100%;
+        height: 100%;
+        min-height: 0;
         flex-direction: column;
+        overflow: hidden;
         color: var(--text);
         background: var(--canvas, var(--page));
     }
