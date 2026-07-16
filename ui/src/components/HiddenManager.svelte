@@ -186,7 +186,7 @@
                 {:else}
                     {#each hiddenChannels as channel}
                         <div class="hidden-row">
-                            <span class="hidden-row__name">
+                            <span class="hidden-row__name" title={channel}>
                                 <i class="bi bi-folder-fill" aria-hidden="true"></i>
                                 {channel}
                             </span>
@@ -357,6 +357,75 @@
             width: 100%;
             height: 100dvh;
             max-height: 100dvh;
+        }
+
+        .hidden-dialog > header {
+            min-height: 56px;
+            padding-top: max(7px, env(safe-area-inset-top));
+            padding-right: max(10px, env(safe-area-inset-right));
+            padding-left: max(10px, env(safe-area-inset-left));
+        }
+
+        .hidden-body {
+            padding-right: max(12px, env(safe-area-inset-right));
+            padding-left: max(12px, env(safe-area-inset-left));
+        }
+
+        .hidden-body .notice {
+            flex-wrap: wrap;
+            overflow-wrap: anywhere;
+            line-height: 1.45;
+        }
+
+        .hidden-form__controls {
+            grid-template-columns: 1fr;
+            gap: 8px;
+        }
+
+        .hidden-form input,
+        .hidden-form button {
+            min-height: 44px;
+            font-size: 16px;
+        }
+
+        .hidden-form button {
+            width: 100%;
+        }
+
+        .icon-button,
+        .hidden-row button,
+        .hidden-footer button {
+            min-height: 44px;
+        }
+
+        .icon-button {
+            width: 44px;
+        }
+
+        .hidden-row {
+            min-height: 56px;
+            gap: 8px;
+            padding: 6px 6px 6px 10px;
+        }
+
+        .hidden-row__name {
+            overflow: visible;
+            font-size: 14px;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+            text-overflow: clip;
+            white-space: normal;
+        }
+
+        .hidden-footer {
+            min-height: 60px;
+            padding-right: max(12px, env(safe-area-inset-right));
+            padding-bottom: max(8px, env(safe-area-inset-bottom));
+            padding-left: max(12px, env(safe-area-inset-left));
+        }
+
+        .hidden-footer button {
+            min-width: 104px;
         }
     }
 </style>

@@ -7,7 +7,7 @@
 </script>
 
 <div class="stat-tile" data-tone={color}>
-    <div>
+    <div class="stat-tile__copy">
         <div class="stat-tile__label">{title}</div>
         <div class="stat-tile__value">{value}</div>
     </div>
@@ -61,5 +61,38 @@
     .stat-tile__icon {
         color: var(--text-muted);
         font-size: 17px;
+    }
+
+    @media (max-width: 600px) {
+        .stat-tile {
+            min-height: 72px;
+            padding: 10px;
+        }
+
+        .stat-tile__copy {
+            min-width: 0;
+        }
+
+        .stat-tile__label {
+            font-size: 11px;
+            line-height: 1.25;
+        }
+
+        .stat-tile__value {
+            overflow-wrap: anywhere;
+            font-size: 20px;
+            line-height: 1.1;
+        }
+
+        .stat-tile__icon {
+            margin-left: 6px;
+            font-size: 15px;
+        }
+    }
+
+    @media (max-width: 380px) {
+        .stat-tile__icon {
+            display: none;
+        }
     }
 </style>

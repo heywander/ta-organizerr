@@ -1544,20 +1544,86 @@
         .jobs-list { max-height: 420px; }
     }
     @media (max-width: 700px) {
+        .salvage-page :global(button),
+        .preview-backdrop :global(button) {
+            min-width: 44px;
+            min-height: 44px;
+        }
+
+        .salvage-page :global(input:not([type="checkbox"]):not([type="radio"])) {
+            min-height: 44px;
+            font-size: 16px;
+        }
+
         .salvage-brief { align-items: stretch; flex-direction: column; }
         .salvage-brief__rules { justify-content: flex-start; }
+        .salvage-workspace > .panel > .section-header { align-items: stretch; flex-direction: column; }
+        .salvage-workspace > .panel > .section-header > .button { width: 100%; }
         .path-row, .operation-grid { grid-template-columns: minmax(0, 1fr); }
+        .path-row > button { width: 100%; }
         .expected-entry { grid-template-columns: minmax(0, 1fr); }
         .operation-grid article { border-right: 0; border-bottom: 1px solid var(--line-soft); }
         .operation-grid article:last-child { border-bottom: 0; }
+        .operation-grid button { width: 100%; grid-column: 1 / -1; }
         .report-facts { grid-template-columns: minmax(0, 1fr); }
         .report-facts > div { border-right: 0; }
+        .candidate-section__heading { align-items: stretch; flex-direction: column; }
+        .candidate-section__actions { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr); }
+        .candidate-section__actions button { width: 100%; }
         .candidate-snapshot__heading { align-items: stretch; flex-direction: column; }
-        .candidate-snapshot__heading .button { align-self: flex-start; }
+        .candidate-snapshot__heading .button { width: 100%; align-self: stretch; }
         .candidate-snapshot__facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .candidate-snapshot__facts div:nth-child(2) { border-right: 0; }
         .candidate-snapshot__facts div:nth-child(-n + 2) { border-bottom: 1px solid var(--line-soft); }
         .candidate-list label { grid-template-columns: 16px minmax(0, 1fr); }
         .candidate-badge { display: none; }
+        .candidate-entry summary { display: flex; min-height: 44px; align-items: center; }
+        .candidate-snapshot > code,
+        .candidate-copy strong,
+        .candidate-copy small,
+        .candidate-copy code,
+        .job-file,
+        .job-output,
+        .job-detail span:first-child,
+        .preview-dialog header code {
+            overflow: visible;
+            text-overflow: clip;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+        .job-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+        .job-actions button { width: 100%; min-height: 44px; font-size: 11px; }
+        .job-duration { flex-wrap: wrap; }
+        .notice-dismiss { width: 44px; min-height: 44px; flex: 0 0 44px; }
+        .salvage-reality > div,
+        .salvage-notice > span,
+        .notice--error > span { min-width: 0; overflow-wrap: anywhere; }
+        .preview-backdrop {
+            align-items: stretch;
+            padding:
+                max(6px, env(safe-area-inset-top))
+                max(6px, env(safe-area-inset-right))
+                max(6px, env(safe-area-inset-bottom))
+                max(6px, env(safe-area-inset-left));
+        }
+        .preview-dialog {
+            width: 100%;
+            max-height: 100%;
+            margin: auto;
+            grid-template-rows: auto auto minmax(0, 1fr) auto;
+            overflow: auto;
+            overscroll-behavior: contain;
+        }
+        .preview-dialog > header .button-quiet { width: 44px; flex: 0 0 44px; }
+        .preview-tabs button { min-height: 44px; flex: 1; }
+        .preview-stage { min-height: min(240px, 40dvh); max-height: none; }
+        .preview-stage video { max-height: 100%; }
+        .audio-preview { padding: 14px; }
+        .preview-dialog > footer { padding-bottom: max(7px, env(safe-area-inset-bottom)); }
+    }
+
+    @media (max-width: 760px) and (max-height: 600px) {
+        .preview-stage { min-height: 140px; }
+        .audio-preview { gap: 10px; padding: 10px; }
     }
 </style>

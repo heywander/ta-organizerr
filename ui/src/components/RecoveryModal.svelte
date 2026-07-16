@@ -24,6 +24,9 @@
     };
 
     const UNKNOWN_SOURCE_CHANNEL = "__unknown_source_channel__";
+    const MOBILE_QUERY = "(max-width: 640px)";
+    const MOBILE_BATCH_SIZE = 60;
+    const MAX_DELETE_BATCH = 500;
 
     let activeTab: RecoveryTab = "unindexed";
     let scanning = false;
@@ -46,6 +49,10 @@
     let channelRequestSequence = 0;
     let channelAbortController: AbortController | null = null;
     let selectedUnindexedChannel = "";
+    let mobileView =
+        typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches;
+    let mobileVisibleCount = MOBILE_BATCH_SIZE;
+    let mobileMediaQuery: MediaQueryList | null = null;
 
     // Media preview state. The backend endpoint supports range requests, so the
     // native media element can seek without downloading an entire archive file.
@@ -140,6 +147,20 @@
             ),
             unknownCount,
         };
+    }
+
+    function resetMobileBatch() {
+        mobileVisibleCount = MOBILE_BATCH_SIZE;
+    }
+
+    function loadMoreRecoveryItems() {
+        mobileVisibleCount += MOBILE_BATCH_SIZE;
+    }
+
+    function handleMobileViewChange(event: MediaQueryListEvent) {
+        mobileView = event.matches;
+        resetMobileBatch();
+        selectedPaths = new Set();
     }
 
     function cancelPreviewRequest() {
@@ -372,6 +393,7 @@
         status = "starting";
         results = emptyResults();
         selectedPaths = new Set();
+        resetMobileBatch();
         operationError = null;
         try {
             const res = await fetch("/api/recovery/scan", {
@@ -406,6 +428,7 @@
                         lost: next.lost || [],
                     };
                     selectedPaths = new Set();
+                    resetMobileBatch();
                     scanning = false;
                     if (pollInterval) clearInterval(pollInterval);
                     pollInterval = undefined;
@@ -452,6 +475,7 @@
         selectedChannel = channel;
         channelVideos = [];
         selectedPaths = new Set();
+        resetMobileBatch();
         if (!channel) {
             searchingVideos = false;
             return;
@@ -493,6 +517,10 @@
         if (pollInterval) clearInterval(pollInterval);
         channelRequestSequence += 1;
         channelAbortController?.abort();
+        mobileMediaQuery?.removeEventListener(
+            "change",
+            handleMobileViewChange,
+        );
         cancelPreviewRequest();
         unloadPreviewMedia();
         document.body.style.overflow = previousBodyOverflow;
@@ -583,12 +611,18 @@
     }
 
     async function deleteSelected() {
-        const selectedItems = visibleItems.filter(
+        const selectedItems = selectionScopeItems.filter(
             (item) => selectedPaths.has(item.path) && canDeleteItem(item),
         );
         const paths = selectedItems.map((item) => item.path);
         if (paths.length === 0) {
             selectedPaths = new Set();
+            return;
+        }
+        if (paths.length > MAX_DELETE_BATCH) {
+            alert(
+                `Select no more than ${MAX_DELETE_BATCH} items for one batch. Nothing was deleted.`,
+            );
             return;
         }
 
@@ -639,6 +673,12 @@
         if (next.has(item.path)) {
             next.delete(item.path);
         } else {
+            if (next.size >= MAX_DELETE_BATCH) {
+                alert(
+                    `A recovery batch can contain at most ${MAX_DELETE_BATCH} items. Deselect one before adding another.`,
+                );
+                return;
+            }
             next.add(item.path);
         }
         selectedPaths = next;
@@ -665,11 +705,13 @@
             event.currentTarget as HTMLSelectElement
         ).value;
         selectedPaths = new Set();
+        resetMobileBatch();
     }
 
     function selectRecoveryTab(tab: RecoveryTab, focusTab = false) {
         activeTab = tab;
         selectedPaths = new Set();
+        resetMobileBatch();
         if (focusTab) {
             void tick().then(() =>
                 document.getElementById(`recovery-tab-${tab}`)?.focus(),
@@ -713,10 +755,21 @@
                     : sourceChannelId(item) === selectedUnindexedChannel,
             )
           : results[activeTab] || [];
-    $: selectableItems = visibleItems.filter(canDeleteItem);
+    $: renderedItems = mobileView
+        ? visibleItems.slice(0, mobileVisibleCount)
+        : visibleItems;
+    $: selectionScopeItems = mobileView ? renderedItems : visibleItems;
+    $: deletableScopeItems = selectionScopeItems.filter(canDeleteItem);
+    $: selectableItems = deletableScopeItems.slice(0, MAX_DELETE_BATCH);
+    $: bulkSelectionLabel = deletableScopeItems.length > MAX_DELETE_BATCH
+        ? `Select first ${MAX_DELETE_BATCH} of ${deletableScopeItems.length} deletable shown items`
+        : `Select all ${deletableScopeItems.length} deletable shown items`;
     $: allSelected =
         selectableItems.length > 0 &&
         selectableItems.every((item) => selectedPaths.has(item.path));
+    $: selectionIndeterminate =
+        !allSelected &&
+        deletableScopeItems.some((item) => selectedPaths.has(item.path));
 
     $: readOnlyPermissions = permissions
         ? (Object.entries(permissions).filter(
@@ -731,6 +784,9 @@
                 : null;
         previousBodyOverflow = document.body.style.overflow;
         document.body.style.overflow = "hidden";
+        mobileMediaQuery = window.matchMedia(MOBILE_QUERY);
+        mobileView = mobileMediaQuery.matches;
+        mobileMediaQuery.addEventListener("change", handleMobileViewChange);
         fetchChannels();
         checkPermissions();
         void tick().then(() => recoveryCloseButton?.focus());
@@ -906,14 +962,18 @@
                                 <thead>
                                     <tr>
                                         <th class="selection-column">
-                                            <input
-                                                type="checkbox"
-                                                checked={allSelected}
-                                                on:change={toggleAll}
-                                                disabled={selectableItems.length === 0}
-                                                class="recovery-checkbox"
-                                                aria-label="Select all available channel videos"
-                                            />
+                                            <label class="select-all-control" title={bulkSelectionLabel}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={allSelected}
+                                                    indeterminate={selectionIndeterminate}
+                                                    on:change={toggleAll}
+                                                    disabled={selectableItems.length === 0}
+                                                    class="recovery-checkbox"
+                                                    aria-label={bulkSelectionLabel}
+                                                />
+                                                <span aria-hidden="true">{bulkSelectionLabel}</span>
+                                            </label>
                                         </th>
                                         <th>Video ID</th>
                                         <th>Title</th>
@@ -921,21 +981,33 @@
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {#each channelVideos as item}
+                                    {#each renderedItems as item}
                                         <tr class:selected-row={selectedPaths.has(item.path)}>
                                             <td class="selection-column">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={selectedPaths.has(item.path)}
-                                                    on:change={() => toggleSelect(item)}
-                                                    disabled={!canDeleteItem(item)}
+                                                <label
+                                                    class="row-selection-control"
                                                     title={!itemPath(item) ? "No media path is available" : !canDeleteItem(item) ? "Enable Destruct Mode to select this source file" : "Select item"}
-                                                    class="recovery-checkbox"
-                                                    aria-label={`Select ${previewName(item)}`}
-                                                />
+                                                >
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedPaths.has(item.path)}
+                                                        on:change={() => toggleSelect(item)}
+                                                        disabled={!canDeleteItem(item)}
+                                                        class="recovery-checkbox"
+                                                        aria-label={`Select ${previewName(item)}`}
+                                                    />
+                                                </label>
                                             </td>
-                                            <td class="item-id">{item.video_id}</td>
-                                            <td class="item-name" title={item.title}>{item.title}</td>
+                                            <td class="item-id">
+                                                <span class="mobile-cell-label">Video ID: </span>{item.video_id}
+                                            </td>
+                                            <td class="item-name" title={item.title}>
+                                                <span class="mobile-cell-label mobile-cell-label--block">Title</span>
+                                                <span>{item.title}</span>
+                                                {#if item.path}
+                                                    <span class="mobile-item-path">{item.path}</span>
+                                                {/if}
+                                            </td>
                                             <td class="action-column">
                                                 <div class="row-actions">
                                                     <button
@@ -962,6 +1034,18 @@
                                     {/each}
                                 </tbody>
                             </table>
+                            {#if mobileView && renderedItems.length < visibleItems.length}
+                                <div class="mobile-load-more">
+                                    <button
+                                        class="button"
+                                        type="button"
+                                        on:click={loadMoreRecoveryItems}
+                                    >
+                                        Load more
+                                        <span>{renderedItems.length} of {visibleItems.length} shown</span>
+                                    </button>
+                                </div>
+                            {/if}
                         {:else}
                             <div class="empty-state">
                                 <i class="bi bi-broadcast" aria-hidden="true"></i>
@@ -1007,17 +1091,22 @@
                 {/if}
                 <div class="table-shell">
                 <table class="recovery-table">
+                    {#if visibleItems.length > 0}
                     <thead>
                         <tr>
                             <th class="selection-column">
-                                <input
-                                    type="checkbox"
-                                    checked={allSelected}
-                                    on:change={toggleAll}
-                                    disabled={selectableItems.length === 0}
-                                    class="recovery-checkbox"
-                                    aria-label="Select all available recovery items"
-                                />
+                                <label class="select-all-control" title={bulkSelectionLabel}>
+                                    <input
+                                        type="checkbox"
+                                        checked={allSelected}
+                                        indeterminate={selectionIndeterminate}
+                                        on:change={toggleAll}
+                                        disabled={selectableItems.length === 0}
+                                        class="recovery-checkbox"
+                                        aria-label={bulkSelectionLabel}
+                                    />
+                                    <span aria-hidden="true">{bulkSelectionLabel}</span>
+                                </label>
                             </th>
                             <th>ID</th>
                             <th>Filename / target path</th>
@@ -1025,25 +1114,37 @@
                             <th class="action-column">Action</th>
                         </tr>
                     </thead>
+                    {/if}
                     <tbody>
-                        {#each visibleItems as item}
+                        {#each renderedItems as item}
                             <tr class:selected-row={selectedPaths.has(item.path)}>
                                 <td class="selection-column">
-                                    <input
-                                        type="checkbox"
-                                        checked={selectedPaths.has(item.path)}
-                                        on:change={() => toggleSelect(item)}
-                                        disabled={!canDeleteItem(item)}
+                                    <label
+                                        class="row-selection-control"
                                         title={!itemPath(item) ? "No media path is available" : !canDeleteItem(item) ? "Enable Destruct Mode to select this source file" : "Select item"}
-                                        class="recovery-checkbox"
-                                        aria-label={`Select ${previewName(item)}`}
-                                    />
+                                    >
+                                        <input
+                                            type="checkbox"
+                                            checked={selectedPaths.has(item.path)}
+                                            on:change={() => toggleSelect(item)}
+                                            disabled={!canDeleteItem(item)}
+                                            class="recovery-checkbox"
+                                            aria-label={`Select ${previewName(item)}`}
+                                        />
+                                    </label>
                                 </td>
-                                <td class="item-id">{item.video_id}</td>
+                                <td class="item-id">
+                                    <span class="mobile-cell-label">ID: </span>{item.video_id}
+                                </td>
                                 <td class="item-name" title={item.path}>
-                                    {item.filename || item.path}
+                                    <span class="mobile-cell-label mobile-cell-label--block">Filename / target path</span>
+                                    <span>{item.filename || item.path}</span>
+                                    {#if item.filename && item.path && item.filename !== item.path}
+                                        <span class="mobile-item-path">{item.path}</span>
+                                    {/if}
                                 </td>
-                                <td>
+                                <td class="item-info">
+                                    <span class="mobile-cell-label">Info: </span>
                                     {#if activeTab === "unindexed"}
                                         <span
                                             class="source-channel-id"
@@ -1136,6 +1237,18 @@
                         {/if}
                     </tbody>
                 </table>
+                {#if mobileView && renderedItems.length < visibleItems.length}
+                    <div class="mobile-load-more">
+                        <button
+                            class="button"
+                            type="button"
+                            on:click={loadMoreRecoveryItems}
+                        >
+                            Load more
+                            <span>{renderedItems.length} of {visibleItems.length} shown</span>
+                        </button>
+                    </div>
+                {/if}
                 </div>
                 </div>
             {/if}
@@ -1561,6 +1674,22 @@
         accent-color: var(--text-secondary);
     }
 
+    .select-all-control,
+    .row-selection-control {
+        display: inline-grid;
+        place-items: center;
+        cursor: pointer;
+    }
+
+    .select-all-control > span {
+        display: none;
+    }
+
+    .select-all-control:has(.recovery-checkbox:disabled),
+    .row-selection-control:has(.recovery-checkbox:disabled) {
+        cursor: not-allowed;
+    }
+
     .destruct-toggle .recovery-checkbox {
         accent-color: var(--danger-rule);
     }
@@ -1746,6 +1875,10 @@
         min-height: 150px;
     }
 
+    .mobile-load-more {
+        display: none;
+    }
+
     .recovery-table {
         width: 100%;
         min-width: 680px;
@@ -1826,6 +1959,14 @@
 
     .item-name {
         color: var(--text);
+    }
+
+    .mobile-item-path {
+        display: none;
+    }
+
+    .mobile-cell-label {
+        display: none;
     }
 
     .source-flag {
@@ -2238,6 +2379,13 @@
             border-bottom: 0;
         }
 
+        .recovery-header {
+            min-height: 56px;
+            padding-top: max(5px, env(safe-area-inset-top));
+            padding-right: max(7px, env(safe-area-inset-right));
+            padding-left: max(10px, env(safe-area-inset-left));
+        }
+
         .recovery-heading h2 {
             font-size: 13px;
         }
@@ -2249,8 +2397,316 @@
             white-space: nowrap;
         }
 
+        .recovery-toolbar {
+            padding-right: max(8px, env(safe-area-inset-right));
+            padding-left: max(8px, env(safe-area-inset-left));
+        }
+
+        .recovery-overlay select {
+            font-size: 16px;
+        }
+
+        .button,
+        .icon-button,
+        .row-action,
+        .preview-close,
+        .preview-done,
+        .preview-mode-switch button {
+            min-height: 44px;
+        }
+
+        .button,
+        .row-action,
+        .preview-done,
+        .preview-mode-switch button {
+            font-size: 13px;
+        }
+
+        .icon-button,
+        .preview-close {
+            width: 44px;
+            height: 44px;
+        }
+
+        .destruct-toggle,
+        .scan-status {
+            min-height: 44px;
+        }
+
+        .recovery-checkbox {
+            width: 20px;
+            height: 20px;
+        }
+
+        .recovery-tabs {
+            padding-right: env(safe-area-inset-right);
+            padding-left: env(safe-area-inset-left);
+            scroll-snap-type: x proximity;
+        }
+
+        .recovery-tabs button {
+            min-width: 116px;
+            min-height: 44px;
+            scroll-snap-align: start;
+            font-size: 13px;
+        }
+
         .workspace-content {
-            padding: 5px;
+            padding-top: 5px;
+            padding-right: max(5px, env(safe-area-inset-right));
+            padding-bottom: max(5px, env(safe-area-inset-bottom));
+            padding-left: max(5px, env(safe-area-inset-left));
+        }
+
+        .field-group select,
+        .selector-refresh,
+        .filter-summary {
+            height: 44px;
+            min-height: 44px;
+        }
+
+        .unindexed-channel-selector {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            align-items: stretch;
+        }
+
+        .unindexed-channel-selector .field-group,
+        .filter-summary {
+            width: 100%;
+        }
+
+        .filter-summary {
+            justify-content: center;
+            font-size: 12px;
+        }
+
+        .table-shell {
+            overflow-x: hidden;
+            overscroll-behavior: contain;
+            background: var(--canvas);
+            border: 0;
+        }
+
+        .recovery-table,
+        .recovery-table tbody {
+            display: block;
+            width: 100%;
+            min-width: 0;
+        }
+
+        .recovery-table thead {
+            position: static;
+            display: block;
+            margin-bottom: 7px;
+        }
+
+        .recovery-table thead tr {
+            display: block;
+        }
+
+        .recovery-table thead th:not(.selection-column) {
+            display: none;
+        }
+
+        .recovery-table thead .selection-column {
+            display: block;
+            width: 100%;
+            min-height: 44px;
+            padding: 0;
+            border: 1px solid var(--rule-dim);
+            background: var(--frame);
+            text-align: left;
+        }
+
+        .select-all-control {
+            display: flex;
+            width: 100%;
+            min-height: 44px;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 9px;
+            padding: 8px 10px;
+        }
+
+        .select-all-control > span {
+            display: inline;
+            color: var(--text-secondary);
+            font-family: Tahoma, Verdana, Arial, sans-serif;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+
+        .recovery-table tbody tr {
+            display: grid;
+            grid-template-columns: 44px minmax(0, 1fr);
+            gap: 3px 8px;
+            margin-bottom: 7px;
+            padding: 9px;
+            border: 1px solid var(--rule-dim);
+        }
+
+        .recovery-table tbody tr:last-child {
+            margin-bottom: 0;
+        }
+
+        .recovery-table td {
+            display: block;
+            width: auto;
+            height: auto;
+            padding: 0;
+            border: 0;
+            overflow: visible;
+            text-overflow: clip;
+            white-space: normal;
+        }
+
+        .recovery-table .selection-column {
+            display: grid;
+            width: 44px;
+            min-height: 44px;
+            grid-column: 1;
+            grid-row: 1 / span 3;
+            align-self: start;
+            place-items: center;
+            padding: 0;
+        }
+
+        .row-selection-control {
+            width: 44px;
+            height: 44px;
+        }
+
+        .select-all-control .recovery-checkbox,
+        .row-selection-control .recovery-checkbox {
+            width: 20px;
+            height: 20px;
+        }
+
+        .recovery-table .item-name {
+            grid-column: 2;
+            grid-row: 1;
+            font-family: Tahoma, Verdana, Arial, sans-serif;
+            font-size: 14px;
+            font-weight: 700;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }
+
+        .mobile-item-path {
+            display: block;
+            margin-top: 4px;
+            color: var(--muted);
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 11px;
+            font-weight: 400;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }
+
+        .recovery-table .item-id {
+            width: auto;
+            grid-column: 2;
+            grid-row: 2;
+            color: var(--muted);
+            font-size: 11px;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+
+        .mobile-cell-label {
+            display: inline;
+            color: var(--text-secondary);
+            font-family: Tahoma, Verdana, Arial, sans-serif;
+            font-weight: 700;
+        }
+
+        .mobile-cell-label--block {
+            display: block;
+            margin-bottom: 2px;
+            color: var(--muted);
+            font-size: 10px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .recovery-table .item-info {
+            grid-column: 2;
+            grid-row: 3;
+            color: var(--muted);
+            font-size: 11px;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+        }
+
+        .source-channel-id {
+            overflow-wrap: anywhere;
+        }
+
+        .recovery-table .action-column {
+            width: auto;
+            grid-column: 1 / -1;
+            grid-row: 4;
+            margin-top: 6px;
+            padding-top: 8px;
+            border-top: 1px solid var(--rule-dim);
+            text-align: left;
+        }
+
+        .row-actions {
+            flex-wrap: wrap;
+            justify-content: stretch;
+            gap: 6px;
+        }
+
+        .row-action {
+            min-width: 0;
+            width: 100%;
+            flex: 1 1 100%;
+            justify-content: center;
+            padding: 7px 10px;
+        }
+
+        .icon-row-action {
+            width: 100%;
+        }
+
+        .icon-row-action::after {
+            content: "Delete";
+        }
+
+        .channel-table-shell .recovery-table .action-column {
+            grid-row: 3;
+        }
+
+        .channel-table-shell .recovery-table .selection-column {
+            grid-row: 1 / span 2;
+        }
+
+        .recovery-table .empty-cell {
+            min-height: 150px;
+            grid-column: 1 / -1;
+            align-content: center;
+            padding: 24px 10px;
+            text-align: center;
+        }
+
+        .mobile-load-more {
+            display: block;
+            padding: 8px 0 2px;
+        }
+
+        .mobile-load-more .button {
+            width: 100%;
+            flex-wrap: wrap;
+        }
+
+        .mobile-load-more span {
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 400;
         }
 
         .preview-backdrop {
@@ -2264,8 +2720,17 @@
             border: 0;
         }
 
+        .preview-header {
+            min-height: 56px;
+            padding-top: max(6px, env(safe-area-inset-top));
+            padding-right: max(7px, env(safe-area-inset-right));
+            padding-left: max(9px, env(safe-area-inset-left));
+        }
+
         .preview-body {
             flex: 1;
+            padding-right: max(7px, env(safe-area-inset-right));
+            padding-left: max(7px, env(safe-area-inset-left));
         }
 
         .preview-media-frame,
@@ -2279,6 +2744,34 @@
 
         .preview-media {
             max-height: 48dvh;
+        }
+
+        .preview-mode-switch button {
+            flex: 1;
+            justify-content: center;
+        }
+
+        .preview-path {
+            grid-template-columns: 1fr;
+            gap: 2px;
+        }
+
+        .preview-path code {
+            overflow: visible;
+            text-overflow: clip;
+            overflow-wrap: anywhere;
+            white-space: normal;
+            user-select: all;
+        }
+
+        .preview-footer {
+            padding-right: max(7px, env(safe-area-inset-right));
+            padding-bottom: max(6px, env(safe-area-inset-bottom));
+            padding-left: max(7px, env(safe-area-inset-left));
+        }
+
+        .preview-done {
+            width: 100%;
         }
     }
 
@@ -2304,12 +2797,7 @@
 
         .notice-action {
             width: 100%;
-            margin-left: 21px;
-        }
-
-        .preview-path {
-            grid-template-columns: 1fr;
-            gap: 2px;
+            margin-left: 0;
         }
     }
 

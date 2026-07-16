@@ -1313,6 +1313,7 @@
                         bind:this={previewElement}
                         src={previewUrl}
                         controls
+                        playsinline
                         preload="metadata"
                         on:loadedmetadata={handleMediaReady}
                         on:canplay={handleMediaReady}
@@ -2154,6 +2155,18 @@
     }
 
     @media (max-width: 640px) {
+        .reconciliation-page :global(button),
+        .preview-overlay :global(button) {
+            min-width: 44px;
+            min-height: 44px;
+        }
+
+        .reconciliation-page :global(input:not([type="checkbox"]):not([type="radio"])),
+        .reconciliation-page :global(select) {
+            min-height: 44px;
+            font-size: 16px;
+        }
+
         .page-heading {
             align-items: flex-start;
             flex-direction: column;
@@ -2182,6 +2195,21 @@
             min-width: 0;
         }
 
+        .status-message {
+            align-items: flex-start;
+            flex-wrap: wrap;
+        }
+
+        .status-message > span:first-child {
+            min-width: 0;
+            flex: 1 1 220px;
+            overflow-wrap: anywhere;
+        }
+
+        .status-message > .button {
+            width: 100%;
+        }
+
         .path-grid {
             grid-template-columns: 1fr;
         }
@@ -2205,7 +2233,8 @@
         }
 
         .preview-button {
-            justify-self: start;
+            width: 100%;
+            justify-self: stretch;
         }
 
         .entry-actions,
@@ -2219,17 +2248,89 @@
             flex-direction: column;
         }
 
+        .entry-title h3,
+        .path-grid dd,
+        .candidate-name,
+        .candidate-path {
+            overflow: visible;
+            text-overflow: clip;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+
+        .candidate-select input {
+            width: 20px;
+            height: 20px;
+        }
+
         .status-badge {
-            margin-left: 35px;
+            margin-left: 0;
+        }
+
+        .preview-overlay {
+            align-items: stretch;
+            padding:
+                max(6px, env(safe-area-inset-top))
+                max(6px, env(safe-area-inset-right))
+                max(6px, env(safe-area-inset-bottom))
+                max(6px, env(safe-area-inset-left));
+        }
+
+        .preview-dialog {
+            width: 100%;
+            max-height: 100%;
+            margin: auto;
+            overscroll-behavior: contain;
+        }
+
+        .preview-close {
+            width: 44px;
+            flex: 0 0 44px;
+        }
+
+        .preview-header h2 {
+            max-width: calc(100vw - 88px);
+        }
+
+        .preview-mode button {
+            min-height: 44px;
+            flex: 1;
         }
 
         .media-frame {
-            min-height: 240px;
+            min-height: min(240px, 38dvh);
         }
 
         .preview-footer {
             align-items: stretch;
             flex-direction: column;
+            padding-bottom: max(7px, env(safe-area-inset-bottom));
+        }
+
+        .preview-footer > span {
+            overflow: visible;
+            text-overflow: clip;
+            white-space: normal;
+            overflow-wrap: anywhere;
+        }
+    }
+
+    @media (max-width: 760px) and (max-height: 600px) {
+        .preview-overlay {
+            place-items: stretch;
+        }
+
+        .preview-dialog {
+            max-height: 100%;
+        }
+
+        .media-frame,
+        .media-frame.audio-mode {
+            min-height: 140px;
+        }
+
+        .audio-player {
+            padding: 10px;
         }
     }
 

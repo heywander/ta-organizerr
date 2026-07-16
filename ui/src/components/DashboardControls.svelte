@@ -188,4 +188,31 @@
             transform: rotate(360deg);
         }
     }
+
+    @media (max-width: 600px) {
+        .operation-primary,
+        .operation-segments :global(.button) {
+            min-height: 44px;
+            font-size: 13px;
+        }
+
+        .operation-segments {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 6px;
+        }
+
+        .operation-segments :global(.button) {
+            border-right-width: 1px;
+        }
+
+        .operation-segments :global(.button:last-child) {
+            grid-column: 1 / -1;
+        }
+
+        .operation-result {
+            min-height: 44px;
+            align-items: center;
+            font-size: 12px;
+        }
+    }
 </style>

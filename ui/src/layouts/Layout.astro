@@ -18,10 +18,14 @@ const isAuthPage = path === "/login" || path === "/setup";
             name="description"
             content="TubeSorter — organized access to a TubeArchivist library"
         />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta
+            name="viewport"
+            content="width=device-width, initial-scale=1, viewport-fit=cover"
+        />
         <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
         <meta name="generator" content={Astro.generator} />
         <title>{title} | TubeSorter</title>
+        <script is:inline>document.documentElement.classList.add("js");</script>
     </head>
     <body>
         <div class="app-frame">
@@ -37,7 +41,24 @@ const isAuthPage = path === "/login" || path === "/setup";
 
                     {
                         !isAuthPage && (
-                            <nav class="nav-tabs" aria-label="Primary navigation">
+                            <Fragment>
+                                <button
+                                    id="nav-menu-toggle"
+                                    class="nav-menu-toggle"
+                                    type="button"
+                                    aria-expanded="false"
+                                    aria-controls="primary-navigation"
+                                    aria-label="Open primary navigation"
+                                >
+                                    <i class="bi bi-list" aria-hidden="true"></i>
+                                    <span>Menu</span>
+                                </button>
+                                <nav
+                                    id="primary-navigation"
+                                    class="nav-tabs"
+                                    aria-label="Primary navigation"
+                                    data-open="false"
+                                >
                                 <a
                                     href="/"
                                     aria-label="Library"
@@ -82,13 +103,16 @@ const isAuthPage = path === "/login" || path === "/setup";
                                     <i class="bi bi-box-arrow-right"></i>
                                     <span class="nav-label">Sign out</span>
                                 </button>
-                            </nav>
+                                </nav>
+                            </Fragment>
                         )
                     }
 
                     <div class="connection-state" aria-label="Session state">
                         <span class="connection-state__dot"></span>
-                        <span>{isAuthPage ? "Local access" : "Session active"}</span>
+                        <span class="connection-state__label">
+                            {isAuthPage ? "Local access" : "Session active"}
+                        </span>
                     </div>
                 </div>
             </header>
@@ -101,6 +125,72 @@ const isAuthPage = path === "/login" || path === "/setup";
 
         <script>
             const logoutBtn = document.getElementById("logout-btn");
+            const navMenuToggle = document.getElementById("nav-menu-toggle");
+            const primaryNavigation = document.getElementById("primary-navigation");
+            const appHeader = document.querySelector(".app-header");
+            const mobileNavigation = window.matchMedia("(max-width: 1023px)");
+
+            const setMobileNavigationOpen = (open, returnFocus = false) => {
+                if (!navMenuToggle || !primaryNavigation) return;
+                const shouldOpen = mobileNavigation.matches && open;
+                primaryNavigation.dataset.open = String(shouldOpen);
+                navMenuToggle.setAttribute("aria-expanded", String(shouldOpen));
+                navMenuToggle.setAttribute(
+                    "aria-label",
+                    shouldOpen ? "Close primary navigation" : "Open primary navigation",
+                );
+                const icon = navMenuToggle.querySelector("i");
+                icon?.classList.toggle("bi-list", !shouldOpen);
+                icon?.classList.toggle("bi-x-lg", shouldOpen);
+                if (returnFocus && navMenuToggle instanceof HTMLElement) {
+                    navMenuToggle.focus();
+                }
+            };
+
+            navMenuToggle?.addEventListener("click", () => {
+                const isOpen = navMenuToggle.getAttribute("aria-expanded") === "true";
+                setMobileNavigationOpen(!isOpen);
+            });
+
+            primaryNavigation?.addEventListener("click", (event) => {
+                if (
+                    event.target instanceof Element &&
+                    event.target.closest("a, button")
+                ) {
+                    setMobileNavigationOpen(false, true);
+                }
+            });
+
+            document.addEventListener("click", (event) => {
+                if (
+                    navMenuToggle?.getAttribute("aria-expanded") === "true" &&
+                    event.target instanceof Node &&
+                    !appHeader?.contains(event.target)
+                ) {
+                    setMobileNavigationOpen(
+                        false,
+                        primaryNavigation?.contains(document.activeElement) ?? false,
+                    );
+                }
+            });
+
+            document.addEventListener("keydown", (event) => {
+                if (
+                    event.key === "Escape" &&
+                    navMenuToggle?.getAttribute("aria-expanded") === "true"
+                ) {
+                    setMobileNavigationOpen(false, true);
+                }
+            });
+
+            mobileNavigation.addEventListener("change", () => {
+                setMobileNavigationOpen(
+                    false,
+                    mobileNavigation.matches &&
+                        (primaryNavigation?.contains(document.activeElement) ?? false),
+                );
+            });
+
             logoutBtn?.addEventListener("click", async () => {
                 try {
                     const res = await fetch("/api/auth/logout", { method: "POST" });

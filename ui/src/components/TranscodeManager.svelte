@@ -149,19 +149,26 @@
                     </thead>
                     <tbody>
                         {#if loading}
-                            <tr>
+                            <tr class="state-row">
                                 <td colspan="4" class="table-message">Loading media…</td>
                             </tr>
                         {:else if videos.length === 0}
-                            <tr>
+                            <tr class="state-row">
                                 <td colspan="4" class="table-message">No linked videos are currently available.</td>
                             </tr>
                         {:else}
                             {#each videos as v}
                                 <tr>
-                                    <td class="channel-column" title={v.channel}>{v.channel}</td>
-                                    <td class="published-column tabular-nums">{v.published}</td>
-                                    <td class="title-column" title={v.title}>
+                                    <td class="channel-column" title={v.channel}>
+                                        <span class="mobile-cell-label">Channel</span>
+                                        {v.channel}
+                                    </td>
+                                    <td class="published-column tabular-nums">
+                                        <span class="mobile-cell-label">Published</span>
+                                        {v.published}
+                                    </td>
+                                    <td class="title-column" data-label="Title" title={v.title}>
+                                        <span class="mobile-cell-label">Title</span>
                                         <i class="bi bi-file-earmark-play" aria-hidden="true"></i>
                                         <span>{v.title}</span>
                                     </td>
@@ -319,6 +326,10 @@
         text-align: center;
     }
 
+    .mobile-cell-label {
+        display: none;
+    }
+
     .media-list__pagination {
         display: flex;
         min-height: 38px;
@@ -351,16 +362,130 @@
             width: 100%;
         }
 
-        .published-column {
+        .transcode-page :global(button) {
+            min-width: 44px;
+            min-height: 44px;
+        }
+
+        .media-list {
+            min-height: 0;
+            overflow: visible;
+        }
+
+        .media-list__table-wrap {
+            max-height: none;
+            overflow: visible;
+        }
+
+        .media-list__table,
+        .media-list__table tbody {
+            display: block;
+        }
+
+        .media-list__table thead {
             display: none;
         }
 
+        .media-list__table tbody {
+            display: grid;
+            gap: 8px;
+            padding: 8px;
+        }
+
+        .media-list__table tr {
+            display: grid;
+            min-width: 0;
+            grid-template-areas:
+                "title"
+                "channel"
+                "published"
+                "action";
+            grid-template-columns: minmax(0, 1fr);
+            border: 1px solid var(--line-soft);
+            background: var(--page-deep);
+        }
+
+        .media-list__table th,
+        .media-list__table td {
+            width: auto;
+            height: auto;
+            min-width: 0;
+            padding: 7px 9px;
+            overflow: visible;
+            text-overflow: clip;
+            white-space: normal;
+        }
+
+        .mobile-cell-label {
+            display: block;
+            margin-bottom: 2px;
+            color: var(--text-muted);
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .title-column {
+            display: block;
+            grid-area: title;
+            border-bottom: 1px solid var(--line-soft) !important;
+            overflow-wrap: anywhere;
+        }
+
+        .title-column span {
+            min-width: 0;
+            font-size: 13px;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+
+        .title-column .mobile-cell-label {
+            margin-bottom: 2px;
+            color: var(--text-muted);
+            font-size: 10px;
+            line-height: normal;
+        }
+
         .channel-column {
-            width: 33%;
+            grid-area: channel;
+            overflow-wrap: anywhere;
+        }
+
+        .published-column {
+            display: block;
+            grid-area: published;
         }
 
         .action-column {
-            width: 98px;
+            grid-area: action;
+            padding-top: 3px !important;
+            text-align: left;
+        }
+
+        .media-list__action {
+            width: 100%;
+            min-height: 44px;
+            font-size: 12px;
+        }
+
+        .media-list__table .state-row {
+            display: block;
+        }
+
+        .state-row .table-message {
+            display: block;
+            height: auto !important;
+            padding: 30px 12px;
+        }
+
+        .media-list__pagination {
+            min-height: 52px;
+        }
+
+        .media-list__pagination button {
+            min-width: 44px;
+            min-height: 44px;
         }
     }
 </style>

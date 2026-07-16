@@ -245,4 +245,34 @@
         color: var(--text-muted);
         text-align: center;
     }
+
+    @media (max-width: 600px) {
+        .log-panel__header {
+            min-height: 52px;
+            gap: 6px;
+        }
+
+        .log-panel__control {
+            min-height: 44px;
+            padding: 6px 10px;
+            font-size: 12px;
+        }
+
+        .log-panel__body {
+            height: min(320px, 52dvh);
+            font-size: 12px;
+            line-height: 1.55;
+            overscroll-behavior: contain;
+        }
+
+        .log-line {
+            grid-template-columns: 30px minmax(0, 1fr);
+            min-height: 32px;
+            padding: 6px 9px 6px 0;
+        }
+
+        .log-line__index {
+            padding-right: 7px;
+        }
+    }
 </style>

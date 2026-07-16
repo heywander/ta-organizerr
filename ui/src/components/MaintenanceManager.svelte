@@ -228,16 +228,29 @@
 
     @media (max-width: 560px) {
         .page-heading {
-            align-items: flex-start;
+            align-items: stretch;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .page-heading__status {
+            white-space: normal;
         }
 
         .task-row {
             grid-template-columns: 30px minmax(0, 1fr);
+            padding: 10px;
         }
 
         .task-row > :global(button) {
-            grid-column: 2;
-            justify-self: start;
+            width: 100%;
+            min-height: 44px;
+            grid-column: 1 / -1;
+        }
+
+        .maintenance-page :global(button) {
+            min-width: 44px;
+            min-height: 44px;
         }
     }
 </style>
