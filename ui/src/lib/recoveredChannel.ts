@@ -9,6 +9,8 @@ export type ReviewDecision = "undecided" | "approved" | "held";
 
 export type PreviewMode = "video" | "audio";
 
+export type RecoveredChannelPlanScope = "approved" | "likely_usable";
+
 export type RecoveredChannelItem = {
     id: string;
     video_id: string;
@@ -66,23 +68,40 @@ export type RecoveredChannelInvestigation = {
 };
 
 export type RecoveredChannelPlanItem = {
+    item_id: string;
     video_id: string;
     source_path: string;
     destination_path: string;
     link_target?: string;
+    health_tier: string;
+    inspection_status: string;
+    decision: ReviewDecision;
     status: string;
     error?: string;
+    [key: string]: unknown;
+};
+
+export type RecoveredChannelPlanSummary = {
+    selected_count: number;
+    excluded_review_count: number;
+    excluded_needs_review_count: number;
+    held_count: number;
+    remaining_count: number;
     [key: string]: unknown;
 };
 
 export type RecoveredChannelPlan = {
     token?: string;
     plan_token?: string;
+    scope: RecoveredChannelPlanScope;
+    selected_count: number;
     approved_count: number;
     ready_count: number;
     blocked_count: number;
+    conflict_count: number;
     target_folder_name?: string;
     target_folder_path?: string;
+    summary: RecoveredChannelPlanSummary;
     items: RecoveredChannelPlanItem[];
     [key: string]: unknown;
 };
@@ -424,6 +443,7 @@ export function normalizeRecoveredChannelItems(
 
 export function normalizeRecoveredChannelPlan(
     value: unknown,
+    fallbackScope: RecoveredChannelPlanScope = "approved",
 ): RecoveredChannelPlan {
     const envelope = record(value);
     const raw = record(envelope.plan || value);
@@ -432,15 +452,21 @@ export function normalizeRecoveredChannelPlan(
         : Array.isArray(raw.entries)
           ? raw.entries
           : [];
-    const items = rawItems.map((item) => {
+    const items = rawItems.map((item, index) => {
         const entry = record(item);
+        const videoId = text(entry.video_id);
+        const sourcePath = text(entry.source_path || entry.path);
+        const destinationPath = text(
+            entry.destination_path || entry.destination || entry.link_path,
+        );
         return {
             ...entry,
-            video_id: text(entry.video_id),
-            source_path: text(entry.source_path || entry.path),
-            destination_path: text(
-                entry.destination_path || entry.destination || entry.link_path,
-            ),
+            item_id:
+                text(entry.item_id || entry.id) ||
+                `${videoId}\u0000${sourcePath}\u0000${destinationPath}\u0000${index}`,
+            video_id: videoId,
+            source_path: sourcePath,
+            destination_path: destinationPath,
             link_target:
                 text(
                     entry.link_target ||
@@ -448,6 +474,15 @@ export function normalizeRecoveredChannelPlan(
                         entry.actual_link_target ||
                         entry.true_link_target,
                 ) || undefined,
+            health_tier: text(
+                entry.health_tier || entry.severity || entry.bucket,
+                "unknown",
+            ).toLowerCase(),
+            inspection_status: text(
+                entry.inspection_status || entry.scan_status,
+                "unknown",
+            ).toLowerCase(),
+            decision: decisionFrom(entry),
             status: text(
                 entry.status,
                 entry.ready === false || entry.conflict ? "blocked" : "ready",
@@ -459,20 +494,59 @@ export function normalizeRecoveredChannelPlan(
     const blockedCount = items.filter((item) =>
         ["blocked", "conflict", "invalid", "error"].includes(item.status),
     ).length;
+    const rawSummary = record(raw.summary);
+    const selectedCount =
+        numberOrNull(raw.selected_count ?? rawSummary.selected_count) ??
+        numberOrNull(raw.approved_count) ??
+        items.length;
+    const conflictCount =
+        numberOrNull(
+            raw.conflict_count ??
+                raw.blocked_count ??
+                rawSummary.conflict_count ??
+                rawSummary.blocked_count,
+        ) ?? blockedCount;
+    const excludedNeedsReviewCount =
+        numberOrNull(
+            rawSummary.excluded_needs_review_count ??
+                rawSummary.excluded_review_count ??
+                raw.excluded_needs_review_count ??
+                raw.excluded_review_count,
+        ) ?? 0;
+    const heldCount =
+        numberOrNull(rawSummary.held_count ?? raw.held_count) ?? 0;
+    const remainingCount =
+        numberOrNull(rawSummary.remaining_count ?? raw.remaining_count) ?? 0;
+    const reportedScope = text(raw.scope || envelope.scope, fallbackScope)
+        .trim()
+        .toLowerCase();
+    const scope: RecoveredChannelPlanScope =
+        reportedScope === "likely_usable" ? "likely_usable" : "approved";
     const targetFolderPath = text(raw.target_folder_path || raw.target_path);
     return {
         ...raw,
+        scope,
+        selected_count: selectedCount,
         approved_count:
-            numberOrNull(raw.approved_count) ?? items.length,
+            numberOrNull(raw.approved_count) ?? selectedCount,
         ready_count:
             numberOrNull(raw.ready_count) ?? items.length - blockedCount,
         blocked_count:
-            numberOrNull(raw.blocked_count) ?? blockedCount,
+            numberOrNull(raw.blocked_count ?? raw.conflict_count) ?? blockedCount,
+        conflict_count: conflictCount,
         target_folder_name:
             text(raw.target_folder_name || raw.folder_name) ||
             (targetFolderPath ? basename(targetFolderPath) : undefined),
         target_folder_path:
             targetFolderPath || undefined,
+        summary: {
+            ...rawSummary,
+            selected_count: selectedCount,
+            excluded_review_count: excludedNeedsReviewCount,
+            excluded_needs_review_count: excludedNeedsReviewCount,
+            held_count: heldCount,
+            remaining_count: remainingCount,
+        },
         items,
     };
 }

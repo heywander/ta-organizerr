@@ -55,6 +55,7 @@ _TERMINAL_JOB_STATES = {
     "completed", "partial", "failed", "cancelled", "interrupted"
 }
 _ACTIVE_JOB_STATES = {"queued", "running", "cancelling"}
+_ORGANIZATION_SCOPES = {"approved", "likely_usable"}
 
 _runtime_lock = threading.RLock()
 _threads: dict[str, threading.Thread] = {}
@@ -467,6 +468,12 @@ def _quote_path(value: str) -> str:
 
 
 def _job_row(row: sqlite3.Row) -> dict[str, Any]:
+    payload = _decode_json(row["payload_json"], {})
+    scope = (
+        payload.get("scope", "approved")
+        if row["kind"] == "organize" and isinstance(payload, dict)
+        else None
+    )
     return {
         "job_id": row["job_id"],
         "case_id": row["case_id"],
@@ -481,6 +488,7 @@ def _job_row(row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "started_at": row["started_at"],
         "completed_at": row["completed_at"],
+        "scope": scope,
     }
 
 
@@ -840,6 +848,7 @@ def list_cases() -> list[dict[str, Any]]:
                        SUM(CASE WHEN inspection_status = 'inconclusive' THEN 1 ELSE 0 END) AS inconclusive,
                        SUM(CASE WHEN inspection_status IN ('completed', 'inconclusive') THEN 1 ELSE 0 END) AS finished,
                        SUM(CASE WHEN organized_path IS NULL AND decision = 'approved' THEN 1 ELSE 0 END) AS approved,
+                       SUM(CASE WHEN organized_path IS NULL THEN 1 ELSE 0 END) AS remaining,
                        SUM(CASE WHEN organized_path IS NOT NULL THEN 1 ELSE 0 END) AS organized
                 FROM recovered_channel_items WHERE case_id = ?
                 """,
@@ -868,6 +877,7 @@ def get_case(case_id: str) -> dict[str, Any]:
                    SUM(CASE WHEN organized_path IS NULL AND health_tier IN ('serious', 'inconclusive') THEN 1 ELSE 0 END) AS review,
                    SUM(CASE WHEN organized_path IS NULL AND decision = 'approved' THEN 1 ELSE 0 END) AS approved,
                    SUM(CASE WHEN organized_path IS NULL AND decision = 'hold' THEN 1 ELSE 0 END) AS hold,
+                   SUM(CASE WHEN organized_path IS NULL THEN 1 ELSE 0 END) AS remaining,
                    SUM(CASE WHEN organized_path IS NOT NULL THEN 1 ELSE 0 END) AS organized
             FROM recovered_channel_items WHERE case_id = ?
             """,
@@ -2078,20 +2088,103 @@ def _remove_created_symlink_at(
         log(f"❌ Could not roll back recovered link {filename}: {exc}")
 
 
-def build_organization_plan(case_id: str) -> dict[str, Any]:
+def _validated_organization_scope(value: object = "approved") -> str:
+    if not isinstance(value, str) or value not in _ORGANIZATION_SCOPES:
+        raise RecoveredChannelError(
+            "scope must be approved or likely_usable"
+        )
+    return value
+
+
+def _unorganized_case_rows(
+    conn: sqlite3.Connection, case_id: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM recovered_channel_items
+        WHERE case_id = ? AND organized_path IS NULL
+        ORDER BY video_id, source_path
+        """,
+        (case_id,),
+    ).fetchall()
+
+
+def _selected_organization_rows(
+    rows: list[sqlite3.Row], scope: str
+) -> list[sqlite3.Row]:
+    if scope == "approved":
+        return [row for row in rows if row["decision"] == "approved"]
+    return [
+        row
+        for row in rows
+        if row["decision"] != "hold"
+        and row["health_tier"] in {"clear", "minimal"}
+    ]
+
+
+def _organization_selection_state(
+    rows: list[sqlite3.Row], scope: str
+) -> list[dict[str, Any]]:
+    # Likely-only ambiguity depends on every unorganized non-held sibling,
+    # including Serious and inconclusive copies. Bind the whole unorganized
+    # case snapshot so a hold, inspection, or newly discovered duplicate
+    # invalidates the dry run. The legacy approved scope remains narrower.
+    relevant = rows if scope == "likely_usable" else _selected_organization_rows(
+        rows, scope
+    )
+    return [
+        {
+            "item_id": row["item_id"],
+            "video_id": row["video_id"],
+            "source_path": row["source_path"],
+            "suffix": row["suffix"],
+            "inspection_status": row["inspection_status"],
+            "health_tier": row["health_tier"],
+            "decision": row["decision"],
+            "expected_duration_seconds": row["expected_duration_seconds"],
+            "sha256": row["sha256"],
+            "fingerprint": [
+                row[name]
+                for name in (
+                    "size_bytes",
+                    "device",
+                    "inode",
+                    "mtime_ns",
+                    "ctime_ns",
+                )
+            ],
+        }
+        for row in relevant
+    ]
+
+
+def _organization_selection_token(
+    rows: list[sqlite3.Row], scope: str
+) -> str:
+    return hashlib.sha256(
+        _json(_organization_selection_state(rows, scope)).encode("utf-8")
+    ).hexdigest()
+
+
+def build_organization_plan(
+    case_id: str, scope: str = "approved"
+) -> dict[str, Any]:
+    scope = _validated_organization_scope(scope)
     _recover_orphaned_jobs()
     with get_db() as conn:
         case = _require_case(conn, case_id)
         folder_error = _target_folder_error(case["target_component"])
-        rows = conn.execute(
-            """
-            SELECT * FROM recovered_channel_items
-            WHERE case_id = ? AND decision = 'approved' AND organized_path IS NULL
-            ORDER BY video_id, source_path
-            """,
-            (case_id,),
-        ).fetchall()
-        id_counts = Counter(row["video_id"] for row in rows)
+        all_rows = _unorganized_case_rows(conn, case_id)
+        rows = _selected_organization_rows(all_rows, scope)
+        if scope == "likely_usable":
+            id_counts = Counter(
+                row["video_id"]
+                for row in all_rows
+                if row["decision"] != "hold"
+            )
+        else:
+            id_counts = Counter(row["video_id"] for row in rows)
+        selection_token = _organization_selection_token(all_rows, scope)
         plan_items: list[dict[str, Any]] = []
         token_items: list[dict[str, Any]] = []
         conflicts: list[dict[str, Any]] = []
@@ -2101,10 +2194,24 @@ def build_organization_plan(case_id: str) -> dict[str, Any]:
             )
             error: str | None = folder_error
             if error is None and id_counts[row["video_id"]] > 1:
-                error = "Multiple approved source files have this exact video ID; approve only one"
+                if scope == "likely_usable":
+                    error = (
+                        "Multiple non-held source files have this exact video ID; "
+                        "hold all but the one selected for publication"
+                    )
+                else:
+                    error = (
+                        "Multiple approved source files have this exact video ID; "
+                        "approve only one"
+                    )
+            allowed_health = (
+                {"clear", "minimal"}
+                if scope == "likely_usable"
+                else {"clear", "minimal", "serious"}
+            )
             if error is None and (
                 row["inspection_status"] != "completed"
-                or row["health_tier"] not in {"clear", "minimal", "serious"}
+                or row["health_tier"] not in allowed_health
                 or not isinstance(row["sha256"], str)
                 or _SHA256_RE.fullmatch(row["sha256"]) is None
             ):
@@ -2140,6 +2247,7 @@ def build_organization_plan(case_id: str) -> dict[str, Any]:
                 "item_id": row["item_id"],
                 "video_id": row["video_id"],
                 "source_path": row["source_path"],
+                "suffix": row["suffix"],
                 "destination_path": str(destination),
                 "link_target": (
                     str(expected_link_target)
@@ -2147,6 +2255,11 @@ def build_organization_plan(case_id: str) -> dict[str, Any]:
                     else None
                 ),
                 "sha256": row["sha256"],
+                "inspection_status": row["inspection_status"],
+                "health_tier": row["health_tier"],
+                "decision": row["decision"],
+                "expected_duration_seconds": row["expected_duration_seconds"],
+                "scope": scope,
                 "crash_left_expected_link": crash_left_expected_link,
                 "ready": error is None,
                 "conflict": error,
@@ -2158,27 +2271,59 @@ def build_organization_plan(case_id: str) -> dict[str, Any]:
                 **item,
                 "fingerprint": [
                     row[name]
-                    for name in ("size_bytes", "device", "inode", "mtime_ns", "ctime_ns")
+                    for name in (
+                        "size_bytes",
+                        "device",
+                        "inode",
+                        "mtime_ns",
+                        "ctime_ns",
+                    )
                 ],
                 "destination_state": destination_state,
                 "database_owner": dict(owner) if owner else None,
             })
+        ready_count = sum(1 for item in plan_items if item["ready"])
+        held_count = sum(1 for row in all_rows if row["decision"] == "hold")
+        excluded_needs_review_count = sum(
+            1
+            for row in all_rows
+            if row["decision"] != "hold"
+            and row["health_tier"] not in {"clear", "minimal"}
+        )
+        remaining_count = max(0, len(all_rows) - ready_count)
+        summary = {
+            "selected_count": len(plan_items),
+            "ready_count": ready_count,
+            "conflict_count": len(conflicts),
+            "excluded_needs_review_count": excluded_needs_review_count,
+            "held_count": held_count,
+            "remaining_count": remaining_count,
+        }
         token_payload = {
-            "schema": 1,
+            "schema": 2,
             "case_id": case_id,
+            "scope": scope,
             "source_channel_id": case["source_channel_id"],
             "target_component": case["target_component"],
+            "selected_item_ids": [item["item_id"] for item in plan_items],
+            "selection_state": _organization_selection_state(all_rows, scope),
             "items": token_items,
+            "summary": summary,
         }
         token = hashlib.sha256(_json(token_payload).encode("utf-8")).hexdigest()
         return {
             "token": token,
             "plan_token": token,
+            "selection_token": selection_token,
+            "scope": scope,
             "target_folder_path": str(TARGET_DIR / case["target_component"]),
             "items": plan_items,
             "conflicts": conflicts,
-            "ready_count": sum(1 for item in plan_items if item["ready"]),
-            "approved_count": len(plan_items),
+            **summary,
+            "summary": summary,
+            "approved_count": sum(
+                1 for row in rows if row["decision"] == "approved"
+            ),
             "source_immutable": True,
         }
 
@@ -2188,16 +2333,28 @@ def start_organization(
     plan_token: str,
     actor: str | None = None,
     background: bool = True,
+    scope: str = "approved",
 ) -> dict[str, Any]:
+    scope = _validated_organization_scope(scope)
     if not isinstance(plan_token, str) or _SHA256_RE.fullmatch(plan_token) is None:
         raise RecoveredChannelError("plan_token must be the current organization plan token")
     _recover_orphaned_jobs()
-    plan = build_organization_plan(case_id)
+    # Keep the default call shape compatible with test/application wrappers
+    # written before scoped organization existed.
+    plan = (
+        build_organization_plan(case_id)
+        if scope == "approved"
+        else build_organization_plan(case_id, scope=scope)
+    )
     if not secrets.compare_digest(plan_token, plan["token"]):
         raise RecoveredChannelError("Organization plan changed; review it again", 409)
-    ready_ids = [item["item_id"] for item in plan["items"] if item["ready"]]
+    ready_items = [item for item in plan["items"] if item["ready"]]
+    ready_ids = [item["item_id"] for item in ready_items]
     if not ready_ids:
-        raise RecoveredChannelError("The plan has no conflict-free approved items", 409)
+        label = "approved" if scope == "approved" else "likely usable"
+        raise RecoveredChannelError(
+            f"The plan has no conflict-free {label} items", 409
+        )
     with get_db() as conn:
         # Serialize the final plan/rename check with every case editor and job
         # starter. The public plan is intentionally built before this short
@@ -2210,14 +2367,15 @@ def start_organization(
             )
         if _active_job(conn, case_id):
             raise RecoveredChannelError("This case already has an active job", 409)
-        current_rows = conn.execute(
-            """
-            SELECT * FROM recovered_channel_items
-            WHERE case_id = ? AND decision = 'approved' AND organized_path IS NULL
-            ORDER BY video_id, source_path
-            """,
-            (case_id,),
-        ).fetchall()
+        all_current_rows = _unorganized_case_rows(conn, case_id)
+        if not secrets.compare_digest(
+            plan["selection_token"],
+            _organization_selection_token(all_current_rows, scope),
+        ):
+            raise RecoveredChannelError(
+                "Organization plan changed; review it again", 409
+            )
+        current_rows = _selected_organization_rows(all_current_rows, scope)
         current_by_id = {row["item_id"]: row for row in current_rows}
         planned_ids = {item["item_id"] for item in plan["items"]}
         if planned_ids != set(current_by_id):
@@ -2234,10 +2392,43 @@ def start_organization(
                 or planned["source_path"] != current["source_path"]
                 or planned["destination_path"] != str(destination)
                 or planned["sha256"] != current["sha256"]
+                or planned["suffix"] != current["suffix"]
+                or planned["inspection_status"] != current["inspection_status"]
+                or planned["health_tier"] != current["health_tier"]
+                or planned["decision"] != current["decision"]
+                or planned["expected_duration_seconds"]
+                != current["expected_duration_seconds"]
+                or planned["scope"] != scope
             ):
                 raise RecoveredChannelError(
                     "Organization plan changed; review it again", 409
                 )
+        ready_snapshots = []
+        for planned in ready_items:
+            current = current_by_id[planned["item_id"]]
+            ready_snapshots.append({
+                "item_id": current["item_id"],
+                "video_id": current["video_id"],
+                "source_path": current["source_path"],
+                "suffix": current["suffix"],
+                "sha256": current["sha256"],
+                "inspection_status": current["inspection_status"],
+                "health_tier": current["health_tier"],
+                "decision": current["decision"],
+                "expected_duration_seconds": current["expected_duration_seconds"],
+                "fingerprint": [
+                    current[name]
+                    for name in (
+                        "size_bytes",
+                        "device",
+                        "inode",
+                        "mtime_ns",
+                        "ctime_ns",
+                    )
+                ],
+                "destination_path": planned["destination_path"],
+                "scope": scope,
+            })
         job_id = secrets.token_hex(12)
         try:
             conn.execute(
@@ -2253,6 +2444,8 @@ def start_organization(
                     len(plan["conflicts"]),
                     _json({
                         "item_ids": ready_ids,
+                        "items": ready_snapshots,
+                        "scope": scope,
                         "plan_token": plan_token,
                         "initial_conflicts": [
                             item["conflict"] for item in plan["conflicts"]
@@ -2277,6 +2470,7 @@ def start_organization(
             details={
                 "job_id": job_id,
                 "item_ids": ready_ids,
+                "scope": scope,
                 "plan_token": plan_token,
             },
         )
@@ -2311,29 +2505,128 @@ def _hash_fd(fd: int, size: int) -> str:
     return digest.hexdigest()
 
 
-def _organize_one(case_id: str, item_id: str) -> str:
-    with get_db() as conn:
-        case = _require_case(conn, case_id)
-        item = _require_item(conn, case_id, item_id)
-        if item["organized_path"]:
-            return item["organized_path"]
-        if item["decision"] != "approved" or item["inspection_status"] != "completed":
-            raise RecoveredChannelError("Item is no longer approved for organization", 409)
-        if not isinstance(item["sha256"], str) or _SHA256_RE.fullmatch(item["sha256"]) is None:
-            raise RecoveredChannelError("Item lacks a completed inspection checksum", 409)
-        duplicates = conn.execute(
+def _organization_item_snapshot_matches(
+    row: sqlite3.Row,
+    case: sqlite3.Row,
+    snapshot: dict[str, Any],
+    scope: str,
+) -> bool:
+    destination = TARGET_DIR / case["target_component"] / (
+        row["video_id"] + row["suffix"]
+    )
+    return (
+        snapshot.get("scope") == scope
+        and snapshot.get("item_id") == row["item_id"]
+        and snapshot.get("video_id") == row["video_id"]
+        and snapshot.get("source_path") == row["source_path"]
+        and snapshot.get("suffix") == row["suffix"]
+        and snapshot.get("sha256") == row["sha256"]
+        and snapshot.get("inspection_status") == row["inspection_status"]
+        and snapshot.get("health_tier") == row["health_tier"]
+        and snapshot.get("decision") == row["decision"]
+        and snapshot.get("expected_duration_seconds")
+        == row["expected_duration_seconds"]
+        and snapshot.get("fingerprint")
+        == [
+            row[name]
+            for name in (
+                "size_bytes",
+                "device",
+                "inode",
+                "mtime_ns",
+                "ctime_ns",
+            )
+        ]
+        and snapshot.get("destination_path") == str(destination)
+    )
+
+
+def _validate_organization_item(
+    conn: sqlite3.Connection,
+    case: sqlite3.Row,
+    item: sqlite3.Row,
+    scope: str,
+) -> None:
+    if item["organized_path"]:
+        raise RecoveredChannelError("Item is already organized", 409)
+    if item["inspection_status"] != "completed":
+        raise RecoveredChannelError(
+            "Item no longer has a completed inspection", 409
+        )
+    if scope == "likely_usable":
+        if item["decision"] == "hold":
+            raise RecoveredChannelError(
+                "Held items are excluded from likely-usable organization", 409
+            )
+        if item["health_tier"] not in {"clear", "minimal"}:
+            raise RecoveredChannelError(
+                "Item is no longer classified as likely usable", 409
+            )
+        duplicate_count = conn.execute(
+            """
+            SELECT COUNT(*) AS count FROM recovered_channel_items
+            WHERE case_id = ? AND video_id = ? AND organized_path IS NULL
+              AND decision != 'hold'
+            """,
+            (case["case_id"], item["video_id"]),
+        ).fetchone()["count"]
+        if duplicate_count != 1:
+            raise RecoveredChannelError(
+                "Exact video ID has multiple non-held candidates", 409
+            )
+    else:
+        if item["decision"] != "approved":
+            raise RecoveredChannelError(
+                "Item is no longer approved for organization", 409
+            )
+        if item["health_tier"] not in {"clear", "minimal", "serious"}:
+            raise RecoveredChannelError(
+                "Approved item no longer has an eligible health result", 409
+            )
+        duplicate_count = conn.execute(
             """
             SELECT COUNT(*) AS count FROM recovered_channel_items
             WHERE case_id = ? AND video_id = ? AND decision = 'approved'
               AND organized_path IS NULL
             """,
-            (case_id, item["video_id"]),
+            (case["case_id"], item["video_id"]),
         ).fetchone()["count"]
-        if duplicates != 1:
-            raise RecoveredChannelError("Exact video ID has multiple approved candidates", 409)
-        fingerprint_error = _fingerprint_error(item, case["source_channel_id"])
-        if fingerprint_error:
-            raise RecoveredChannelError(fingerprint_error, 409)
+        if duplicate_count != 1:
+            raise RecoveredChannelError(
+                "Exact video ID has multiple approved candidates", 409
+            )
+    if (
+        not isinstance(item["sha256"], str)
+        or _SHA256_RE.fullmatch(item["sha256"]) is None
+    ):
+        raise RecoveredChannelError(
+            "Item lacks a completed inspection checksum", 409
+        )
+    fingerprint_error = _fingerprint_error(item, case["source_channel_id"])
+    if fingerprint_error:
+        raise RecoveredChannelError(fingerprint_error, 409)
+
+
+def _organize_one(
+    case_id: str,
+    item_id: str,
+    *,
+    scope: str = "approved",
+    planned_item: dict[str, Any] | None = None,
+) -> str:
+    scope = _validated_organization_scope(scope)
+    with get_db() as conn:
+        case = _require_case(conn, case_id)
+        item = _require_item(conn, case_id, item_id)
+        if item["organized_path"]:
+            return item["organized_path"]
+        _validate_organization_item(conn, case, item, scope)
+        if planned_item is not None and not _organization_item_snapshot_matches(
+            item, case, planned_item, scope
+        ):
+            raise RecoveredChannelError(
+                "Token-bound organization item changed before execution", 409
+            )
         source = Path(item["source_path"])
         destination = TARGET_DIR / case["target_component"] / (
             item["video_id"] + item["suffix"]
@@ -2449,9 +2742,37 @@ def _organize_one(case_id: str, item_id: str) -> str:
                 )
                 with get_db() as conn:
                     conn.execute("BEGIN IMMEDIATE")
+                    current_case = _require_case(conn, case_id)
+                    current_item = _require_item(conn, case_id, item_id)
+                    _validate_organization_item(
+                        conn, current_case, current_item, scope
+                    )
+                    if (
+                        planned_item is not None
+                        and not _organization_item_snapshot_matches(
+                            current_item,
+                            current_case,
+                            planned_item,
+                            scope,
+                        )
+                    ):
+                        raise RecoveredChannelError(
+                            "Token-bound organization item changed before commit",
+                            409,
+                        )
+                    current_destination = (
+                        TARGET_DIR
+                        / current_case["target_component"]
+                        / (current_item["video_id"] + current_item["suffix"])
+                    )
+                    if current_destination != destination:
+                        raise RecoveredChannelError(
+                            "Recovered channel destination changed before commit",
+                            409,
+                        )
                     owner = conn.execute(
                         "SELECT symlink FROM videos WHERE video_id = ?",
-                        (item["video_id"],),
+                        (current_item["video_id"],),
                     ).fetchone()
                     if owner is not None:
                         raise RecoveredChannelError(
@@ -2465,21 +2786,39 @@ def _organize_one(case_id: str, item_id: str) -> str:
                         VALUES (?, ?, ?, NULL, ?, 'recovered', 0, 0)
                         """,
                         (
-                            item["video_id"],
-                            item["video_id"],
-                            case["target_component"],
+                            current_item["video_id"],
+                            current_item["video_id"],
+                            current_case["target_component"],
                             str(destination),
                         ),
                     )
                     cursor = conn.execute(
                         """
                         UPDATE recovered_channel_items
-                        SET organized_path = ?, organized_at = ?, error = NULL,
+                        SET decision = 'approved', organized_path = ?,
+                            organized_at = ?, error = NULL,
                             updated_at = CURRENT_TIMESTAMP
-                        WHERE case_id = ? AND item_id = ? AND decision = 'approved'
-                          AND organized_path IS NULL
+                        WHERE case_id = ? AND item_id = ?
+                          AND organized_path IS NULL AND decision = ?
+                          AND inspection_status = ? AND health_tier = ?
+                          AND sha256 = ? AND size_bytes = ? AND device = ?
+                          AND inode = ? AND mtime_ns = ? AND ctime_ns = ?
                         """,
-                        (str(destination), _now(), case_id, item_id),
+                        (
+                            str(destination),
+                            _now(),
+                            case_id,
+                            item_id,
+                            current_item["decision"],
+                            current_item["inspection_status"],
+                            current_item["health_tier"],
+                            current_item["sha256"],
+                            current_item["size_bytes"],
+                            current_item["device"],
+                            current_item["inode"],
+                            current_item["mtime_ns"],
+                            current_item["ctime_ns"],
+                        ),
                     )
                     if cursor.rowcount != 1:
                         raise RecoveredChannelError(
@@ -2495,6 +2834,8 @@ def _organize_one(case_id: str, item_id: str) -> str:
                             "destination_path": str(destination),
                             "link_target": str(link_target),
                             "sha256": expected_checksum,
+                            "scope": scope,
+                            "decision_before": current_item["decision"],
                             "adopted_crash_left_link": adopted_crash_left,
                         },
                     )
@@ -2848,6 +3189,23 @@ def run_organization_job(job_id: str) -> None:
         item_ids = payload.get("item_ids") if isinstance(payload, dict) else []
         if not isinstance(item_ids, list):
             item_ids = []
+        scope = _validated_organization_scope(
+            payload.get("scope", "approved")
+            if isinstance(payload, dict)
+            else "approved"
+        )
+        raw_planned_items = (
+            payload.get("items", []) if isinstance(payload, dict) else []
+        )
+        planned_by_id = {
+            item["item_id"]: item
+            for item in raw_planned_items
+            if isinstance(item, dict) and isinstance(item.get("item_id"), str)
+        }
+        if scope == "likely_usable" and set(planned_by_id) != set(item_ids):
+            raise RecoveredChannelError(
+                "Likely-usable job lost its token-bound item snapshot", 409
+            )
         case_id = row["case_id"]
         cursor = conn.execute(
             "UPDATE recovered_channel_jobs SET status = 'running', started_at = ?, "
@@ -2871,7 +3229,12 @@ def run_organization_job(job_id: str) -> None:
             cancelled = True
             break
         try:
-            _organize_one(case_id, item_id)
+            _organize_one(
+                case_id,
+                item_id,
+                scope=scope,
+                planned_item=planned_by_id.get(item_id),
+            )
             success_count += 1
         except Exception as exc:  # continue a guarded batch after per-item failure
             fail_count += 1
@@ -2888,7 +3251,7 @@ def run_organization_job(job_id: str) -> None:
                     case_id,
                     "item_organization_failed",
                     item_id=item_id,
-                    details={"error": message},
+                    details={"error": message, "scope": scope},
                 )
                 conn.commit()
         with get_db() as conn:
@@ -2946,6 +3309,7 @@ def run_organization_job(job_id: str) -> None:
                 "status": final_status,
                 "success_count": success_count,
                 "fail_count": fail_count,
+                "scope": scope,
             },
         )
         conn.commit()

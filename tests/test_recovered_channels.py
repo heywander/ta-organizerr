@@ -1120,6 +1120,344 @@ class RecoveredChannelOrganizationTests(RecoveredChannelTestCase):
         )
         self.assertEqual(source.read_bytes(), b"source-remains-in-place")
 
+    def test_likely_scope_is_case_wide_and_leaves_review_and_holds_for_later(self) -> None:
+        sources = {
+            VIDEO_ID: self.make_media(VIDEO_ID, payload=b"clear-source"),
+            SECOND_VIDEO_ID: self.make_media(
+                SECOND_VIDEO_ID, suffix=".mkv", payload=b"minimal-source"
+            ),
+            "thirdvideo1": self.make_media(
+                "thirdvideo1", payload=b"serious-source"
+            ),
+            "fourthvid02": self.make_media(
+                "fourthvid02", payload=b"held-source"
+            ),
+        }
+        before = {
+            video_id: self.source_signature(path)
+            for video_id, path in sources.items()
+        }
+        case = self.create_case()
+        case_id = self.case_id(case)
+        items = {item["video_id"]: item for item in self.items(case_id)}
+        self.seed_completed_inspection(items[VIDEO_ID], health_tier="clear")
+        self.seed_completed_inspection(
+            items[SECOND_VIDEO_ID], health_tier="minimal"
+        )
+        self.seed_completed_inspection(
+            items["thirdvideo1"], health_tier="serious"
+        )
+        self.seed_completed_inspection(
+            items["fourthvid02"], health_tier="clear"
+        )
+        self.approve(case_id, items["thirdvideo1"])
+        recovered_channels.bulk_decision(
+            case_id,
+            [self.item_id(items["fourthvid02"])],
+            "hold",
+            actor="tester",
+        )
+
+        first_page = recovered_channels.list_items(
+            case_id, page=1, per_page=1
+        )
+        self.assertEqual(len(first_page["items"]), 1)
+        default_plan = recovered_channels.build_organization_plan(case_id)
+        self.assertEqual(default_plan["scope"], "approved")
+        self.assertEqual(
+            {item["video_id"] for item in default_plan["items"]},
+            {"thirdvideo1"},
+            "the default scope must retain the prior approved behavior",
+        )
+
+        plan = recovered_channels.build_organization_plan(
+            case_id, scope="likely_usable"
+        )
+
+        self.assertEqual(plan["scope"], "likely_usable")
+        self.assertEqual(plan["selected_count"], 2)
+        self.assertEqual(plan["ready_count"], 2)
+        self.assertEqual(plan["conflict_count"], 0)
+        self.assertEqual(plan["excluded_needs_review_count"], 1)
+        self.assertEqual(plan["held_count"], 1)
+        self.assertEqual(plan["remaining_count"], 2)
+        self.assertEqual(plan["summary"]["remaining_count"], 2)
+        self.assertEqual(
+            {item["video_id"] for item in plan["items"]},
+            {VIDEO_ID, SECOND_VIDEO_ID},
+            "scope selection must not depend on the currently loaded page",
+        )
+        self.assertTrue(
+            all(item["decision"] == "pending" for item in plan["items"]),
+            "dry-run planning must not auto-approve pending items",
+        )
+        self.assertTrue(
+            all(
+                item["health_tier"] in {"clear", "minimal"}
+                and item["scope"] == "likely_usable"
+                for item in plan["items"]
+            )
+        )
+
+        job = recovered_channels.start_organization(
+            case_id,
+            plan["plan_token"],
+            actor="tester",
+            background=False,
+            scope="likely_usable",
+        )
+
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["scope"], "likely_usable")
+        refreshed = {
+            item["video_id"]: item for item in self.items(case_id)
+        }
+        for video_id in (VIDEO_ID, SECOND_VIDEO_ID):
+            self.assertEqual(refreshed[video_id]["decision"], "approved")
+            self.assertTrue(Path(refreshed[video_id]["organized_path"]).is_symlink())
+        self.assertEqual(refreshed["thirdvideo1"]["decision"], "approved")
+        self.assertIsNone(refreshed["thirdvideo1"]["organized_path"])
+        self.assertEqual(refreshed["fourthvid02"]["decision"], "hold")
+        self.assertIsNone(refreshed["fourthvid02"]["organized_path"])
+        investigation = recovered_channels.get_case(case_id)
+        self.assertEqual(investigation["case"]["status"], "review")
+        self.assertEqual(investigation["counts"]["remaining"], 2)
+        for video_id, path in sources.items():
+            self.assertEqual(self.source_signature(path), before[video_id])
+
+    def test_likely_scope_blocks_nonheld_duplicates_and_hold_resolves_one(self) -> None:
+        source_specs = (
+            (VIDEO_ID, ".mp4", b"clear-a"),
+            (VIDEO_ID, ".mkv", b"clear-b"),
+            (SECOND_VIDEO_ID, ".mp4", b"mixed-clear"),
+            (SECOND_VIDEO_ID, ".mkv", b"mixed-serious-approved"),
+            ("thirdvideo1", ".mp4", b"held-clear"),
+            ("thirdvideo1", ".mkv", b"held-serious"),
+        )
+        sources = [
+            self.make_media(video_id, suffix=suffix, payload=payload)
+            for video_id, suffix, payload in source_specs
+        ]
+        before = [self.source_signature(path) for path in sources]
+        case = self.create_case()
+        case_id = self.case_id(case)
+        items = self.items(case_id)
+        by_key = {
+            (item["video_id"], item["suffix"]): item for item in items
+        }
+        for item in items:
+            health = (
+                "serious"
+                if (item["video_id"], item["suffix"])
+                in {
+                    (SECOND_VIDEO_ID, ".mkv"),
+                    ("thirdvideo1", ".mkv"),
+                }
+                else "clear"
+            )
+            self.seed_completed_inspection(item, health_tier=health)
+        self.approve(case_id, by_key[(SECOND_VIDEO_ID, ".mkv")])
+        recovered_channels.bulk_decision(
+            case_id,
+            [self.item_id(by_key[("thirdvideo1", ".mkv")])],
+            "hold",
+            actor="tester",
+        )
+
+        plan = recovered_channels.build_organization_plan(
+            case_id, scope="likely_usable"
+        )
+
+        self.assertEqual(plan["selected_count"], 4)
+        self.assertEqual(plan["ready_count"], 1)
+        self.assertEqual(plan["conflict_count"], 3)
+        self.assertEqual(plan["held_count"], 1)
+        self.assertEqual(plan["excluded_needs_review_count"], 1)
+        self.assertEqual(plan["remaining_count"], 5)
+        self.assertEqual(
+            {item["video_id"] for item in plan["conflicts"]},
+            {VIDEO_ID, SECOND_VIDEO_ID},
+        )
+        self.assertEqual(
+            [item["video_id"] for item in plan["items"] if item["ready"]],
+            ["thirdvideo1"],
+            "a held sibling is the only duplicate state that disambiguates",
+        )
+
+        job = recovered_channels.start_organization(
+            case_id,
+            plan["plan_token"],
+            actor="tester",
+            background=False,
+            scope="likely_usable",
+        )
+
+        self.assertEqual(job["status"], "partial")
+        self.assertEqual(job["success_count"], 1)
+        self.assertEqual(job["fail_count"], 3)
+        refreshed = self.items(case_id)
+        published = [item for item in refreshed if item["organized_path"]]
+        self.assertEqual(len(published), 1)
+        self.assertEqual(published[0]["video_id"], "thirdvideo1")
+        self.assertEqual(published[0]["decision"], "approved")
+        serious_held = next(
+            item
+            for item in refreshed
+            if item["video_id"] == "thirdvideo1" and item["suffix"] == ".mkv"
+        )
+        self.assertEqual(serious_held["decision"], "hold")
+        serious_approved = next(
+            item
+            for item in refreshed
+            if item["video_id"] == SECOND_VIDEO_ID and item["suffix"] == ".mkv"
+        )
+        self.assertEqual(serious_approved["decision"], "approved")
+        self.assertIsNone(serious_approved["organized_path"])
+        self.assertEqual(
+            recovered_channels.get_case(case_id)["counts"]["remaining"], 5
+        )
+        for path, signature in zip(sources, before):
+            self.assertEqual(self.source_signature(path), signature)
+
+    def test_likely_scope_token_binds_decision_and_expected_duration(self) -> None:
+        self.make_media(payload=b"likely-token-source")
+        case = self.create_case()
+        case_id = self.case_id(case)
+        item = self.items(case_id)[0]
+        self.seed_completed_inspection(item, health_tier="clear")
+        plan = recovered_channels.build_organization_plan(
+            case_id, scope="likely_usable"
+        )
+
+        recovered_channels.update_item(
+            case_id,
+            self.item_id(item),
+            {"decision": "hold"},
+            actor="tester",
+        )
+        with self.assertRaises(recovered_channels.RecoveredChannelError) as held:
+            recovered_channels.start_organization(
+                case_id,
+                plan["plan_token"],
+                background=False,
+                scope="likely_usable",
+            )
+        self.assertEqual(held.exception.status, 409)
+
+        recovered_channels.update_item(
+            case_id,
+            self.item_id(item),
+            {"decision": "pending"},
+            actor="tester",
+        )
+        duration_plan = recovered_channels.build_organization_plan(
+            case_id, scope="likely_usable"
+        )
+        with db.get_db() as connection:
+            connection.execute(
+                "UPDATE recovered_channel_items SET expected_duration_seconds = 90 "
+                "WHERE item_id = ?",
+                (self.item_id(item),),
+            )
+            connection.commit()
+        with self.assertRaises(recovered_channels.RecoveredChannelError) as changed:
+            recovered_channels.start_organization(
+                case_id,
+                duration_plan["plan_token"],
+                background=False,
+                scope="likely_usable",
+            )
+        self.assertEqual(changed.exception.status, 409)
+        self.assertFalse(
+            (self.target_dir / "The Oversphere [Recovered]").exists()
+        )
+
+    def test_explicit_null_organization_scope_is_never_defaulted(self) -> None:
+        self.make_media(payload=b"null-scope-source")
+        case = self.create_case()
+        case_id = self.case_id(case)
+        with self.assertRaises(recovered_channels.RecoveredChannelError):
+            recovered_channels.build_organization_plan(case_id, scope=None)
+        with self.assertRaises(recovered_channels.RecoveredChannelError):
+            recovered_channels.start_organization(
+                case_id,
+                "0" * 64,
+                background=False,
+                scope=None,
+            )
+
+    def test_likely_worker_rechecks_hold_and_does_not_approve_failed_item(self) -> None:
+        source = self.make_media(payload=b"late-held-source")
+        before = self.source_signature(source)
+        case = self.create_case()
+        case_id = self.case_id(case)
+        item = self.items(case_id)[0]
+        self.seed_completed_inspection(item, health_tier="minimal")
+        plan = recovered_channels.build_organization_plan(
+            case_id, scope="likely_usable"
+        )
+        with patch.object(recovered_channels, "_launch"):
+            job = recovered_channels.start_organization(
+                case_id,
+                plan["plan_token"],
+                actor="tester",
+                background=True,
+                scope="likely_usable",
+            )
+        with db.get_db() as connection:
+            connection.execute(
+                "UPDATE recovered_channel_items SET decision = 'hold' "
+                "WHERE item_id = ?",
+                (self.item_id(item),),
+            )
+            connection.commit()
+
+        recovered_channels.run_organization_job(job["job_id"])
+
+        result = recovered_channels.get_job(case_id, job["job_id"])
+        self.assertEqual(result["status"], "failed")
+        persisted = self.items(case_id)[0]
+        self.assertEqual(persisted["decision"], "hold")
+        self.assertIsNone(persisted["organized_path"])
+        self.assertEqual(self.source_signature(source), before)
+        with db.get_db() as connection:
+            owner = connection.execute(
+                "SELECT 1 FROM videos WHERE video_id = ?", (VIDEO_ID,)
+            ).fetchone()
+        self.assertIsNone(owner)
+
+    def test_failed_likely_publication_keeps_pending_decision(self) -> None:
+        source = self.make_media(payload=b"pending-source-before-drift")
+        case = self.create_case()
+        case_id = self.case_id(case)
+        item = self.items(case_id)[0]
+        self.seed_completed_inspection(item, health_tier="clear")
+        plan = recovered_channels.build_organization_plan(
+            case_id, scope="likely_usable"
+        )
+        with patch.object(recovered_channels, "_launch"):
+            job = recovered_channels.start_organization(
+                case_id,
+                plan["plan_token"],
+                actor="tester",
+                background=True,
+                scope="likely_usable",
+            )
+        source.write_bytes(b"source-drift-after-job-start")
+
+        recovered_channels.run_organization_job(job["job_id"])
+
+        result = recovered_channels.get_job(case_id, job["job_id"])
+        self.assertEqual(result["status"], "failed")
+        persisted = self.items(case_id)[0]
+        self.assertEqual(persisted["decision"], "pending")
+        self.assertIsNone(persisted["organized_path"])
+        with db.get_db() as connection:
+            owner = connection.execute(
+                "SELECT 1 FROM videos WHERE video_id = ?", (VIDEO_ID,)
+            ).fetchone()
+        self.assertIsNone(owner)
+
 
 class RecoveredChannelIntegrationTests(RecoveredChannelTestCase):
     def publish_one(self) -> tuple[Path, dict, dict, Path]:
@@ -2473,6 +2811,85 @@ class RecoveredChannelRouteTests(RecoveredChannelTestCase):
                 """,
                 (case_id,),
             ).fetchone()
+        self.assertEqual(event["actor"], "route-tester")
+
+    def test_scoped_organization_routes_bind_scope_and_reject_extra_keys(self) -> None:
+        self.login()
+        self.make_media(payload=b"route-likely-source")
+        case = self.create_case()
+        case_id = self.case_id(case)
+        item = self.items(case_id)[0]
+        self.seed_completed_inspection(item, health_tier="clear")
+        plan_path = f"/api/recovery/channel-cases/{case_id}/organization-plan"
+
+        unknown = self.client.post(plan_path, json={"scope": "everything"})
+        self.assertEqual(unknown.status_code, 400, unknown.get_json())
+        null_plan = self.client.post(plan_path, json={"scope": None})
+        self.assertEqual(null_plan.status_code, 400, null_plan.get_json())
+        injected_plan = self.client.post(
+            plan_path,
+            json={"scope": "likely_usable", "item_ids": [self.item_id(item)]},
+        )
+        self.assertEqual(injected_plan.status_code, 400, injected_plan.get_json())
+        planned = self.client.post(
+            plan_path, json={"scope": "likely_usable"}
+        )
+        self.assertEqual(planned.status_code, 200, planned.get_json())
+        plan = planned.get_json()["plan"]
+        self.assertEqual(plan["scope"], "likely_usable")
+        self.assertEqual(plan["ready_count"], 1)
+        self.assertEqual(plan["items"][0]["decision"], "pending")
+
+        organize_path = f"/api/recovery/channel-cases/{case_id}/organize"
+        null_organize = self.client.post(
+            organize_path,
+            json={"plan_token": plan["plan_token"], "scope": None},
+        )
+        self.assertEqual(
+            null_organize.status_code, 400, null_organize.get_json()
+        )
+        missing_scope = self.client.post(
+            organize_path, json={"plan_token": plan["plan_token"]}
+        )
+        self.assertEqual(missing_scope.status_code, 409, missing_scope.get_json())
+        injected_organize = self.client.post(
+            organize_path,
+            json={
+                "plan_token": plan["plan_token"],
+                "scope": "likely_usable",
+                "candidate_path": str(self.root / "injected.mp4"),
+            },
+        )
+        self.assertEqual(
+            injected_organize.status_code, 400, injected_organize.get_json()
+        )
+        with patch.object(recovered_channels, "_launch"):
+            started = self.client.post(
+                organize_path,
+                json={
+                    "plan_token": plan["plan_token"],
+                    "scope": "likely_usable",
+                },
+            )
+        self.assertEqual(started.status_code, 202, started.get_json())
+        job = started.get_json()["job"]
+        self.assertEqual(job["scope"], "likely_usable")
+        with db.get_db() as connection:
+            stored = connection.execute(
+                "SELECT payload_json FROM recovered_channel_jobs WHERE job_id = ?",
+                (job["job_id"],),
+            ).fetchone()
+            event = connection.execute(
+                "SELECT actor, details_json FROM recovered_channel_events "
+                "WHERE case_id = ? AND event = 'organization_started' "
+                "ORDER BY event_id DESC LIMIT 1",
+                (case_id,),
+            ).fetchone()
+        payload = json.loads(stored["payload_json"])
+        details = json.loads(event["details_json"])
+        self.assertEqual(payload["scope"], "likely_usable")
+        self.assertEqual(payload["items"][0]["decision"], "pending")
+        self.assertEqual(details["scope"], "likely_usable")
         self.assertEqual(event["actor"], "route-tester")
 
     def test_case_repair_route_accepts_no_client_path_and_records_actor(self) -> None:

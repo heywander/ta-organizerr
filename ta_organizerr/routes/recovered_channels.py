@@ -160,25 +160,38 @@ def api_recovered_channel_cancel(case_id: str, job_id: str):
 @bp.post("/<case_id>/organization-plan")
 @requires_auth
 def api_recovered_channel_plan(case_id: str):
-    # An empty object is accepted so clients can use the same JSON POST helper
-    # as the mutating actions. The server always derives the plan from current
-    # approved item state and never accepts client paths.
     data = request.get_json(silent=True)
-    if data not in (None, {}) and not isinstance(data, dict):
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
         raise recovered_channels.RecoveredChannelError(
             "Request body must be a JSON object"
         )
-    return jsonify({"plan": recovered_channels.build_organization_plan(case_id)})
+    if not set(data).issubset({"scope"}):
+        raise recovered_channels.RecoveredChannelError(
+            "Organization plan accepts only scope"
+        )
+    scope = data.get("scope", "approved")
+    return jsonify({
+        "plan": recovered_channels.build_organization_plan(
+            case_id, scope=scope
+        )
+    })
 
 
 @bp.post("/<case_id>/organize")
 @requires_auth
 def api_recovered_channel_organize(case_id: str):
     data = _body()
+    if not set(data).issubset({"plan_token", "scope"}):
+        raise recovered_channels.RecoveredChannelError(
+            "Organize accepts only plan_token and scope"
+        )
     job = recovered_channels.start_organization(
         case_id,
         data.get("plan_token"),
         actor=_actor(),
         background=True,
+        scope=data.get("scope", "approved"),
     )
     return jsonify({"job": job}), 202

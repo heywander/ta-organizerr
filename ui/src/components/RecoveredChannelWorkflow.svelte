@@ -13,6 +13,8 @@
         type RecoveredChannelInvestigation,
         type RecoveredChannelItem,
         type RecoveredChannelPlan,
+        type RecoveredChannelPlanItem,
+        type RecoveredChannelPlanScope,
         type RecoveredChannelResult,
         type RecoveredChannelStep,
         type ReviewDecision,
@@ -70,8 +72,11 @@
     let expectedDurationErrors: Record<string, string> = {};
     let reportedDirtyExpectedDurations = false;
     let mobileReviewBucket: "likely" | "review" = "likely";
+    let likelyPlanConfirmationOpen = false;
     let stepHeading: HTMLElement | null = null;
     let backButton: HTMLButtonElement | null = null;
+    let likelyPlanTrigger: HTMLButtonElement | null = null;
+    let likelyPlanConfirmationHeading: HTMLElement | null = null;
 
     function asRecord(value: unknown): Record<string, unknown> {
         return value && typeof value === "object" && !Array.isArray(value)
@@ -134,6 +139,7 @@
         focusTab = false,
     ) {
         mobileReviewBucket = bucket;
+        if (bucket === "review") likelyPlanConfirmationOpen = false;
         if (!focusTab) return;
         await tick();
         document
@@ -156,6 +162,26 @@
         if (!next) return;
         event.preventDefault();
         void selectMobileReviewBucket(next, true);
+    }
+
+    async function openLikelyPlanConfirmation() {
+        if (dirtyExpectedDurationItems.length > 0 || actionBusy) return;
+        likelyPlanConfirmationOpen = true;
+        await tick();
+        likelyPlanConfirmationHeading?.focus();
+    }
+
+    async function closeLikelyPlanConfirmation(restoreFocus = true) {
+        likelyPlanConfirmationOpen = false;
+        if (!restoreFocus) return;
+        await tick();
+        likelyPlanTrigger?.focus();
+    }
+
+    function handleLikelyPlanConfirmationKeydown(event: KeyboardEvent) {
+        if (event.key !== "Escape") return;
+        event.preventDefault();
+        void closeLikelyPlanConfirmation();
     }
 
     function requestedTargetComponent(): string {
@@ -897,8 +923,14 @@
         }
     }
 
-    async function buildPlan() {
-        if (!investigation || approvedCount === 0 || actionBusy) return;
+    async function buildPlan(scope: RecoveredChannelPlanScope) {
+        if (
+            !investigation ||
+            actionBusy ||
+            (scope === "approved" && approvedCount === 0) ||
+            (scope === "likely_usable" && authoritativeLikelyCount === 0)
+        )
+            return;
         if (dirtyExpectedDurationItems.length > 0) {
             error = "Save or discard all expected-duration edits before building an organization plan.";
             return;
@@ -910,12 +942,13 @@
         try {
             const data = await request(casePath("/organization-plan"), {
                 method: "POST",
-                body: JSON.stringify({}),
+                body: JSON.stringify({ scope }),
             });
-            plan = normalizeRecoveredChannelPlan(data);
+            plan = normalizeRecoveredChannelPlan(data, scope);
+            likelyPlanConfirmationOpen = false;
             await moveTo("plan");
         } catch (value) {
-            error = `Organization plan could not be built: ${messageFrom(value)}`;
+            error = `${scope === "likely_usable" ? "Likely-usable" : "Approved-video"} organization plan could not be built: ${messageFrom(value)}`;
         } finally {
             actionBusy = false;
         }
@@ -932,9 +965,12 @@
             error = "The dry-run plan has no validation token. Build it again.";
             return;
         }
+        const likelyScope = plan.scope === "likely_usable";
         if (
             !confirm(
-                `Create ${plan.ready_count} managed links under ${plan.target_folder_name || investigation.target_folder_name}? Source files will remain in place.`,
+                likelyScope
+                    ? `Publish ${plan.ready_count} likely usable videos under ${plan.target_folder_name || investigation.target_folder_name}?\n\nOnly the clear/minimal, non-held items bound to this dry-run plan will receive managed links. Successful pending items become approved. Needs closer review and held videos stay in the investigation. Source files remain in place.`
+                    : `Create ${plan.ready_count} managed links under ${plan.target_folder_name || investigation.target_folder_name}? Source files will remain in place.`,
             )
         )
             return;
@@ -945,14 +981,19 @@
         try {
             const data = await request(casePath("/organize"), {
                 method: "POST",
-                body: JSON.stringify({ plan_token: token }),
+                body: JSON.stringify({
+                    plan_token: token,
+                    scope: plan.scope,
+                }),
             });
             activeJob = asRecord(data?.job || data);
             activeJobKind = "organize";
-            notice = "Organization queued. Every source and destination will be revalidated before its link is created.";
+            notice = likelyScope
+                ? "Likely-usable publication queued. Only the items bound to this scoped plan can receive links; every source and destination will be revalidated first."
+                : "Organization queued. Every source and destination will be revalidated before its link is created.";
             schedulePoll(350);
         } catch (value) {
-            error = `Approved videos could not be organized: ${messageFrom(value)}`;
+            error = `${likelyScope ? "Likely usable" : "Approved"} videos could not be organized: ${messageFrom(value)}`;
         } finally {
             actionBusy = false;
         }
@@ -1005,6 +1046,31 @@
         return labels[item.severity] || labels[item.assessment] || "Needs closer review";
     }
 
+    function planScopeLabel(scope: RecoveredChannelPlanScope): string {
+        return scope === "likely_usable"
+            ? "Likely usable only"
+            : "Approved selections";
+    }
+
+    function planHealthTierLabel(item: RecoveredChannelPlanItem): string {
+        const labels: Record<string, string> = {
+            clear: "Clear",
+            minimal: "Minimal",
+            serious: "Serious",
+            inconclusive: "Inconclusive",
+            damaged: "Damaged",
+            failed: "Failed",
+            unknown: "Unknown tier",
+        };
+        return labels[item.health_tier] || item.health_tier.replaceAll("_", " ");
+    }
+
+    function planDecisionLabel(item: RecoveredChannelPlanItem): string {
+        if (item.decision === "approved") return "Prior: approved";
+        if (item.decision === "held") return "Prior: held";
+        return "Prior: pending";
+    }
+
     function itemFindings(item: RecoveredChannelItem): string[] {
         const values = [
             ...item.findings,
@@ -1034,6 +1100,17 @@
             if (Number.isFinite(values[name])) return values[name];
         }
         return fallback;
+    }
+
+    function optionalCountFromCase(
+        counts: Record<string, number> | undefined,
+        names: string[],
+    ): number | null {
+        const values = counts || {};
+        for (const name of names) {
+            if (Number.isFinite(values[name])) return values[name];
+        }
+        return null;
     }
 
     function jobProgress(): number {
@@ -1100,16 +1177,16 @@
     }
     $: likelyItems = unresolvedItems.filter(isLikelyUsable);
     $: reviewItems = unresolvedItems.filter((item) => !isLikelyUsable(item));
-    $: likelyCount = countFromCase(
+    $: authoritativeLikelyCount = optionalCountFromCase(
         investigation?.counts,
         ["remaining_best", "best", "likely_usable", "likely", "clear_or_minimal"],
-        likelyItems.length,
     );
-    $: reviewCount = countFromCase(
+    $: likelyCount = authoritativeLikelyCount ?? 0;
+    $: authoritativeReviewCount = optionalCountFromCase(
         investigation?.counts,
         ["remaining_review", "needs_review", "review", "serious_or_inconclusive"],
-        reviewItems.length,
     );
+    $: reviewCount = authoritativeReviewCount ?? 0;
     $: approvedCount = countFromCase(
         investigation?.counts,
         ["approved", "remaining_approved", "decision_approved"],
@@ -1120,11 +1197,22 @@
         ["hold", "held", "decision_hold"],
         unresolvedItems.filter((item) => item.decision === "held").length,
     );
+    $: publishedCount = countFromCase(
+        investigation?.counts,
+        ["organized", "published"],
+        publishedItems.length,
+    );
     $: totalCount = Math.max(
         sourceItems.length,
         itemsTotal,
         investigation?.total || 0,
     );
+    $: authoritativeRemainingCount = optionalCountFromCase(
+        investigation?.counts,
+        ["remaining", "remaining_count", "unresolved", "unpublished"],
+    );
+    $: remainingCount =
+        authoritativeRemainingCount ?? Math.max(0, totalCount - publishedCount);
     $: completedCount = Math.min(
         totalCount,
         (investigation?.completed || 0) + (investigation?.failed || 0),
@@ -1310,8 +1398,8 @@
                 <header>
                     <div>
                         <span class="step-eyebrow">Step 3</span>
-                        <h3 bind:this={stepHeading} tabindex="-1" id="workflow-review-heading">Review condition and approve individually</h3>
-                        <p>Nothing is approved automatically. Held videos remain in this investigation for later work.</p>
+                        <h3 bind:this={stepHeading} tabindex="-1" id="workflow-review-heading">Review condition and choose what to publish</h3>
+                        <p>Approve videos individually, or explicitly prepare every eligible Likely usable video. Held videos always remain for later work.</p>
                     </div>
                     <div class="decision-summary" aria-live="polite">
                         <strong>{approvedCount} approved</strong>
@@ -1358,6 +1446,59 @@
                             </div>
                             <span>{likelyCount}</span>
                         </header>
+                        <div class="likely-plan-action">
+                            <div>
+                                <strong>Publish the strongest candidates first</strong>
+                                <span>
+                                    {#if authoritativeLikelyCount === null}
+                                        The server will count eligible clear/minimal videos across the whole investigation.
+                                    {:else}
+                                        {authoritativeLikelyCount} clear/minimal {authoritativeLikelyCount === 1 ? "video is" : "videos are"} classified across the whole investigation.
+                                    {/if}
+                                </span>
+                            </div>
+                            <button
+                                bind:this={likelyPlanTrigger}
+                                class="primary-action"
+                                type="button"
+                                aria-expanded={likelyPlanConfirmationOpen}
+                                aria-controls="likely-plan-confirmation"
+                                on:click={openLikelyPlanConfirmation}
+                                disabled={actionBusy || authoritativeLikelyCount === 0 || dirtyExpectedDurationItems.length > 0}
+                                title={dirtyExpectedDurationItems.length > 0 ? "Save or discard expected-duration edits first" : undefined}
+                            >
+                                <i class="bi bi-shield-check" aria-hidden="true"></i>
+                                Prepare likely usable
+                            </button>
+                        </div>
+                        {#if likelyPlanConfirmationOpen}
+                            <section
+                                id="likely-plan-confirmation"
+                                class="likely-plan-confirmation"
+                                aria-labelledby="likely-plan-confirmation-heading"
+                                aria-describedby="likely-plan-confirmation-description"
+                                on:keydown={handleLikelyPlanConfirmationKeydown}
+                            >
+                                <div>
+                                    <span class="step-eyebrow">Scoped dry run</span>
+                                    <h5 bind:this={likelyPlanConfirmationHeading} tabindex="-1" id="likely-plan-confirmation-heading">Prepare every eligible Likely usable video?</h5>
+                                    <p id="likely-plan-confirmation-description">The server—not the loaded page—will consider all completed clear/minimal candidates in this investigation that are not held.</p>
+                                </div>
+                                <ul>
+                                    <li><strong>Pending and already-approved Likely videos are included.</strong> Load a Likely video and use Hold before continuing when it must be excluded.</li>
+                                    <li><strong>Needs closer review stays untouched,</strong> even when you approved one of those videos manually.</li>
+                                    <li><strong>Held videos stay held.</strong> Their decision will not be changed.</li>
+                                    <li><strong>Planning changes no decisions and creates no links.</strong> After you confirm the plan, only pending videos whose links publish successfully become approved.</li>
+                                </ul>
+                                <div class="likely-plan-confirmation-actions">
+                                    <button type="button" on:click={() => closeLikelyPlanConfirmation()} disabled={actionBusy}>Cancel</button>
+                                    <button class="primary-action" type="button" on:click={() => buildPlan("likely_usable")} disabled={actionBusy || dirtyExpectedDurationItems.length > 0}>
+                                        {actionBusy ? "Building dry run…" : "Create likely-only dry run"}
+                                        <i class="bi bi-arrow-right" aria-hidden="true"></i>
+                                    </button>
+                                </div>
+                            </section>
+                        {/if}
                         <div class="media-list">
                             {#each likelyItems as item (item.id)}
                                 <article class:approved={item.decision === "approved"} class:held={item.decision === "held"} aria-labelledby={`recovered-item-${item.id}`}>
@@ -1554,12 +1695,12 @@
 
                 <footer class="step-actions review-footer">
                     <button type="button" on:click={() => moveTo("inspect")}><i class="bi bi-arrow-left" aria-hidden="true"></i> Inspection</button>
-                    {#if countFromCase(investigation?.counts, ["organized"], publishedItems.length) > 0}
-                        <button type="button" on:click={() => moveTo("complete")}><i class="bi bi-link-45deg" aria-hidden="true"></i> Published links ({countFromCase(investigation?.counts, ["organized"], publishedItems.length)})</button>
+                    {#if publishedCount > 0}
+                        <button type="button" on:click={() => moveTo("complete")}><i class="bi bi-link-45deg" aria-hidden="true"></i> Published links ({publishedCount})</button>
                     {/if}
                     <div>
                         <span>{approvedCount} approved · {heldCount} held</span>
-                        <button class="primary-action" type="button" on:click={buildPlan} disabled={approvedCount === 0 || actionBusy || dirtyExpectedDurationItems.length > 0} title={dirtyExpectedDurationItems.length > 0 ? "Save or discard expected-duration edits first" : undefined}>
+                        <button class="primary-action" type="button" on:click={() => buildPlan("approved")} disabled={approvedCount === 0 || actionBusy || dirtyExpectedDurationItems.length > 0} title={dirtyExpectedDurationItems.length > 0 ? "Save or discard expected-duration edits first" : undefined}>
                             Review organization plan
                             <i class="bi bi-arrow-right" aria-hidden="true"></i>
                         </button>
@@ -1571,8 +1712,8 @@
                 <header>
                     <div>
                         <span class="step-eyebrow">Step 4</span>
-                        <h3 bind:this={stepHeading} tabindex="-1" id="workflow-plan-heading">Review the managed-link plan</h3>
-                        <p>Approved source files remain where they are. Target receives direct symlinks named with the exact video ID and original suffix.</p>
+                        <h3 bind:this={stepHeading} tabindex="-1" id="workflow-plan-heading">{plan?.scope === "likely_usable" ? "Review the likely-only managed-link plan" : "Review the approved-video managed-link plan"}</h3>
+                        <p>{plan?.scope === "likely_usable" ? "This dry run is scoped to eligible clear/minimal, non-held videos across the whole investigation." : "This dry run is scoped to your individually approved videos."} Source files remain where they are.</p>
                     </div>
                 </header>
 
@@ -1584,8 +1725,22 @@
                 {:else if plan}
                     <div class="plan-summary">
                         <div><span>Target channel</span><strong>{plan.target_folder_name || investigation?.target_folder_name}</strong></div>
+                        <div><span>Scope</span><strong>{planScopeLabel(plan.scope)}</strong></div>
+                        <div><span>Selected</span><strong>{plan.selected_count}</strong></div>
                         <div><span>Ready</span><strong>{plan.ready_count}</strong></div>
                         <div><span>Blocked</span><strong>{plan.blocked_count}</strong></div>
+                    </div>
+
+                    <div class="plan-scope-note" role="note">
+                        <i class={`bi ${plan.scope === "likely_usable" ? "bi-filter-circle" : "bi-check2-square"}`} aria-hidden="true"></i>
+                        <div>
+                            <strong>{planScopeLabel(plan.scope)}</strong>
+                            {#if plan.scope === "likely_usable"}
+                                <span>{plan.summary.excluded_needs_review_count} Needs-review {plan.summary.excluded_needs_review_count === 1 ? "video is" : "videos are"} excluded, including manual approvals · {plan.summary.held_count} held unchanged · {plan.summary.remaining_count} remain for later after this batch. Pending items become approved only when their links publish successfully.</span>
+                            {:else}
+                                <span>Only individually approved videos are selected · {plan.summary.held_count} held unchanged · {plan.summary.remaining_count} remain for later after this batch.</span>
+                            {/if}
+                        </div>
                     </div>
 
                     <div class="source-preserved" role="note">
@@ -1594,11 +1749,15 @@
                     </div>
 
                     <div class="plan-list">
-                        {#each plan.items as entry (entry.video_id)}
+                        {#each plan.items as entry (entry.item_id)}
                             <article class:blocked={["blocked", "conflict", "invalid", "error"].includes(entry.status)}>
                                 <div class="plan-entry-heading">
                                     <strong>{entry.video_id}</strong>
-                                    <span>{entry.status}</span>
+                                    <div class="plan-entry-badges">
+                                        <span class="condition-badge" class:condition-badge--likely={["clear", "minimal"].includes(entry.health_tier)} class:condition-badge--review={!(["clear", "minimal"].includes(entry.health_tier))}>{planHealthTierLabel(entry)}</span>
+                                        <span>{planDecisionLabel(entry)}</span>
+                                        <span>{entry.status}</span>
+                                    </div>
                                 </div>
                                 <div><span>Source</span><code>{entry.source_path}</code></div>
                                 <div><span>Managed link</span><code>{entry.destination_path}</code></div>
@@ -1617,7 +1776,7 @@
                     <button type="button" on:click={() => moveTo("review")} disabled={organizationRunning}><i class="bi bi-arrow-left" aria-hidden="true"></i> Back to review</button>
                     <button class="primary-action" type="button" on:click={organizeApproved} disabled={!plan || plan.ready_count === 0 || actionBusy || organizationRunning || dirtyExpectedDurationItems.length > 0}>
                         <i class="bi bi-link-45deg" aria-hidden="true"></i>
-                        {organizationRunning ? "Organizing…" : `Organize ${plan?.ready_count || 0} approved videos`}
+                        {organizationRunning ? "Publishing…" : plan?.scope === "likely_usable" ? `Publish ${plan.ready_count} likely usable videos` : `Organize ${plan?.ready_count || 0} approved videos`}
                     </button>
                 </footer>
             </section>
@@ -1635,12 +1794,24 @@
                     <i class={`bi ${linkHealthAttention ? "bi-exclamation-triangle" : "bi-check2-circle"}`} aria-hidden="true"></i>
                 </div>
                 <dl class="completion-counts">
-                    <div><dt>Published</dt><dd>{countFromCase(investigation?.counts, ["organized"], publishedItems.length)}</dd></div>
+                    <div><dt>Published</dt><dd>{publishedCount}</dd></div>
                     <div><dt>Healthy loaded</dt><dd>{healthyPublishedCount}</dd></div>
                     <div><dt>Other states loaded</dt><dd>{unhealthyPublishedCount}</dd></div>
                     <div><dt>Repair available</dt><dd>{repairNeededCount}</dd></div>
                 </dl>
                 <div class="completion-target"><span>Target channel</span><code>{investigation?.target_folder_path || investigation?.target_folder_name}</code></div>
+                <div class="completion-batch-note" class:complete={remainingCount === 0 && !organizationOutcomeWarning} role="status">
+                    <i class={`bi ${organizationOutcomeWarning ? "bi-exclamation-triangle" : remainingCount === 0 ? "bi-check2-circle" : "bi-collection-play"}`} aria-hidden="true"></i>
+                    <span>
+                        {#if organizationOutcomeWarning}
+                            <strong>Publication batch finished with exceptions.</strong> {remainingCount} {remainingCount === 1 ? "video remains" : "videos remain"} unpublished; review the warning and remaining work.
+                        {:else if remainingCount > 0}
+                            <strong>Publication batch complete; investigation still open.</strong> {remainingCount} {remainingCount === 1 ? "video remains" : "videos remain"} unpublished for later review.
+                        {:else}
+                            <strong>Recovered channel publication complete.</strong> No unpublished videos remain in this investigation.
+                        {/if}
+                    </span>
+                </div>
                 {#if organizeResult?.message}<p class="completion-message">{organizeResult.message}</p>{/if}
                 {#if organizationOutcomeWarning}
                     <p class="completion-warning" role="alert">
@@ -1709,8 +1880,8 @@
                 </section>
 
                 <footer class="step-actions split-actions">
-                    {#if unresolvedItems.length > 0}
-                        <button type="button" on:click={() => moveTo("review")}><i class="bi bi-collection-play" aria-hidden="true"></i> Review remaining videos</button>
+                    {#if remainingCount > 0}
+                        <button type="button" on:click={() => moveTo("review")}><i class="bi bi-collection-play" aria-hidden="true"></i> Review remaining videos ({remainingCount})</button>
                     {:else}<span></span>{/if}
                     <button class="primary-action" type="button" on:click={leaveWorkflow}>Return to Unindexed</button>
                 </footer>
@@ -1881,6 +2052,19 @@
     .condition-list--review h4 i { color: var(--warning); }
     .condition-list header p { margin: 2px 0 0; color: var(--muted, var(--text-muted)); font-size: 9px; }
     .condition-list > header > span { display: grid; min-width: 28px; height: 24px; place-items: center; background: var(--frame, var(--page-deep)); border: 1px solid var(--rule-dim, var(--line-soft)); font-size: 10px; font-weight: 700; }
+    .likely-plan-action { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 7px 7px 0; padding: 8px; background: var(--surface, #434b3c); border: 1px solid var(--success); }
+    .likely-plan-action > div { min-width: 0; }
+    .likely-plan-action strong,
+    .likely-plan-action span { display: block; }
+    .likely-plan-action strong { font-size: 10px; }
+    .likely-plan-action span { margin-top: 2px; color: var(--muted, var(--text-muted)); font-size: 9px; }
+    .likely-plan-action > button { flex: 0 0 auto; }
+    .likely-plan-confirmation { display: grid; gap: 8px; margin: 7px 7px 0; padding: 10px; color: var(--text-secondary, var(--text-soft)); background: var(--frame, var(--page-deep)); border: 1px solid var(--accent); }
+    .likely-plan-confirmation h5 { margin: 2px 0 0; color: var(--text); font-size: 12px; }
+    .likely-plan-confirmation h5:focus { outline: 1px solid var(--accent); outline-offset: 3px; }
+    .likely-plan-confirmation p { margin: 3px 0 0; font-size: 9px; }
+    .likely-plan-confirmation ul { display: grid; gap: 5px; margin: 0; padding-left: 18px; font-size: 9px; }
+    .likely-plan-confirmation-actions { display: flex; justify-content: flex-end; gap: 6px; padding-top: 7px; border-top: 1px solid var(--rule-dim, var(--line-soft)); }
     .media-list { display: grid; gap: 7px; max-height: 58dvh; overflow-y: auto; padding: 7px; }
     .media-list article { display: grid; gap: 6px; padding: 8px; background: var(--row, var(--surface-raised)); border: 1px solid var(--rule-dim, var(--line-soft)); }
     .media-list article.approved { border-color: var(--success); }
@@ -1928,7 +2112,7 @@
     .review-footer > div > span { color: var(--muted, var(--text-muted)); font-size: 10px; }
 
     .organization-running { width: min(680px, calc(100% - 20px)); margin: 10px auto; }
-    .plan-summary { display: grid; grid-template-columns: minmax(0, 2fr) repeat(2, minmax(90px, 1fr)); gap: 1px; margin: 8px; background: var(--rule-dim, var(--line-soft)); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .plan-summary { display: grid; grid-template-columns: minmax(0, 2fr) repeat(4, minmax(82px, 1fr)); gap: 1px; margin: 8px; background: var(--rule-dim, var(--line-soft)); border: 1px solid var(--rule-dim, var(--line-soft)); }
     .plan-summary > div { padding: 8px; background: var(--surface, #434b3c); }
     .plan-summary span,
     .plan-summary strong { display: block; }
@@ -1936,11 +2120,21 @@
     .plan-summary strong { margin-top: 2px; font-size: 11px; overflow-wrap: anywhere; }
     .source-preserved { margin: 0 8px 8px; }
     .source-preserved i { color: var(--success); }
+    .plan-scope-note { display: flex; align-items: flex-start; gap: 8px; margin: 0 8px 8px; padding: 8px; color: var(--text-secondary, var(--text-soft)); background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .plan-scope-note i { margin-top: 1px; color: var(--accent); }
+    .plan-scope-note strong,
+    .plan-scope-note span { display: block; }
+    .plan-scope-note strong { font-size: 10px; }
+    .plan-scope-note span { margin-top: 2px; color: var(--muted, var(--text-muted)); font-size: 9px; }
     .plan-list { display: grid; gap: 6px; max-height: 56dvh; overflow-y: auto; padding: 0 8px 8px; }
     .plan-list article { display: grid; gap: 5px; padding: 7px; background: var(--row, var(--surface-raised)); border: 1px solid var(--rule-dim, var(--line-soft)); }
     .plan-list article.blocked { color: var(--danger-text, #f0d7cf); background: var(--danger-surface, #4a2e28); border-color: var(--danger-rule, #8b5a4e); }
-    .plan-entry-heading { display: flex; justify-content: space-between; gap: 8px; }
-    .plan-entry-heading span { font-size: 9px; font-weight: 700; text-transform: uppercase; }
+    .plan-entry-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+    .plan-entry-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+    .plan-entry-badges > span { min-height: 19px; padding: 2px 5px; border: 1px solid var(--rule-dim, var(--line-soft)); font-size: 8px; font-weight: 700; text-transform: uppercase; }
+    .plan-entry-badges > .condition-badge--likely { border-color: var(--success); }
+    .plan-entry-badges > .condition-badge--review { color: var(--danger-text, #f0d7cf); background: var(--danger-surface, #4a2e28); border-color: var(--danger-rule, #8b5a4e); }
+    .plan-entry-badges > span:last-child { color: var(--text-secondary, var(--text-soft)); }
     .plan-list article > div:not(.plan-entry-heading) { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 6px; }
     .plan-list article > div > span { color: var(--muted, var(--text-muted)); font-size: 8px; text-transform: uppercase; }
     .plan-list code { color: var(--text-secondary, var(--text-soft)); font-size: 9px; overflow-wrap: anywhere; }
@@ -1953,6 +2147,11 @@
     .completion-target { display: grid; width: min(620px, calc(100% - 20px)); margin: 8px auto; gap: 3px; padding: 8px; background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
     .completion-target span { color: var(--muted, var(--text-muted)); font-size: 8px; text-transform: uppercase; }
     .completion-target code { overflow-wrap: anywhere; }
+    .completion-batch-note { display: flex; width: min(620px, calc(100% - 20px)); align-items: flex-start; gap: 8px; margin: 0 auto 8px; padding: 8px; color: var(--text-secondary, var(--text-soft)); background: var(--surface, #434b3c); border: 1px solid var(--warning); }
+    .completion-batch-note.complete { border-color: var(--success); }
+    .completion-batch-note i { flex: 0 0 auto; color: var(--warning); }
+    .completion-batch-note.complete i { color: var(--success); }
+    .completion-batch-note span { min-width: 0; font-size: 10px; overflow-wrap: anywhere; }
     .completion-message { width: min(620px, calc(100% - 20px)); margin: 0 auto 10px; color: var(--muted, var(--text-muted)); text-align: center; }
     .completion-warning { display: flex; width: min(620px, calc(100% - 20px)); align-items: flex-start; gap: 7px; margin: 0 auto 10px; padding: 8px; color: var(--danger-text, #f0d7cf); background: var(--danger-surface, #4a2e28); border: 1px solid var(--danger-rule, #8b5a4e); }
     .completion-warning i { flex: 0 0 auto; }
@@ -2036,6 +2235,13 @@
         .mobile-bucket-tabs button span { display: inline-grid; min-width: 21px; height: 21px; place-items: center; color: inherit; background: rgb(0 0 0 / 12%); }
         .review-columns { grid-template-columns: minmax(0, 1fr); padding: 0 6px 6px; }
         .condition-list.mobile-hidden { display: none; }
+        .likely-plan-action { align-items: stretch; flex-direction: column; }
+        .likely-plan-action > button { width: 100%; }
+        .likely-plan-confirmation { margin-right: 7px; margin-left: 7px; padding: 11px; }
+        .likely-plan-confirmation p,
+        .likely-plan-confirmation ul { font-size: 10px; line-height: 1.45; }
+        .likely-plan-confirmation-actions { align-items: stretch; flex-direction: column-reverse; }
+        .likely-plan-confirmation-actions button { width: 100%; }
         .media-list { max-height: none; overflow: visible; }
         .media-list article { padding: 9px; }
         .media-list summary { display: flex; min-height: 44px; align-items: center; }
@@ -2055,6 +2261,8 @@
         .review-footer > div > span { text-align: center; }
         .plan-summary { grid-template-columns: minmax(0, 1fr); }
         .plan-list { max-height: none; overflow: visible; }
+        .plan-entry-heading { align-items: stretch; flex-direction: column; }
+        .plan-entry-badges { justify-content: flex-start; }
         .plan-list article > div:not(.plan-entry-heading) { grid-template-columns: minmax(0, 1fr); }
         .published-health { width: calc(100% - 12px); }
         .published-link-list { max-height: none; overflow: visible; }
