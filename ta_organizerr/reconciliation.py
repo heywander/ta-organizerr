@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ctypes
+import copy
 import errno
 import hashlib
 import json
@@ -10,6 +11,10 @@ import os
 import secrets
 import stat
 import subprocess
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -29,6 +34,18 @@ _MAX_PATH_LENGTH = 4096
 _PROBE_TIMEOUT_SECONDS = 20
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_PROBE_CACHE_SCHEMA = 1
+
+
+def _bounded_env_int(name: str, default: int, maximum: int) -> int:
+    try:
+        return max(1, min(maximum, int(os.getenv(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+_PROBE_WORKERS = _bounded_env_int("RECONCILIATION_PROBE_WORKERS", 2, 8)
+_PROBE_CACHE_MAX = _bounded_env_int("RECONCILIATION_PROBE_CACHE_MAX", 4096, 50_000)
 
 _DEMUXERS = {
     ".avi": "avi",
@@ -50,6 +67,21 @@ _STATUS_LABELS = {
 }
 
 _CACHE: dict[str, Any] | None = None
+_PROBE_CACHE: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+_PROBE_CACHE_LOCK = threading.Lock()
+_SCAN_STATE_LOCK = threading.Lock()
+_SCAN_THREAD: threading.Thread | None = None
+_SCAN_STATE: dict[str, Any] = {
+    "job_id": None,
+    "status": "idle",
+    "phase": "idle",
+    "current": 0,
+    "total": 0,
+    "detail": "No reconciliation scan has run yet.",
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+}
 
 
 class ReconciliationError(RuntimeError):
@@ -65,7 +97,31 @@ class ReconciliationScanError(ReconciliationError):
 
 
 def get_cached_inventory() -> dict[str, Any] | None:
-    return _CACHE
+    with _SCAN_STATE_LOCK:
+        return _CACHE
+
+
+def get_scan_state() -> dict[str, Any]:
+    with _SCAN_STATE_LOCK:
+        return dict(_SCAN_STATE)
+
+
+def _clear_probe_cache() -> None:
+    """Clear probe results; exposed for deterministic tests and diagnostics."""
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE.clear()
+
+
+def _clear_negative_probe_cache() -> int:
+    """Drop invalid results so an explicit rescan retries transient failures."""
+    with _PROBE_CACHE_LOCK:
+        stale = [
+            key for key, result in _PROBE_CACHE.items()
+            if not result.get("valid")
+        ]
+        for key in stale:
+            _PROBE_CACHE.pop(key, None)
+        return len(stale)
 
 
 def _entry_key(path: Path) -> str:
@@ -190,6 +246,7 @@ def _walk_real_source_files() -> list[dict[str, Any]]:
                 "video_id": extract_id_from_filename(path.name),
                 "size_bytes": file_stat.st_size,
                 "mtime_ns": file_stat.st_mtime_ns,
+                "ctime_ns": file_stat.st_ctime_ns,
                 "device": file_stat.st_dev,
                 "inode": file_stat.st_ino,
                 "kind": "source_file",
@@ -243,6 +300,7 @@ def _walk_managed_entries() -> list[dict[str, Any]]:
                     "inode": entry_stat.st_ino,
                     "device": entry_stat.st_dev,
                     "mtime_ns": entry_stat.st_mtime_ns,
+                    "ctime_ns": entry_stat.st_ctime_ns,
                 })
     return sorted(entries, key=lambda item: item["path"])
 
@@ -389,6 +447,56 @@ def probe_media(path: Path, *, allowed_roots: Iterable[Path] | None = None) -> d
             pass
 
 
+def _structural_media_check(
+    path: Path,
+    expected_video_id: str | None,
+) -> dict[str, Any]:
+    """Cheaply validate an already-resolving link target without ffprobe.
+
+    Full stream inspection is reserved for files involved in reconciliation
+    decisions. A healthy link means its target is a confined, nonempty regular
+    media entry with the exact tracked ID; it does not promise codec validity.
+    """
+    result: dict[str, Any] = {
+        "valid": False,
+        "valid_media": False,
+        "error": None,
+        "duration": None,
+        "streams": [],
+        "has_video": False,
+        "has_audio": False,
+        "inspection": "structural",
+    }
+    if _DEMUXERS.get(path.suffix.lower()) is None:
+        result["error"] = "Symlink target has an unsupported media container"
+        return result
+    if not _lexically_under(path, MEDIA_ROOTS):
+        result["error"] = "Symlink target is outside allowed media directories"
+        return result
+    try:
+        entry_stat = os.lstat(path)
+        if not stat.S_ISREG(entry_stat.st_mode):
+            result["error"] = "Symlink target is not a real regular file"
+            return result
+        canonical = path.resolve(strict=True)
+        if not path_within(canonical, MEDIA_ROOTS):
+            result["error"] = "Symlink target escaped allowed media directories"
+            return result
+    except OSError as exc:
+        result["error"] = f"Symlink target is not accessible: {exc}"
+        return result
+    result["size_bytes"] = entry_stat.st_size
+    if entry_stat.st_size <= 0:
+        result["error"] = "Symlink target is empty"
+        return result
+    actual_video_id = extract_id_from_filename(path.name)
+    if expected_video_id and actual_video_id != expected_video_id:
+        result["error"] = "Symlink target does not contain the exact tracked video ID"
+        return result
+    result["valid"] = result["valid_media"] = True
+    return result
+
+
 def _preview_fields(path: str) -> dict[str, str]:
     query = urlencode({"filepath": path})
     return {
@@ -429,6 +537,7 @@ def _normalise_recovery_files(results: dict[str, Any]) -> list[dict[str, Any]]:
                 ),
                 "size_bytes": file_stat.st_size,
                 "mtime_ns": file_stat.st_mtime_ns,
+                "ctime_ns": file_stat.st_ctime_ns,
                 "device": file_stat.st_dev,
                 "inode": file_stat.st_ino,
                 "bucket": bucket,
@@ -439,22 +548,220 @@ def _normalise_recovery_files(results: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(unique.values(), key=lambda item: item["path"])
 
 
+def _probe_ancestor_identity(
+    path: Path,
+    roots: Iterable[Path],
+) -> tuple[Any, ...]:
+    """Fingerprint the configured root and lexical directory ancestors."""
+    absolute = Path(os.path.abspath(path))
+    for configured in roots:
+        root = Path(os.path.abspath(configured))
+        try:
+            relative = absolute.relative_to(root)
+        except ValueError:
+            continue
+        ancestors = [root]
+        cursor = root
+        for component in relative.parts[:-1]:
+            cursor /= component
+            ancestors.append(cursor)
+        identity: list[tuple[Any, ...]] = []
+        for ancestor in ancestors:
+            try:
+                ancestor_stat = os.lstat(ancestor)
+                identity.append((
+                    str(ancestor),
+                    ancestor_stat.st_dev,
+                    ancestor_stat.st_ino,
+                    ancestor_stat.st_mode,
+                ))
+            except OSError:
+                identity.append((str(ancestor), "missing"))
+        return (str(root), tuple(identity))
+    return ("outside", str(absolute.parent))
+
+
+def _probe_cache_key(path: Path, roots: Iterable[Path]) -> tuple[Any, ...]:
+    roots = tuple(roots)
+    absolute = Path(os.path.abspath(path))
+    root_key = tuple(str(Path(os.path.abspath(root))) for root in roots)
+    demuxer = _DEMUXERS.get(path.suffix.lower())
+    ancestor_identity = _probe_ancestor_identity(absolute, roots)
+    try:
+        file_stat = os.lstat(absolute)
+        canonical = absolute.resolve(strict=True)
+        return (
+            _PROBE_CACHE_SCHEMA,
+            str(absolute),
+            str(canonical),
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+            file_stat.st_ctime_ns,
+            ancestor_identity,
+            root_key,
+            demuxer,
+        )
+    except (OSError, RuntimeError):
+        return (
+            _PROBE_CACHE_SCHEMA,
+            str(absolute),
+            "missing-or-unresolved",
+            ancestor_identity,
+            root_key,
+            demuxer,
+        )
+
+
+def _probe_cache_path_is_safe(path: Path, roots: Iterable[Path]) -> bool:
+    """Re-authorize type and confinement before using any cached probe."""
+    roots = tuple(roots)
+    if _DEMUXERS.get(path.suffix.lower()) is None or not _lexically_under(path, roots):
+        return False
+    try:
+        entry_stat = os.lstat(path)
+        if not stat.S_ISREG(entry_stat.st_mode):
+            return False
+        canonical = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    return path_within(canonical, roots)
+
+
+def _probe_cache_get(key: tuple[Any, ...]) -> dict[str, Any] | None:
+    with _PROBE_CACHE_LOCK:
+        cached = _PROBE_CACHE.get(key)
+        if cached is None:
+            return None
+        _PROBE_CACHE.move_to_end(key)
+        return copy.deepcopy(cached)
+
+
+def _probe_cache_lookup(
+    path: Path,
+    roots: tuple[Path, ...],
+    key: tuple[Any, ...],
+) -> dict[str, Any] | None:
+    cached = _probe_cache_get(key)
+    if cached is None:
+        return None
+    if not _probe_cache_path_is_safe(path, roots):
+        return None
+    if _probe_cache_key(path, roots) != key:
+        return None
+    return cached
+
+
+def _probe_cache_put(key: tuple[Any, ...], result: dict[str, Any]) -> None:
+    with _PROBE_CACHE_LOCK:
+        _PROBE_CACHE[key] = copy.deepcopy(result)
+        _PROBE_CACHE.move_to_end(key)
+        while len(_PROBE_CACHE) > _PROBE_CACHE_MAX:
+            _PROBE_CACHE.popitem(last=False)
+
+
 def _probe_cached(
     path: Path,
     roots: Iterable[Path],
     cache: dict[tuple[Any, ...], dict[str, Any]],
 ) -> dict[str, Any]:
-    try:
-        file_stat = os.lstat(path)
-        fingerprint = (
-            str(path), file_stat.st_dev, file_stat.st_ino, file_stat.st_size,
-            file_stat.st_mtime_ns, tuple(str(root) for root in roots),
-        )
-    except OSError:
-        fingerprint = (str(path), "missing", tuple(str(root) for root in roots))
-    if fingerprint not in cache:
-        cache[fingerprint] = probe_media(path, allowed_roots=roots)
-    return cache[fingerprint]
+    roots = tuple(roots)
+    key = _probe_cache_key(path, roots)
+    if key in cache:
+        if _probe_cache_path_is_safe(path, roots) and _probe_cache_key(path, roots) == key:
+            return copy.deepcopy(cache[key])
+        cache.pop(key, None)
+    result = _probe_cache_lookup(path, roots, key)
+    if result is None:
+        result = probe_media(path, allowed_roots=roots)
+        _probe_cache_put(key, result)
+    cache[key] = copy.deepcopy(result)
+    return result
+
+
+def _unexpected_probe_failure(exc: Exception) -> dict[str, Any]:
+    return {
+        "valid": False,
+        "valid_media": False,
+        "error": f"Media inspection failed unexpectedly: {exc}",
+        "duration": None,
+        "streams": [],
+        "has_video": False,
+        "has_audio": False,
+    }
+
+
+def _prewarm_probes(
+    requests: Iterable[tuple[Path, tuple[Path, ...]]],
+    cache: dict[tuple[Any, ...], dict[str, Any]],
+    progress: Callable[[str, int, int, str], None] | None = None,
+) -> dict[str, int]:
+    """Populate probe results with a fixed-size rolling executor window."""
+    unique: dict[tuple[Any, ...], tuple[Path, tuple[Path, ...]]] = {}
+    for path, roots in requests:
+        key = _probe_cache_key(path, roots)
+        unique.setdefault(key, (path, roots))
+
+    total = len(unique)
+    completed = 0
+    hits = 0
+    misses: list[tuple[tuple[Any, ...], Path, tuple[Path, ...]]] = []
+    for key, (path, roots) in unique.items():
+        result = _probe_cache_lookup(path, roots, key)
+        if result is None:
+            misses.append((key, path, roots))
+            continue
+        cache[key] = result
+        hits += 1
+        completed += 1
+    if progress:
+        progress("probing", completed, total, f"Validating reconciliation media ({completed}/{total})")
+
+    if misses:
+        worker_count = min(_PROBE_WORKERS, len(misses))
+        iterator = iter(misses)
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="reconciliation-probe",
+        ) as executor:
+            pending: dict[Any, tuple[tuple[Any, ...], Path, tuple[Path, ...]]] = {}
+
+            def submit_next() -> bool:
+                try:
+                    key, path, roots = next(iterator)
+                except StopIteration:
+                    return False
+                pending[executor.submit(probe_media, path, allowed_roots=roots)] = (
+                    key,
+                    path,
+                    roots,
+                )
+                return True
+
+            for _ in range(worker_count):
+                submit_next()
+            while pending:
+                done, _not_done = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                for future in done:
+                    key, _path, _roots = pending.pop(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # noqa: BLE001 - worker result is data
+                        result = _unexpected_probe_failure(exc)
+                    _probe_cache_put(key, result)
+                    cache[key] = copy.deepcopy(result)
+                    completed += 1
+                    if progress:
+                        progress(
+                            "probing",
+                            completed,
+                            total,
+                            f"Validating reconciliation media ({completed}/{total})",
+                        )
+                    submit_next()
+
+    return {"requested": total, "hits": hits, "misses": len(misses)}
 
 
 def _candidate(
@@ -524,6 +831,48 @@ def _db_record(row: Any) -> dict[str, Any]:
     }
 
 
+def _probe_requests_for_inventory(
+    database_entries: list[dict[str, Any]],
+    fs_entries: list[dict[str, Any]],
+    fs_by_key: dict[str, dict[str, Any]],
+    source_by_id: dict[str, list[dict[str, Any]]],
+) -> list[tuple[Path, tuple[Path, ...]]]:
+    """Return only paths whose classification requires full stream probing."""
+    requests: list[tuple[Path, tuple[Path, ...]]] = []
+    represented_keys: set[str] = set()
+
+    def add_candidates(video_id: str | None) -> None:
+        if not video_id:
+            return
+        for item in source_by_id.get(video_id, []):
+            path = Path(item["path"])
+            roots = (SOURCE_DIR,) if _lexically_under(path, (SOURCE_DIR,)) else MANAGED_ROOTS
+            requests.append((path, tuple(roots)))
+
+    for row in database_entries:
+        raw_link = row.get("symlink")
+        key = _entry_key(Path(raw_link)) if isinstance(raw_link, str) else ""
+        fs_entry = fs_by_key.get(key)
+        if key:
+            represented_keys.add(key)
+        if fs_entry and fs_entry["is_real_file"]:
+            requests.append((Path(fs_entry["path"]), tuple(MANAGED_ROOTS)))
+        elif not (fs_entry and fs_entry["is_symlink"] and fs_entry["target_exists"]):
+            add_candidates(row.get("video_id"))
+
+    for fs_entry in fs_entries:
+        if fs_entry["entry_key"] in represented_keys:
+            continue
+        if fs_entry["is_real_file"]:
+            requests.append((Path(fs_entry["path"]), tuple(MANAGED_ROOTS)))
+            continue
+        orphan_id, _sources = _derive_orphan_id(fs_entry)
+        if not (fs_entry["is_symlink"] and fs_entry["target_exists"]):
+            add_candidates(orphan_id)
+
+    return sorted(requests, key=lambda item: (str(item[0]), tuple(map(str, item[1]))))
+
+
 def _classify_entry(
     db_record: dict[str, Any] | None,
     fs_entry: dict[str, Any] | None,
@@ -580,14 +929,16 @@ def _classify_entry(
             detail = "A regular media file occupies the database-owned link path."
     elif fs_entry and fs_entry["is_symlink"] and fs_entry["target_exists"]:
         translated = Path(fs_entry["translated_target"])
-        current_probe = _probe_cached(translated, MEDIA_ROOTS, probe_cache)
-        target_id = extract_id_from_filename(translated.name)
-        if video_id and target_id and target_id != video_id:
-            status, detail = "invalid_media", "The symlink target has a different video ID than the tracked record."
-        elif current_probe["valid"]:
-            status, detail = "healthy", "The managed symlink resolves to valid media."
+        current_probe = _structural_media_check(translated, video_id)
+        if current_probe["valid"]:
+            status = "healthy"
+            detail = (
+                "The managed symlink resolves to a confined, nonempty regular "
+                "file with the exact video ID. Stream validation is performed "
+                "for reconciliation candidates."
+            )
         else:
-            status, detail = "invalid_media", current_probe["error"] or "The symlink target is invalid media."
+            status, detail = "invalid_media", current_probe["error"] or "The symlink target is structurally invalid."
     else:
         candidates = [
             _candidate(item, video_id, bucket_map, probe_cache)
@@ -684,9 +1035,15 @@ def _inventory_token(payload: dict[str, Any]) -> str:
 
 def _build_inventory_unlocked(
     recovery_provider: Callable[[], dict[str, Any]] | None = None,
+    *,
+    progress: Callable[[str, int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     global _CACHE
+    scan_started = time.perf_counter()
     recovery_provider = recovery_provider or scan_for_unindexed_videos
+    if progress:
+        progress("advanced_recovery", 0, 0, "Building the Advanced Recovery inventory")
+    phase_started = time.perf_counter()
     try:
         recovery_results = recovery_provider()
     except Exception as exc:  # noqa: BLE001 - incomplete scans must fail closed
@@ -695,7 +1052,12 @@ def _build_inventory_unlocked(
         ) from exc
     if not isinstance(recovery_results, dict):
         raise ReconciliationScanError("Advanced Recovery returned an invalid inventory", 503)
+    recovery_seconds = time.perf_counter() - phase_started
+    log(f"⏱️ [RECONCILIATION] Advanced Recovery inventory: {recovery_seconds:.2f}s")
 
+    if progress:
+        progress("discovery", 0, 0, "Reading database and filesystem inventory")
+    phase_started = time.perf_counter()
     with get_db() as conn:
         rows = conn.execute(
             """
@@ -736,6 +1098,13 @@ def _build_inventory_unlocked(
         ):
             source_by_id.setdefault(item["video_id"], []).append(item)
             known_candidate_paths.add(item["path"])
+    discovery_seconds = time.perf_counter() - phase_started
+    log(
+        "⏱️ [RECONCILIATION] Discovery: "
+        f"{discovery_seconds:.2f}s; db={len(database_entries)}, "
+        f"managed={len(fs_entries)}, source={len(source_files)}, "
+        f"recovery={len(recovery_files)}"
+    )
 
     path_owners: dict[str, int] = {}
     for row in database_entries:
@@ -743,8 +1112,36 @@ def _build_inventory_unlocked(
             key = _entry_key(Path(row["symlink"]))
             path_owners[key] = path_owners.get(key, 0) + 1
 
-    entries: list[dict[str, Any]] = []
     probe_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+    probe_requests = _probe_requests_for_inventory(
+        database_entries,
+        fs_entries,
+        fs_by_key,
+        source_by_id,
+    )
+    phase_started = time.perf_counter()
+    probe_stats = _prewarm_probes(probe_requests, probe_cache, progress)
+    probe_seconds = time.perf_counter() - phase_started
+    log(
+        "⏱️ [RECONCILIATION] Media validation: "
+        f"{probe_seconds:.2f}s; requested={probe_stats['requested']}, "
+        f"cache_hits={probe_stats['hits']}, probes={probe_stats['misses']}, "
+        f"workers={min(_PROBE_WORKERS, probe_stats['misses'])}"
+    )
+
+    represented_db_keys = {
+        _entry_key(Path(row["symlink"]))
+        for row in database_entries
+        if isinstance(row.get("symlink"), str)
+    }
+    classification_total = len(database_entries) + sum(
+        1 for item in fs_entries if item["entry_key"] not in represented_db_keys
+    )
+    classified = 0
+    if progress:
+        progress("classifying", 0, classification_total, "Classifying link state")
+    phase_started = time.perf_counter()
+    entries: list[dict[str, Any]] = []
     represented_keys: set[str] = set()
     for row in database_entries:
         raw_link = row.get("symlink")
@@ -755,10 +1152,16 @@ def _build_inventory_unlocked(
         entries.append(_classify_entry(
             row, fs_entry, source_by_id, bucket_map, path_owners.get(key, 0), probe_cache
         ))
+        classified += 1
+        if progress:
+            progress("classifying", classified, classification_total, "Classifying link state")
     for fs_entry in fs_entries:
         if fs_entry["entry_key"] in represented_keys:
             continue
         entries.append(_classify_entry(None, fs_entry, source_by_id, bucket_map, 0, probe_cache))
+        classified += 1
+        if progress:
+            progress("classifying", classified, classification_total, "Classifying link state")
 
     entries.sort(key=lambda item: ((item.get("status") or ""), (item.get("video_id") or ""), (item.get("link_path") or "")))
     summary = {status: 0 for status in _STATUS_LABELS}
@@ -783,15 +1186,196 @@ def _build_inventory_unlocked(
         "lost": [item for item in recovery_files if item["bucket"] == "lost"],
     }
     payload["scan_token"] = _inventory_token(payload)
-    _CACHE = payload
+    classify_seconds = time.perf_counter() - phase_started
+    total_seconds = time.perf_counter() - scan_started
+    log(
+        "⏱️ [RECONCILIATION] Classification/token: "
+        f"{classify_seconds:.2f}s; total={total_seconds:.2f}s; entries={len(entries)}"
+    )
+    with _SCAN_STATE_LOCK:
+        _CACHE = payload
     return payload
 
 
 def build_inventory(
     recovery_provider: Callable[[], dict[str, Any]] | None = None,
+    *,
+    progress: Callable[[str, int, int, str], None] | None = None,
 ) -> dict[str, Any]:
     with LIBRARY_MUTATION_LOCK:
-        return _build_inventory_unlocked(recovery_provider)
+        return _build_inventory_unlocked(recovery_provider, progress=progress)
+
+
+def _scan_progress(job_id: str, phase: str, current: int, total: int, detail: str) -> None:
+    with _SCAN_STATE_LOCK:
+        if _SCAN_STATE.get("job_id") != job_id or _SCAN_STATE.get("status") != "scanning":
+            return
+        _SCAN_STATE.update({
+            "phase": phase,
+            "current": current,
+            "total": total,
+            "detail": detail,
+        })
+
+
+def _run_background_scan(job_id: str, builder: Callable[..., dict[str, Any]]) -> None:
+    global _CACHE
+    try:
+        inventory = builder(
+            progress=lambda phase, current, total, detail: _scan_progress(
+                job_id, phase, current, total, detail
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - failure is exposed through scan state
+        message = str(exc) or exc.__class__.__name__
+        log(f"❌ [RECONCILIATION] Background scan failed: {message}")
+        with _SCAN_STATE_LOCK:
+            if _SCAN_STATE.get("job_id") == job_id:
+                _SCAN_STATE.update({
+                    "status": "error",
+                    "phase": "error",
+                    "detail": "Reconciliation scan failed.",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error": message,
+                })
+        return
+
+    with _SCAN_STATE_LOCK:
+        if _SCAN_STATE.get("job_id") != job_id:
+            return
+        _CACHE = inventory
+        _SCAN_STATE.update({
+            "status": "complete",
+            "phase": "complete",
+            "current": len(inventory.get("entries") or []),
+            "total": len(inventory.get("entries") or []),
+            "detail": "Reconciliation inventory is ready.",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "error": None,
+        })
+
+
+def _scan_wrapper(
+    state: dict[str, Any],
+    cache: dict[str, Any] | None,
+    *,
+    include_cache: bool,
+) -> dict[str, Any]:
+    payload = {
+        "status": "scanning",
+        "scan_complete": False,
+        "scan": state,
+        "stale": cache is not None,
+    }
+    if include_cache:
+        payload["inventory"] = cache
+    return payload
+
+
+def _scan_error_wrapper(
+    state: dict[str, Any],
+    cache: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "scan_complete": False,
+        "error": state.get("error") or "Reconciliation scan failed",
+        "scan": state,
+        "inventory": cache,
+        "stale": cache is not None,
+    }
+
+
+def request_inventory(
+    *,
+    force: bool,
+    include_cache: bool = True,
+    builder: Callable[..., dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], int]:
+    """Return cached inventory or start/poll one single-flight background scan."""
+    global _SCAN_THREAD
+    builder = builder or build_inventory
+    with _SCAN_STATE_LOCK:
+        state = dict(_SCAN_STATE)
+        cache = _CACHE
+        if state["status"] == "scanning":
+            return _scan_wrapper(state, cache, include_cache=include_cache), 202
+
+        if not force and cache is not None and state["status"] != "error":
+            response = dict(cache)
+            response["scan"] = state
+            response["stale"] = False
+            return response, 200
+
+        if not force and state["status"] == "error":
+            return _scan_error_wrapper(state, cache), 503
+
+        if force:
+            cleared = _clear_negative_probe_cache()
+            if cleared:
+                log(
+                    "🔄 [RECONCILIATION] Forced rescan will retry "
+                    f"{cleared} cached invalid media result(s)"
+                )
+
+        job_id = secrets.token_hex(12)
+        started_at = datetime.now(timezone.utc).isoformat()
+        _SCAN_STATE.update({
+            "job_id": job_id,
+            "status": "scanning",
+            "phase": "queued",
+            "current": 0,
+            "total": 0,
+            "detail": "Reconciliation scan is queued.",
+            "started_at": started_at,
+            "completed_at": None,
+            "error": None,
+        })
+        state = dict(_SCAN_STATE)
+        try:
+            _SCAN_THREAD = threading.Thread(
+                target=_run_background_scan,
+                args=(job_id, builder),
+                daemon=True,
+                name=f"reconciliation-scan-{job_id[:8]}",
+            )
+            _SCAN_THREAD.start()
+        except Exception as exc:  # noqa: BLE001 - expose startup failure as state
+            message = f"Could not start reconciliation scan: {exc}"
+            _SCAN_THREAD = None
+            _SCAN_STATE.update({
+                "status": "error",
+                "phase": "error",
+                "detail": "Reconciliation scan could not start.",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": message,
+            })
+            state = dict(_SCAN_STATE)
+            log(f"❌ [RECONCILIATION] {message}")
+            return _scan_error_wrapper(state, cache), 503
+        return _scan_wrapper(state, cache, include_cache=include_cache), 202
+
+
+def _reset_scan_runtime_for_tests(*, clear_inventory: bool = True) -> None:
+    """Reset completed scan state; a live background scan may not be discarded."""
+    global _CACHE, _SCAN_THREAD
+    with _SCAN_STATE_LOCK:
+        if _SCAN_THREAD is not None and _SCAN_THREAD.is_alive():
+            raise RuntimeError("Cannot reset reconciliation state during an active scan")
+        if clear_inventory:
+            _CACHE = None
+        _SCAN_THREAD = None
+        _SCAN_STATE.update({
+            "job_id": None,
+            "status": "idle",
+            "phase": "idle",
+            "current": 0,
+            "total": 0,
+            "detail": "No reconciliation scan has run yet.",
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+        })
 
 
 def _require_selector(data: dict[str, Any]) -> tuple[str, str, str]:
@@ -951,6 +1535,8 @@ def _restore_quarantine(quarantine: Path | None, destination: Path) -> None:
 
 
 def _finish_action(message: str) -> dict[str, Any]:
+    global _CACHE
+    refresh_started_at = datetime.now(timezone.utc).isoformat()
     try:
         inventory = _build_inventory_unlocked()
         return {
@@ -959,15 +1545,33 @@ def _finish_action(message: str) -> dict[str, Any]:
             "message": message,
             "inventory": inventory,
         }
-    except ReconciliationScanError as exc:
+    except Exception as exc:  # noqa: BLE001 - mutation has already committed
         # The mutation is already committed and was logged by the caller.
-        # Never misreport it as unapplied merely because the external
-        # Advanced Recovery inventory could not be refreshed afterward.
+        # Any cached pre-mutation snapshot is now unsafe to serve as fresh.
+        raw_error = str(exc) or exc.__class__.__name__
+        state_error = (
+            "Action succeeded, but the follow-up reconciliation refresh "
+            f"failed: {raw_error}"
+        )
+        with _SCAN_STATE_LOCK:
+            _CACHE = None
+            _SCAN_STATE.update({
+                "job_id": secrets.token_hex(12),
+                "status": "error",
+                "phase": "error",
+                "current": 0,
+                "total": 0,
+                "detail": "Action applied; follow-up inventory refresh failed.",
+                "started_at": refresh_started_at,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": state_error,
+            })
+        log(f"❌ [RECONCILIATION] {state_error}")
         return {
             "success": True,
             "action_applied": True,
             "message": message,
-            "rescan_error": str(exc),
+            "rescan_error": raw_error,
             "inventory": None,
         }
 

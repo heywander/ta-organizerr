@@ -79,6 +79,8 @@ SESSION_COOKIE_SECURE=false
 # Optional safety/resource caps.
 MAX_METADATA_PAGES=10000
 MAX_CONCURRENT_TRANSCODES=1
+RECONCILIATION_PROBE_WORKERS=2
+RECONCILIATION_PROBE_CACHE_MAX=4096
 ```
 
 Compose reads these values from `.env`; values in the shell can override them.
@@ -183,7 +185,13 @@ migration.
   missing entries. Repair is limited to one case-sensitive exact video-ID match;
   similar titles and filenames are never used for automatic repair. Candidates
   are checked as non-empty regular media files with `ffprobe` and can be watched
-  or heard before a decision.
+  or heard before a decision. Inventory scans run as one background job and the
+  page reports its current phase instead of holding one request open. Resolving
+  links receive a confined, non-empty, exact-ID structural check; full stream
+  probing is reserved for files that can affect recovery or adoption. Candidate
+  probes use a bounded worker pool and a fingerprint cache. The defaults are two
+  workers and 4,096 cached fingerprints; keep the worker count low on network
+  storage.
 - Transcoding replaces the resolved source media file in place after FFmpeg
   completes successfully. It is limited to MP4, Matroska (`.mkv`), and MOV
   containers. It maps every input stream, copies metadata/chapters and

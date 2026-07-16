@@ -41,13 +41,18 @@ def _run(operation, *, action: str | None = None):
 @bp.route("/inventory", methods=["GET"])
 @requires_auth
 def api_reconciliation_inventory():
-    return _run(reconciliation.build_inventory)
+    payload, status = reconciliation.request_inventory(
+        force=False,
+        include_cache=request.args.get("poll") != "1",
+    )
+    return jsonify(payload), status
 
 
 @bp.route("/rescan", methods=["POST"])
 @requires_auth
 def api_reconciliation_rescan():
-    return _run(reconciliation.build_inventory)
+    payload, status = reconciliation.request_inventory(force=True)
+    return jsonify(payload), status
 
 
 @bp.route("/repair-link", methods=["POST"])

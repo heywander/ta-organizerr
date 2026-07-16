@@ -34,6 +34,16 @@
         entries?: ReconciliationEntry[];
     };
 
+    type ScanProgress = {
+        job_id?: string;
+        status?: string;
+        phase?: string;
+        current?: number;
+        total?: number;
+        detail?: string;
+        started_at?: string;
+    };
+
     type StatusDefinition = {
         key: string;
         label: string;
@@ -89,6 +99,12 @@
     let statusFilter = "all";
     let selectedCandidates: Record<string, string> = {};
     let busyEntryKey: string | null = null;
+    let scanProgress: ScanProgress = {};
+    let scanElapsedSeconds = 0;
+    let inventoryPollTimer: ReturnType<typeof setTimeout> | null = null;
+    let scanElapsedTimer: ReturnType<typeof setInterval> | null = null;
+    let pendingRescanMessage = false;
+    let inventoryAbortController: AbortController | null = null;
 
     let previewTarget: Candidate | null = null;
     let previewEntry: ReconciliationEntry | null = null;
@@ -309,31 +325,175 @@
         selectedCandidates = next;
     }
 
-    async function loadInventory(preserveMessage = false) {
-        loading = true;
-        loadError = null;
-        actionError = null;
-        if (!preserveMessage) successMessage = null;
-        try {
-            const response = await fetch("/api/reconciliation/inventory", {
-                headers: { Accept: "application/json" },
-            });
-            const data = (await readResponse(response)) as InventoryResponse;
+    function clearInventoryPoll() {
+        if (inventoryPollTimer !== null) {
+            clearTimeout(inventoryPollTimer);
+            inventoryPollTimer = null;
+        }
+    }
+
+    function startElapsedClock() {
+        if (scanElapsedTimer !== null) return;
+        scanElapsedSeconds = 0;
+        scanElapsedTimer = setInterval(() => {
+            scanElapsedSeconds += 1;
+        }, 1000);
+    }
+
+    function stopElapsedClock() {
+        if (scanElapsedTimer !== null) {
+            clearInterval(scanElapsedTimer);
+            scanElapsedTimer = null;
+        }
+    }
+
+    function formatElapsed(seconds: number): string {
+        if (seconds < 60) return `${seconds}s`;
+        const minutes = Math.floor(seconds / 60);
+        return `${minutes}m ${seconds % 60}s`;
+    }
+
+    function phaseLabel(phase = scanProgress.phase || scanProgress.status): string {
+        const key = normalize(phase);
+        const labels: Record<string, string> = {
+            queued: "Scan queued",
+            waiting: "Waiting for library access",
+            waiting_for_library: "Waiting for library access",
+            advanced_recovery: "Comparing TubeArchivist metadata",
+            metadata: "Comparing TubeArchivist metadata",
+            discovery: "Walking archive paths",
+            walking: "Walking archive paths",
+            probing: "Validating recovery candidates",
+            classifying: "Classifying link state",
+            finalizing: "Finalizing inventory",
+            running: "Building link inventory",
+            scanning: "Building link inventory",
+        };
+        return labels[key] || "Building link inventory";
+    }
+
+    function updateScanProgress(data: any) {
+        const raw = data?.scan || data?.job || data?.progress || data || {};
+        scanProgress = {
+            job_id: raw.job_id || raw.id,
+            status: raw.status || data?.status || "scanning",
+            phase: raw.phase || data?.phase || raw.status || data?.status,
+            current:
+                raw.current ?? raw.completed ?? data?.current ?? data?.completed,
+            total: raw.total ?? data?.total,
+            detail: raw.detail || raw.message || data?.detail,
+            started_at: raw.started_at || data?.started_at,
+        };
+    }
+
+    function responseIsScanning(response: Response, data: any): boolean {
+        const state = normalize(
+            data?.scan?.status ||
+                data?.job?.status ||
+                data?.status,
+        );
+        if (!response.ok || state === "error" || state === "complete") return false;
+        if (response.status === 202 || data?.scan_complete === false) return true;
+        return ["queued", "waiting", "running", "scanning", "in_progress"].includes(
+            state,
+        );
+    }
+
+    function scheduleInventoryPoll() {
+        clearInventoryPoll();
+        const delay = scanElapsedSeconds < 30 ? 1000 : 2000;
+        inventoryPollTimer = setTimeout(() => {
+            inventoryPollTimer = null;
+            void loadInventory(true, true);
+        }, delay);
+    }
+
+    function acceptScanEnvelope(response: Response, data: any): boolean {
+        if (!responseIsScanning(response, data)) return false;
+        if (Array.isArray(data?.inventory?.entries)) {
             applyInventory(data);
+        }
+        // A displayed cached inventory is intentionally read-only until the
+        // new filesystem snapshot completes.
+        scanToken = "";
+        updateScanProgress(data);
+        inventoryStatus = phaseLabel();
+        scheduleInventoryPoll();
+        return true;
+    }
+
+    async function loadInventory(preserveMessage = false, isPoll = false) {
+        if (!isPoll) clearInventoryPoll();
+        loading = true;
+        startElapsedClock();
+        if (!isPoll) {
+            loadError = null;
+            actionError = null;
+            if (!preserveMessage) successMessage = null;
+        }
+        let stillScanning = false;
+        const controller = new AbortController();
+        inventoryAbortController = controller;
+        try {
+            const endpoint = isPoll
+                ? "/api/reconciliation/inventory?poll=1"
+                : "/api/reconciliation/inventory";
+            const response = await fetch(endpoint, {
+                headers: { Accept: "application/json" },
+                signal: controller.signal,
+            });
+            const data = await response.json().catch(() => ({}));
+            stillScanning = acceptScanEnvelope(response, data);
+            if (stillScanning) return;
+            if (!response.ok) {
+                if (Array.isArray(data?.inventory?.entries)) applyInventory(data);
+                scanToken = "";
+                throw new Error(
+                    data.error ||
+                        data.message ||
+                        `Request failed with status ${response.status}`,
+                );
+            }
+            applyInventory(data as InventoryResponse);
+            scanProgress = {};
+            loadError = null;
+            if (pendingRescanMessage) {
+                successMessage = "The filesystem inventory was rebuilt from current paths.";
+                pendingRescanMessage = false;
+            }
         } catch (error) {
+            if ((error as Error)?.name === "AbortError") return;
             loadError = messageFrom(error);
-            entries = [];
+            if (entries.length === 0) entries = [];
             inventoryStatus = "error";
+            pendingRescanMessage = false;
         } finally {
-            loading = false;
+            if (inventoryAbortController === controller) {
+                inventoryAbortController = null;
+            }
+            if (!stillScanning) {
+                loading = false;
+                stopElapsedClock();
+            }
         }
     }
 
     async function rescanInventory() {
+        clearInventoryPoll();
+        const previousScanToken = scanToken;
+        const previousScanTokenField = scanTokenField;
+        // The moment a refresh is requested, the displayed snapshot is stale
+        // and must stay read-only even if the background job cannot start.
+        scanToken = "";
         loading = true;
+        startElapsedClock();
         loadError = null;
         actionError = null;
         successMessage = null;
+        pendingRescanMessage = true;
+        let stillScanning = false;
+        const controller = new AbortController();
+        inventoryAbortController = controller;
         try {
             const response = await fetch("/api/reconciliation/rescan", {
                 method: "POST",
@@ -342,16 +502,38 @@
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify(
-                    scanToken ? { [scanTokenField]: scanToken } : {},
+                    previousScanToken
+                        ? { [previousScanTokenField]: previousScanToken }
+                        : {},
                 ),
+                signal: controller.signal,
             });
-            const data = await readResponse(response);
+            const data = await response.json().catch(() => ({}));
+            stillScanning = acceptScanEnvelope(response, data);
+            if (stillScanning) return;
+            if (!response.ok) {
+                throw new Error(
+                    data.error ||
+                        data.message ||
+                        `Request failed with status ${response.status}`,
+                );
+            }
             applyInventory(data);
+            scanProgress = {};
+            pendingRescanMessage = false;
             successMessage = "The filesystem inventory was rebuilt from current paths.";
         } catch (error) {
+            if ((error as Error)?.name === "AbortError") return;
             loadError = messageFrom(error);
+            pendingRescanMessage = false;
         } finally {
-            loading = false;
+            if (inventoryAbortController === controller) {
+                inventoryAbortController = null;
+            }
+            if (!stillScanning) {
+                loading = false;
+                stopElapsedClock();
+            }
         }
     }
 
@@ -701,6 +883,10 @@
     });
 
     onDestroy(() => {
+        clearInventoryPoll();
+        stopElapsedClock();
+        inventoryAbortController?.abort();
+        inventoryAbortController = null;
         stopPreviewRequest();
         unloadPreview();
         if (previewTarget) document.body.style.overflow = previousBodyOverflow;
@@ -762,8 +948,10 @@
         </div>
         <div class="heading-actions">
             <span class="page-heading__status">
-                <i class="bi bi-clock-history" aria-hidden="true"></i>
-                {formatGeneratedAt(generatedAt)}
+                <i class:spin={loading} class="bi {loading ? "bi-arrow-clockwise" : "bi-clock-history"}" aria-hidden="true"></i>
+                {loading
+                    ? `${phaseLabel()} · ${formatElapsed(scanElapsedSeconds)}`
+                    : formatGeneratedAt(generatedAt)}
             </span>
             <button class="button" on:click={rescanInventory} disabled={loading || busyEntryKey !== null}>
                 <i class:spin={loading} class="bi bi-arrow-clockwise" aria-hidden="true"></i>
@@ -782,8 +970,11 @@
 
     {#if loadError}
         <div class="notice notice--error status-message" role="alert">
-            <span><strong>Inventory unavailable.</strong> {loadError}</span>
-            <button class="button" on:click={() => loadInventory()}>Try again</button>
+            <span>
+                <strong>Inventory unavailable.</strong> {loadError}
+                {#if entries.length > 0} The previous snapshot is read-only until a scan succeeds.{/if}
+            </span>
+            <button class="button" on:click={rescanInventory}>Try again</button>
         </div>
     {/if}
 
@@ -802,6 +993,16 @@
             <button class="button-quiet" on:click={() => (successMessage = null)} aria-label="Dismiss success message">
                 <i class="bi bi-x-lg" aria-hidden="true"></i>
             </button>
+        </div>
+    {/if}
+
+    {#if loading && entries.length > 0}
+        <div class="notice scan-message status-message" role="status" aria-live="polite">
+            <span>
+                <strong>{phaseLabel()}.</strong>
+                {scanProgress.detail || "The last completed inventory is shown read-only while the refresh runs."}
+            </span>
+            <span class="scan-message__elapsed">{formatElapsed(scanElapsedSeconds)}</span>
         </div>
     {/if}
 
@@ -863,8 +1064,20 @@
         {#if loading && entries.length === 0}
             <div class="loading-state" role="status">
                 <i class="bi bi-arrow-clockwise spin" aria-hidden="true"></i>
-                <strong>Building link inventory…</strong>
-                <span>Checking records, links, source media, and unindexed files.</span>
+                <strong>{phaseLabel()}…</strong>
+                <span>
+                    {scanProgress.detail || "Checking records, links, source media, and exact-ID recovery candidates."}
+                    · {formatElapsed(scanElapsedSeconds)} elapsed
+                </span>
+                {#if Number(scanProgress.total || 0) > 0}
+                    <div class="scan-progress" aria-label="Scan progress">
+                        <progress
+                            max={Number(scanProgress.total)}
+                            value={Number(scanProgress.current || 0)}
+                        ></progress>
+                        <small>{Number(scanProgress.current || 0)} of {Number(scanProgress.total)} validated</small>
+                    </div>
+                {/if}
             </div>
         {:else if !loadError && filteredEntries.length === 0}
             <div class="empty-state">
@@ -883,7 +1096,7 @@
                     {@const candidates = entry.candidates || []}
                     {@const currentCandidate = selectedCandidate(entry)}
                     {@const entryBusy = busyEntryKey === entryKey(entry)}
-                    {@const mutationsBusy = busyEntryKey !== null}
+                    {@const mutationsBusy = busyEntryKey !== null || loading || !scanToken}
                     <article class="entry-card entry-card--{statusDefinition?.tone || "unknown"}">
                         <header class="entry-heading">
                             <div class="entry-title">
@@ -1223,6 +1436,17 @@
 
     .success-message {
         border-color: var(--success);
+    }
+
+    .scan-message {
+        border-color: var(--accent);
+    }
+
+    .scan-message__elapsed {
+        flex: 0 0 auto;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
     }
 
     .inventory-strip {
@@ -1679,6 +1903,27 @@
     .loading-state span,
     .empty-state span {
         font-size: 10px;
+    }
+
+    .scan-progress {
+        display: grid;
+        width: min(340px, 100%);
+        gap: 4px;
+        margin-top: 5px;
+    }
+
+    .scan-progress progress {
+        width: 100%;
+        height: 7px;
+        border: 0;
+        background: var(--page-deep);
+        accent-color: var(--accent);
+    }
+
+    .scan-progress small {
+        color: var(--text-muted);
+        font-size: 9px;
+        font-variant-numeric: tabular-nums;
     }
 
     .preview-overlay {

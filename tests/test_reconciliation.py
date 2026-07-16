@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import os
 import stat
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
 from types import SimpleNamespace
-import subprocess
+from unittest.mock import patch
 
 from ta_organizerr import db, reconciliation, symlinks
 
@@ -38,6 +40,8 @@ def valid_probe(path: Path, **_kwargs):
 
 class LinkReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
+        reconciliation._reset_scan_runtime_for_tests()
+        reconciliation._clear_probe_cache()
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.source = root / "source"
@@ -56,11 +60,21 @@ class LinkReconciliationTests(unittest.TestCase):
         self.stack.enter_context(patch.object(reconciliation, "HOST_SOURCE_BASE", self.host))
         self.stack.enter_context(patch.object(reconciliation, "MANAGED_ROOTS", (self.target, self.hidden)))
         self.stack.enter_context(patch.object(reconciliation, "MEDIA_ROOTS", (self.source, self.target, self.hidden)))
-        self.stack.enter_context(patch.object(reconciliation, "probe_media", side_effect=valid_probe))
-        self.stack.enter_context(patch.object(reconciliation, "scan_for_unindexed_videos", side_effect=self._recovery_inventory))
+        self.probe = self.stack.enter_context(
+            patch.object(reconciliation, "probe_media", side_effect=valid_probe)
+        )
+        self.recovery_scan = self.stack.enter_context(
+            patch.object(
+                reconciliation,
+                "scan_for_unindexed_videos",
+                side_effect=self._recovery_inventory,
+            )
+        )
         db.init_db()
 
     def tearDown(self) -> None:
+        reconciliation._reset_scan_runtime_for_tests()
+        reconciliation._clear_probe_cache()
         self.stack.close()
         self.temp.cleanup()
 
@@ -125,7 +139,7 @@ class LinkReconciliationTests(unittest.TestCase):
         self.assertEqual(entry["stored_target_path"], os.readlink(link))
         self.assertIn(str(media), {item["path"] for item in inventory["source_files"]})
 
-    def test_resolving_link_to_corrupt_media_is_invalid(self) -> None:
+    def test_resolving_link_uses_structural_validation_without_ffprobe(self) -> None:
         media = self.source / "channel" / f"corrupt [{VIDEO_ID}].mp4"
         media.parent.mkdir()
         media.write_bytes(b"random bytes")
@@ -136,8 +150,10 @@ class LinkReconciliationTests(unittest.TestCase):
 
         entry = self._entry(reconciliation.build_inventory(), link_path=link)
 
-        self.assertEqual(entry["status"], "invalid_media")
-        self.assertIn("corrupt", entry["detail"])
+        self.assertEqual(entry["status"], "healthy")
+        self.assertEqual(entry["link"]["current_probe"]["inspection"], "structural")
+        self.assertIn("Stream validation", entry["detail"])
+        self.probe.assert_not_called()
 
     def test_broken_link_with_exact_unindexed_file_is_repairable_not_missing(self) -> None:
         candidate = self.source / f"Recovered [{VIDEO_ID}].mp4"
@@ -153,6 +169,179 @@ class LinkReconciliationTests(unittest.TestCase):
         self.assertEqual(len(entry["candidates"]), 1)
         self.assertTrue(entry["candidates"][0]["exact_video_id_match"])
         self.assertIn("repair_link", entry["allowed_actions"])
+
+    def test_cross_scan_probe_cache_is_reused_and_invalidated_by_file_change(self) -> None:
+        candidate = self.source / f"Recovered [{VIDEO_ID}].mp4"
+        candidate.write_bytes(b"first")
+        link = self.target / "Channel" / "Title" / "video.mp4"
+        self._broken_link(link)
+        self._row(link)
+
+        first = reconciliation.build_inventory()
+        second = reconciliation.build_inventory()
+
+        self.assertEqual(first["scan_token"], second["scan_token"])
+        self.assertEqual(self.probe.call_count, 1)
+
+        previous = candidate.stat()
+        candidate.write_bytes(b"other")
+        os.utime(
+            candidate,
+            ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000),
+        )
+        third = reconciliation.build_inventory()
+
+        self.assertEqual(self.probe.call_count, 2)
+        self.assertNotEqual(second["scan_token"], third["scan_token"])
+
+    def test_cross_scan_probe_cache_includes_invalid_results(self) -> None:
+        (self.source / f"corrupt [{VIDEO_ID}].mp4").write_bytes(b"bad")
+        link = self.target / "Channel" / "Title" / "video.mp4"
+        self._broken_link(link)
+        self._row(link)
+
+        first = self._entry(reconciliation.build_inventory(), link_path=link)
+        second = self._entry(reconciliation.build_inventory(), link_path=link)
+
+        self.assertEqual(first["status"], "invalid_media")
+        self.assertEqual(second["status"], "invalid_media")
+        self.assertEqual(self.probe.call_count, 1)
+
+    def test_forced_rescan_retries_cached_negative_probe_result(self) -> None:
+        candidate = self.source / f"Recovered [{VIDEO_ID}].mp4"
+        candidate.write_bytes(b"valid")
+        link = self.target / "Channel" / "Title" / "video.mp4"
+        self._broken_link(link)
+        self._row(link)
+        attempts = 0
+
+        def transient_probe(path: Path, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return {
+                    "valid": False,
+                    "valid_media": False,
+                    "error": "Timed out while inspecting media",
+                    "duration": None,
+                    "streams": [],
+                    "has_video": False,
+                    "has_audio": False,
+                    "size_bytes": path.stat().st_size,
+                }
+            return valid_probe(path, **kwargs)
+
+        self.probe.side_effect = transient_probe
+        first = self._entry(reconciliation.build_inventory(), link_path=link)
+        cached = self._entry(reconciliation.build_inventory(), link_path=link)
+        self.assertEqual(first["status"], "invalid_media")
+        self.assertEqual(cached["status"], "invalid_media")
+        self.assertEqual(self.probe.call_count, 1)
+
+        response, status = reconciliation.request_inventory(force=True)
+        self.assertEqual(status, 202)
+        self.assertEqual(response["status"], "scanning")
+        thread = reconciliation._SCAN_THREAD
+        self.assertIsNotNone(thread)
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+        self.assertEqual(reconciliation.get_scan_state()["status"], "complete")
+        recovered = self._entry(
+            reconciliation.get_cached_inventory(),
+            link_path=link,
+        )
+        self.assertEqual(recovered["status"], "repair_available")
+        self.assertEqual(self.probe.call_count, 2)
+
+    def test_probe_cache_reauthorizes_ancestor_and_canonical_confinement(self) -> None:
+        directory = self.source / "sub"
+        directory.mkdir()
+        candidate = directory / f"Recovered [{VIDEO_ID}].mp4"
+        candidate.write_bytes(b"valid")
+        first = reconciliation._probe_cached(candidate, (self.source,), {})
+        self.assertTrue(first["valid"])
+
+        escaped = self.source.parent / "escaped"
+        directory.rename(escaped)
+        directory.symlink_to(escaped, target_is_directory=True)
+
+        def confinement_probe(path: Path, *, allowed_roots):
+            if not reconciliation.path_within(path.resolve(), allowed_roots):
+                result = valid_probe(path)
+                result.update({
+                    "valid": False,
+                    "valid_media": False,
+                    "error": "Path outside allowed media directories",
+                })
+                return result
+            return valid_probe(path)
+
+        self.probe.reset_mock()
+        self.probe.side_effect = confinement_probe
+        second = reconciliation._probe_cached(candidate, (self.source,), {})
+
+        self.assertFalse(second["valid"])
+        self.assertIn("outside", second["error"])
+        self.probe.assert_called_once()
+
+    def test_probe_executor_never_exceeds_configured_worker_bound(self) -> None:
+        paths = []
+        for index in range(6):
+            path = self.source / f"Candidate {index} [{VIDEO_ID}].mp4"
+            path.write_bytes(b"valid")
+            paths.append(path)
+
+        active = 0
+        maximum_active = 0
+        guard = threading.Lock()
+        two_running = threading.Event()
+
+        def slow_probe(path: Path, **kwargs):
+            nonlocal active, maximum_active
+            with guard:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                if active == 2:
+                    two_running.set()
+            try:
+                two_running.wait(1)
+                time.sleep(0.01)
+                return valid_probe(path, **kwargs)
+            finally:
+                with guard:
+                    active -= 1
+
+        reconciliation._clear_probe_cache()
+        requests = [(path, (self.source,)) for path in paths]
+        local_cache = {}
+        with (
+            patch.object(reconciliation, "_PROBE_WORKERS", 2),
+            patch.object(reconciliation, "probe_media", side_effect=slow_probe) as probe,
+        ):
+            stats = reconciliation._prewarm_probes(requests, local_cache)
+
+        self.assertEqual(stats, {"requested": 6, "hits": 0, "misses": 6})
+        self.assertEqual(probe.call_count, 6)
+        self.assertEqual(maximum_active, 2)
+
+    def test_cross_scan_probe_cache_evicts_oldest_entry_at_configured_bound(self) -> None:
+        paths = []
+        for index in range(3):
+            path = self.source / f"Bounded {index} [{VIDEO_ID}].mp4"
+            path.write_bytes(b"valid")
+            paths.append(path)
+        first_key = reconciliation._probe_cache_key(paths[0], (self.source,))
+
+        with patch.object(reconciliation, "_PROBE_CACHE_MAX", 2):
+            for path in paths:
+                reconciliation._prewarm_probes(
+                    [(path, (self.source,))],
+                    {},
+                )
+
+        self.assertEqual(len(reconciliation._PROBE_CACHE), 2)
+        self.assertNotIn(first_key, reconciliation._PROBE_CACHE)
 
     def test_multiple_exact_paths_are_ambiguous_even_when_one_is_corrupt(self) -> None:
         (self.source / f"Good [{VIDEO_ID}].mp4").write_bytes(b"valid")
@@ -235,6 +424,7 @@ class LinkReconciliationTests(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(Path(os.readlink(link)), self.host / candidate.relative_to(self.source))
         self.assertEqual(self._entry(result["inventory"])["status"], "healthy")
+        self.assertEqual(self.probe.call_count, 2)
 
     def test_remove_broken_link_deletes_only_link_and_exact_db_row(self) -> None:
         link = self.target / "Channel" / "Title" / "video.mp4"
@@ -505,6 +695,40 @@ class LinkReconciliationTests(unittest.TestCase):
         self.assertTrue(absent.parent.is_dir())
         with db.get_db() as conn:
             self.assertIsNone(conn.execute("SELECT 1 FROM videos WHERE video_id = ?", (VIDEO_ID,)).fetchone())
+
+    def test_post_commit_rescan_failure_invalidates_pre_action_snapshot(self) -> None:
+        absent = self.target / "Channel" / "Title" / "video.mp4"
+        absent.parent.mkdir(parents=True)
+        self._row(absent)
+        inventory = reconciliation.build_inventory()
+        self.recovery_scan.side_effect = [
+            self._recovery_inventory(),
+            RuntimeError("discovery failed after commit"),
+        ]
+
+        result = reconciliation.forget_stale_record({
+            "video_id": VIDEO_ID,
+            "link_path": str(absent),
+            "scan_token": inventory["scan_token"],
+        })
+
+        self.assertTrue(result["action_applied"])
+        self.assertIn("discovery failed after commit", result["rescan_error"])
+        self.assertIsNone(result["inventory"])
+        self.assertIsNone(reconciliation.get_cached_inventory())
+        self.assertEqual(reconciliation.get_scan_state()["status"], "error")
+        payload, status = reconciliation.request_inventory(force=False)
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "error")
+        self.assertIsNone(payload["inventory"])
+        self.assertFalse(payload["stale"])
+        with db.get_db() as conn:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM videos WHERE video_id = ?",
+                    (VIDEO_ID,),
+                ).fetchone()
+            )
 
     def test_failed_advanced_recovery_scan_preserves_last_snapshot_and_fails_closed(self) -> None:
         link = self.target / "Channel" / "Title" / "video.mp4"
