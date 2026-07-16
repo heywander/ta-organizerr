@@ -1989,6 +1989,11 @@
     @keyframes workflow-spin { to { transform: rotate(360deg); } }
 
     @media (max-width: 760px) {
+        .channel-workflow {
+            height: 100%;
+            min-height: 0;
+            overflow: hidden;
+        }
         .channel-workflow button { min-height: 44px; font-size: 12px; }
         .channel-workflow input { min-height: 44px; font-size: 16px; }
         .workflow-header { grid-template-columns: minmax(0, 1fr) auto; min-height: 56px; padding-right: max(8px, env(safe-area-inset-right)); padding-left: max(8px, env(safe-area-inset-left)); }
@@ -2001,7 +2006,16 @@
         .workflow-steps li strong { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
         .workflow-steps li::after { right: -12px; left: calc(50% + 16px); }
         .workflow-notice > button { width: 44px; min-height: 44px; flex-basis: 44px; }
-        .workflow-body { padding-right: max(5px, env(safe-area-inset-right)); padding-bottom: max(5px, env(safe-area-inset-bottom)); padding-left: max(5px, env(safe-area-inset-left)); }
+        .workflow-body {
+            min-height: 0;
+            flex: 1 1 0;
+            overflow-y: auto;
+            overscroll-behavior-y: contain;
+            -webkit-overflow-scrolling: touch;
+            padding-right: max(5px, env(safe-area-inset-right));
+            padding-bottom: max(5px, env(safe-area-inset-bottom));
+            padding-left: max(5px, env(safe-area-inset-left));
+        }
         .step-panel > header { align-items: flex-start; flex-direction: column; }
         .step-panel h3 { font-size: 15px; }
         .channel-form,
@@ -2032,7 +2046,11 @@
         .duration-editor p { font-size: 10px; }
         .media-actions button,
         .decision-actions button { font-size: 11px; }
-        .review-footer { bottom: -5px; padding-bottom: max(8px, env(safe-area-inset-bottom)); }
+        .review-footer {
+            position: static;
+            bottom: auto;
+            padding-bottom: max(8px, env(safe-area-inset-bottom));
+        }
         .review-footer > div { align-items: stretch; flex-direction: column; }
         .review-footer > div > span { text-align: center; }
         .plan-summary { grid-template-columns: minmax(0, 1fr); }

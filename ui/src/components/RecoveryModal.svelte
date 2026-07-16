@@ -2553,6 +2553,15 @@
         }
     }
 
+    @media (max-width: 760px) {
+        .workspace-content.workflow-active {
+            display: grid;
+            min-height: 0;
+            grid-template-rows: minmax(0, 1fr);
+            overflow: hidden;
+        }
+    }
+
     @media (max-width: 640px) {
         .recovery-overlay {
             padding: 0;
