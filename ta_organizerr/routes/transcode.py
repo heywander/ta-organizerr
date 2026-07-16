@@ -84,7 +84,7 @@ def api_transcode_start():
     started, message = start_transcode_job(filepath, encoder)
     if not started:
         message_lower = message.lower()
-        if "already" in message_lower:
+        if "already" in message_lower or "currently in use" in message_lower:
             status = 409
         elif "busy" in message_lower:
             status = 429

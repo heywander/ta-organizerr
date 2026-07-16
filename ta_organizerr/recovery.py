@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .config import HIDDEN_DIR, IMPORT_DIR, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
+from .media_reservations import MediaReservationConflict, media_mutation_guard
 from .ta_api import fetch_all_metadata
 from .utils import (
     extract_id_from_filename,
@@ -90,10 +91,20 @@ def _prepare_media_stage(source: Path, destination: Path) -> tuple[Path | None, 
     for _ in range(10):
         temp_path = destination.parent / f".stage-{secrets.token_hex(12)}.tmp"
         try:
-            os.link(canonical_source, temp_path)
+            # Creating a hard link changes the source inode's ctime.  Do not
+            # invalidate a concurrent salvage/transcode integrity check; a
+            # descriptor-based copy is non-mutating and remains safe if the
+            # source pathname is atomically replaced afterward.
+            with media_mutation_guard(
+                paths=(canonical_source,),
+                action="hard-link this media while it is being processed",
+            ):
+                os.link(canonical_source, temp_path)
             return temp_path, "hardlinked"
         except FileExistsError:
             continue
+        except MediaReservationConflict:
+            return _copy_to_unique_temp(canonical_source, destination), "copied"
         except OSError:
             return _copy_to_unique_temp(canonical_source, destination), "copied"
     raise OSError("Could not allocate a unique media staging path")
@@ -138,37 +149,43 @@ def _publish_import_pair(
     media_destination: Path,
 ) -> None:
     """Publish metadata first and media last, rolling metadata back on error."""
+    protected_paths = (media_destination,) if media_temp is not None else ()
     backup: Path | None = None
     metadata_published = False
     try:
-        if os.path.lexists(metadata_destination):
-            if metadata_destination.is_dir() and not metadata_destination.is_symlink():
-                raise OSError(f"Metadata destination is a directory: {metadata_destination}")
-            backup = metadata_destination.parent / (
-                f".metadata-backup-{secrets.token_hex(12)}.tmp"
-            )
-            os.replace(metadata_destination, backup)
-        os.replace(metadata_temp, metadata_destination)
-        metadata_published = True
-        if media_temp is not None:
-            os.replace(media_temp, media_destination)
-        if backup is not None:
+        with media_mutation_guard(
+            paths=protected_paths,
+            action="replace this imported media file",
+        ):
             try:
-                backup.unlink(missing_ok=True)
-            except OSError as exc:
-                log(f"⚠️ Could not remove old metadata backup {backup}: {exc}")
-    except OSError:
-        if metadata_published:
-            try:
-                metadata_destination.unlink(missing_ok=True)
+                if os.path.lexists(metadata_destination):
+                    if metadata_destination.is_dir() and not metadata_destination.is_symlink():
+                        raise OSError(f"Metadata destination is a directory: {metadata_destination}")
+                    backup = metadata_destination.parent / (
+                        f".metadata-backup-{secrets.token_hex(12)}.tmp"
+                    )
+                    os.replace(metadata_destination, backup)
+                os.replace(metadata_temp, metadata_destination)
+                metadata_published = True
+                if media_temp is not None:
+                    os.replace(media_temp, media_destination)
+                if backup is not None:
+                    try:
+                        backup.unlink(missing_ok=True)
+                    except OSError as exc:
+                        log(f"⚠️ Could not remove old metadata backup {backup}: {exc}")
             except OSError:
-                pass
-        if backup is not None and os.path.lexists(backup):
-            try:
-                os.replace(backup, metadata_destination)
-            except OSError as restore_exc:
-                log(f"❌ Could not restore metadata after import failure: {restore_exc}")
-        raise
+                if metadata_published:
+                    try:
+                        metadata_destination.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if backup is not None and os.path.lexists(backup):
+                    try:
+                        os.replace(backup, metadata_destination)
+                    except OSError as restore_exc:
+                        log(f"❌ Could not restore metadata after import failure: {restore_exc}")
+                raise
     finally:
         for staged_path in (metadata_temp, media_temp, backup):
             if staged_path is None:
@@ -310,6 +327,8 @@ def recover_video_metadata(filepath: str) -> tuple[bool, str]:
         media_temp, method = _prepare_media_stage(src_path, dest_video)
         _publish_import_pair(temp_json, dest_json, media_temp, dest_video)
         log(f"   📂 Media {method} atomically.")
+    except MediaReservationConflict:
+        raise
     except OSError as exc:
         return False, f"Failed to stage recovery: {exc}"
     finally:
@@ -352,6 +371,8 @@ def force_import(filepath: str) -> tuple[bool, str]:
             conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
             conn.commit()
         return True, "Force import successful"
+    except MediaReservationConflict:
+        raise
     except OSError as exc:
         log(f"   ❌ Force import failed: {exc}")
         return False, str(exc)

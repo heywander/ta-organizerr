@@ -19,12 +19,21 @@ from .config import (
 )
 from .logging_util import tlog
 from .library_lock import LIBRARY_MUTATION_LOCK
+from .media_reservations import (
+    MediaReservation,
+    MediaReservationConflict,
+    extend_media_reservation,
+    media_identity,
+    media_mutation_guard,
+    release_media,
+    reserve_media,
+)
 from .utils import path_within, resolve_media_source
 
 
 _ALLOWED_BASES = (SOURCE_DIR, TARGET_DIR, HIDDEN_DIR, IMPORT_DIR)
 _SUPPORTED_CONTAINERS = {".mp4", ".mkv", ".mov"}
-_active_transcodes: dict[Path, tuple[int, int]] = {}
+_active_transcodes: dict[Path, MediaReservation] = {}
 _active_transcodes_lock = threading.Lock()
 
 
@@ -179,47 +188,75 @@ def _resolve_source(filepath: str) -> tuple[Path | None, str | None]:
 
 
 def _reserve(source: Path) -> tuple[bool, str]:
-    with _active_transcodes_lock:
+    # Reservation establishment follows the global lock order: library,
+    # transcode bookkeeping, then the shared media registry.  The library
+    # lock is released before FFmpeg starts.
+    with LIBRARY_MUTATION_LOCK, _active_transcodes_lock:
         try:
             source_stat = source.stat()
         except OSError as exc:
             return False, f"Source file became unavailable: {exc}"
-        identity = (source_stat.st_dev, source_stat.st_ino)
-        if source in _active_transcodes or identity in _active_transcodes.values():
+        if source in _active_transcodes:
             return False, "A transcode is already running for this file"
         if len(_active_transcodes) >= MAX_CONCURRENT_TRANSCODES:
             return False, "The transcode worker is busy; try again later"
-        _active_transcodes[source] = identity
+        try:
+            reservation = reserve_media(
+                (media_identity(source_stat),),
+                paths=(source,),
+                owner=f"transcode job for {source.name}",
+            )
+        except MediaReservationConflict as exc:
+            return False, str(exc)
+        _active_transcodes[source] = reservation
     return True, "Transcode started"
 
 
 def _release(source: Path) -> None:
-    with _active_transcodes_lock:
-        _active_transcodes.pop(source, None)
+    with LIBRARY_MUTATION_LOCK:
+        with _active_transcodes_lock:
+            reservation = _active_transcodes.pop(source, None)
+        release_media(reservation)
 
 
 def delete_source_if_idle(source: Path) -> None:
     """Delete a source entry atomically with respect to transcode reservation."""
-    # Global ordering for mutating paths is library lock, then transcode lock.
-    with LIBRARY_MUTATION_LOCK:
-        canonical = source.resolve(strict=True)
-        source_stat = source.stat()
-        identity = (source_stat.st_dev, source_stat.st_ino)
-        with _active_transcodes_lock:
-            if canonical in _active_transcodes or identity in _active_transcodes.values():
-                raise OSError(f"Source is currently being transcoded: {source}")
+    canonical = source.resolve(strict=True)
+    try:
+        with media_mutation_guard(
+            paths=(source, canonical),
+            action="delete this source file",
+        ):
             source.unlink()
+    except MediaReservationConflict as exc:
+        raise OSError(
+            f"Source is currently being transcoded or used by media salvage: {source}"
+        ) from exc
 
 
 def _temporary_output(source: Path) -> Path:
     """Create a unique same-directory output with the original container suffix."""
-    fd, name = tempfile.mkstemp(
-        prefix=f".{source.stem}.transcoding-",
-        suffix=source.suffix,
-        dir=source.parent,
-    )
-    os.close(fd)
-    return Path(name)
+    with LIBRARY_MUTATION_LOCK:
+        fd, name = tempfile.mkstemp(
+            prefix=f".{source.stem}.transcoding-",
+            suffix=source.suffix,
+            dir=source.parent,
+        )
+        os.close(fd)
+        output = Path(name)
+        try:
+            with _active_transcodes_lock:
+                reservation = _active_transcodes.get(source)
+            if reservation is not None:
+                extend_media_reservation(
+                    reservation,
+                    (media_identity(output.stat()),),
+                    paths=(output,),
+                )
+            return output
+        except Exception:
+            output.unlink(missing_ok=True)
+            raise
 
 
 def _commit_output(
@@ -234,6 +271,12 @@ def _commit_output(
         temp_file.chmod(stat.S_IMODE(original_stat.st_mode))
         with LIBRARY_MUTATION_LOCK:
             with _active_transcodes_lock:
+                own_reservation = _active_transcodes.get(source)
+            with media_mutation_guard(
+                paths=(source,),
+                except_reservation=own_reservation,
+                action="publish this transcoded replacement",
+            ):
                 current_stat = source.stat()
                 original_identity = (
                     original_stat.st_dev,

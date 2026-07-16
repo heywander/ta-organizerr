@@ -7,12 +7,18 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from ta_organizerr import symlinks
+from ta_organizerr import media_reservations, symlinks
 from ta_organizerr.symlinks import _destination_for_video
 from ta_organizerr.utils import channel_component
 
 
 class DestinationCollisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        media_reservations._reset_reservations_for_tests()
+
+    def tearDown(self) -> None:
+        media_reservations._reset_reservations_for_tests()
+
     def test_lossy_channel_names_get_distinct_stable_components(self) -> None:
         first = channel_component("频道")
         second = channel_component("チャンネル")
@@ -135,6 +141,36 @@ class DestinationCollisionTests(unittest.TestCase):
 
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
             self.assertTrue(channel_link.is_symlink())
+            self.assertFalse((hidden / "Private").exists())
+
+    def test_hidden_migration_defers_requested_link_held_by_salvage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "target"
+            hidden = root / "hidden"
+            channel = target / "Private"
+            source = root / "source.mp4"
+            link = channel / "video.mp4"
+            channel.mkdir(parents=True)
+            hidden.mkdir()
+            source.write_bytes(b"media")
+            link.symlink_to(source)
+            reservation = media_reservations.reserve_media(
+                (media_reservations.media_identity(source.stat()),),
+                paths=(source, link),
+                owner="media salvage job test",
+            )
+            try:
+                with (
+                    patch.object(symlinks, "TARGET_DIR", target),
+                    patch.object(symlinks, "HIDDEN_DIR", hidden),
+                ):
+                    symlinks._enforce_hidden_locations({"Private"})
+            finally:
+                media_reservations.release_media(reservation)
+
+            self.assertTrue(channel.is_dir())
+            self.assertTrue(link.is_symlink())
             self.assertFalse((hidden / "Private").exists())
 
     def test_distinct_video_ids_get_distinct_folders_on_collision(self) -> None:

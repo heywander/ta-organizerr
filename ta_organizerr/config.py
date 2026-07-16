@@ -43,6 +43,10 @@ TARGET_DIR = Path(os.getenv("TARGET_DIR", "/app/target"))
 HIDDEN_DIR = Path(os.getenv("HIDDEN_DIR", "/app/hidden"))
 IMPORT_DIR = Path(os.getenv("IMPORT_DIR", "/app/import"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+# Salvage outputs are intentionally separate from originals and live under the
+# persisted data mount by default.  They are never published over a source
+# file, even when FFmpeg reports a completely clean result.
+SALVAGE_DIR = Path(os.getenv("SALVAGE_DIR", str(DATA_DIR / "media-salvage")))
 # Preserve the historical fallback for bare-Docker/local upgrades. Compose
 # requires an explicit value, and app startup logs a warning when this fallback
 # is active so it can be removed in a future breaking release.
@@ -58,6 +62,13 @@ SESSION_LIFETIME_SECONDS = _positive_int("SESSION_LIFETIME_SECONDS", 8 * 3600)
 MAX_PER_PAGE = _positive_int("MAX_PER_PAGE", 500)
 MAX_METADATA_PAGES = _positive_int("MAX_METADATA_PAGES", 10_000)
 MAX_CONCURRENT_TRANSCODES = _positive_int("MAX_CONCURRENT_TRANSCODES", 1)
+MAX_CONCURRENT_SALVAGE_JOBS = _positive_int("MAX_CONCURRENT_SALVAGE_JOBS", 1)
+SALVAGE_JOB_TIMEOUT_SECONDS = _positive_int(
+    "SALVAGE_JOB_TIMEOUT_SECONDS", 24 * 3600
+)
+SALVAGE_MAX_OUTPUT_BYTES = _positive_int(
+    "SALVAGE_MAX_OUTPUT_BYTES", 100 * 1024 * 1024 * 1024
+)
 
 HEADERS = {"Authorization": f"Token {API_TOKEN}"} if API_TOKEN else {}
 

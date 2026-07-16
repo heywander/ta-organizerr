@@ -14,10 +14,11 @@ from typing import BinaryIO, Callable, Iterator
 from flask import Blueprint, current_app, jsonify, request
 
 from ..auth import requires_auth
-from ..config import HIDDEN_DIR, SOURCE_DIR, TARGET_DIR
+from ..config import HIDDEN_DIR, SALVAGE_DIR, SOURCE_DIR, TARGET_DIR
 from ..db import get_db
 from ..logging_util import log
 from ..library_lock import LIBRARY_MUTATION_LOCK
+from ..media_reservations import MediaReservationConflict, media_mutation_guard
 from ..recovery import (
     RECOVERY_ALLOWED_BASES,
     _delete_candidate_error,
@@ -46,6 +47,12 @@ _AUDIO_PROBE_TIMEOUT_SECONDS = 15
 _SINGLE_BYTE_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 _RAW_PREVIEW_GUARD = threading.BoundedSemaphore(value=2)
 _AUDIO_PREVIEW_GUARD = threading.BoundedSemaphore(value=1)
+
+
+def _preview_allowed_bases():
+    # Resolve dynamically so tests/runtime overrides of the recovery roots do
+    # not leave preview validation bound to a stale import-time tuple.
+    return (*RECOVERY_ALLOWED_BASES, SALVAGE_DIR)
 
 # These are the media containers the recovery UI may preview.  Keeping an
 # explicit allow-list prevents this authenticated file-serving endpoint from
@@ -116,23 +123,33 @@ class _CleanupOnce:
         self._callback()
 
 
-def _validated_entry_path(filepath: str | None) -> tuple[Path | None, tuple[object, int] | None]:
+def _validated_entry_path(
+    filepath: str | None,
+    allowed_bases=None,
+) -> tuple[Path | None, tuple[object, int] | None]:
+    if allowed_bases is None:
+        allowed_bases = RECOVERY_ALLOWED_BASES
     if not isinstance(filepath, str) or not filepath or "\x00" in filepath:
         return None, (jsonify({"error": "No filepath provided"}), 400)
     if len(filepath) > _MAX_PATH_LENGTH:
         return None, (jsonify({"error": "Filepath is too long"}), 400)
     path = Path(filepath)
-    if not path_in_allowed_tree(path, RECOVERY_ALLOWED_BASES):
+    if not path_in_allowed_tree(path, allowed_bases):
         return None, (jsonify({"error": "Path outside allowed directories"}), 400)
     return path, None
 
 
-def _validated_media_source(filepath: str | None) -> tuple[Path | None, tuple[object, int] | None]:
-    path, error = _validated_entry_path(filepath)
+def _validated_media_source(
+    filepath: str | None,
+    allowed_bases=None,
+) -> tuple[Path | None, tuple[object, int] | None]:
+    if allowed_bases is None:
+        allowed_bases = RECOVERY_ALLOWED_BASES
+    path, error = _validated_entry_path(filepath, allowed_bases)
     if error:
         return None, error
     source = resolve_media_source(path)
-    if not source or not path_within(source, RECOVERY_ALLOWED_BASES):
+    if not source or not path_within(source, allowed_bases):
         return None, (jsonify({"error": "Resolved media path outside allowed directories"}), 400)
     return source, None
 
@@ -190,7 +207,7 @@ def _open_preview_file(
         canonical_source = source.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         raise FileNotFoundError from None
-    if not path_within(canonical_source, RECOVERY_ALLOWED_BASES):
+    if not path_within(canonical_source, _preview_allowed_bases()):
         raise PermissionError("Resolved media path outside allowed directories")
     # Validate the final target's own type as well. A media-looking symlink may
     # not be used to disguise a non-media file inside an allowed mount.
@@ -219,7 +236,7 @@ def _open_preview_file(
             # The supported deployment is Linux. Fail closed if /proc is not
             # mounted or the file was unlinked during validation.
             raise PermissionError("Could not validate opened media file") from None
-        if not path_within(opened_path, RECOVERY_ALLOWED_BASES):
+        if not path_within(opened_path, _preview_allowed_bases()):
             raise PermissionError("Opened media path outside allowed directories")
 
         return os.fdopen(fd, "rb"), file_stat.st_size, mimetype, demuxer
@@ -452,7 +469,9 @@ def api_recovery_poll():
 @requires_auth
 def api_recovery_preview():
     """Stream one confined recovery media file to the authenticated browser."""
-    source, error = _validated_media_source(request.args.get("filepath"))
+    source, error = _validated_media_source(
+        request.args.get("filepath"), _preview_allowed_bases()
+    )
     if error:
         response, status = error
         response.status_code = status
@@ -531,7 +550,9 @@ def api_recovery_preview():
 @requires_auth
 def api_recovery_preview_audio():
     """Transcode one confined media file to a low-cost MP3 audio stream."""
-    source, error = _validated_media_source(request.args.get("filepath"))
+    source, error = _validated_media_source(
+        request.args.get("filepath"), _preview_allowed_bases()
+    )
     if error:
         response, status = error
         response.status_code = status
@@ -690,7 +711,10 @@ def api_recovery_start():
     media_path, error = _validated_media_source(data.get("filepath"))
     if error:
         return error
-    success, msg = recover_video_metadata(str(media_path))
+    try:
+        success, msg = recover_video_metadata(str(media_path))
+    except MediaReservationConflict as exc:
+        return jsonify({"error": str(exc)}), 409
     log(f"Recovery Result for {media_path}: {msg}")
     return jsonify({
         "message": msg,
@@ -709,7 +733,10 @@ def api_recovery_force():
     if error:
         return error
     log(f"💪 Force Importing (Lost Media): {media_path.name}")
-    success, msg = force_import(str(media_path))
+    try:
+        success, msg = force_import(str(media_path))
+    except MediaReservationConflict as exc:
+        return jsonify({"error": str(exc)}), 409
     if success:
         return jsonify({"success": True, "message": msg})
     # 404 if the file is missing, 400/500 otherwise.
@@ -741,7 +768,11 @@ def api_recovery_delete():
 
         vid_id = extract_id_from_filename(p.name)
         try:
-            p.unlink()
+            with media_mutation_guard(
+                paths=(p,),
+                action="delete this recovery media entry",
+            ):
+                p.unlink()
             with get_db() as conn:
                 if vid_id and is_valid_youtube_id(vid_id):
                     conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
@@ -749,6 +780,9 @@ def api_recovery_delete():
                 conn.commit()
             log(f"🗑️ Deleted file: {p}")
             return jsonify({"success": True, "message": "File deleted"})
+        except MediaReservationConflict as exc:
+            log(f"⏳ Delete deferred because media is active: {exc}")
+            return jsonify({"error": str(exc)}), 409
         except OSError as exc:
             log(f"❌ Delete failed: {exc}")
             return jsonify({"error": "Delete failed"}), 500
@@ -849,7 +883,11 @@ def api_recovery_delete_batch():
                     log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
 
                 if os.path.lexists(p):
-                    p.unlink()
+                    with media_mutation_guard(
+                        paths=(p,),
+                        action="delete this recovery media entry",
+                    ):
+                        p.unlink()
                     filesystem_changed = True
                     log(f"🗑️ Deleted target: {path}")
 

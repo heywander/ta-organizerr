@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ta_organizerr import db, reconciliation, symlinks
+from ta_organizerr import db, media_reservations, reconciliation, symlinks
 
 
 VIDEO_ID = "abcdefghijk"
@@ -40,6 +40,7 @@ def valid_probe(path: Path, **_kwargs):
 
 class LinkReconciliationTests(unittest.TestCase):
     def setUp(self) -> None:
+        media_reservations._reset_reservations_for_tests()
         reconciliation._reset_scan_runtime_for_tests()
         reconciliation._clear_probe_cache()
         self.temp = tempfile.TemporaryDirectory()
@@ -75,6 +76,7 @@ class LinkReconciliationTests(unittest.TestCase):
     def tearDown(self) -> None:
         reconciliation._reset_scan_runtime_for_tests()
         reconciliation._clear_probe_cache()
+        media_reservations._reset_reservations_for_tests()
         self.stack.close()
         self.temp.cleanup()
 
@@ -425,6 +427,33 @@ class LinkReconciliationTests(unittest.TestCase):
         self.assertEqual(Path(os.readlink(link)), self.host / candidate.relative_to(self.source))
         self.assertEqual(self._entry(result["inventory"])["status"], "healthy")
         self.assertEqual(self.probe.call_count, 2)
+
+    def test_repair_returns_conflict_for_path_reserved_by_salvage(self) -> None:
+        candidate = self.source / f"Recovered [{VIDEO_ID}].mp4"
+        candidate.write_bytes(b"valid")
+        link = self.target / "Channel" / "Title" / "video.mp4"
+        self._broken_link(link)
+        self._row(link)
+        inventory = reconciliation.build_inventory()
+        reservation = media_reservations.reserve_media(
+            (media_reservations.media_identity(candidate.stat()),),
+            paths=(candidate, link),
+            owner="media salvage job test",
+        )
+        try:
+            with self.assertRaises(reconciliation.ReconciliationError) as raised:
+                reconciliation.repair_link({
+                    "video_id": VIDEO_ID,
+                    "link_path": str(link),
+                    "candidate_path": str(candidate),
+                    "scan_token": inventory["scan_token"],
+                })
+        finally:
+            media_reservations.release_media(reservation)
+
+        self.assertEqual(raised.exception.status, 409)
+        self.assertIn("currently in use", str(raised.exception))
+        self.assertTrue(link.is_symlink())
 
     def test_remove_broken_link_deletes_only_link_and_exact_db_row(self) -> None:
         link = self.target / "Channel" / "Title" / "video.mp4"

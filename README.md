@@ -23,6 +23,8 @@ management, and optional FFmpeg transcoding.
   in the browser before deciding how to classify or recover them.
 - Reconciles tracked records, organized links, source media, and unindexed
   real files on a dedicated page before declaring a broken link truly missing.
+- Deep-scans damaged audio/video streams and creates separately validated,
+  non-destructive salvage outputs from packets or frames FFmpeg can still read.
 - Stages recovered videos and metadata into `/app/import`.
 - Can transcode media to H.264/AAC with FFmpeg.
 - Supports Docker and Unraid-style `PUID`/`PGID` ownership.
@@ -79,6 +81,10 @@ SESSION_COOKIE_SECURE=false
 # Optional safety/resource caps.
 MAX_METADATA_PAGES=10000
 MAX_CONCURRENT_TRANSCODES=1
+SALVAGE_DIR=/app/data/media-salvage
+MAX_CONCURRENT_SALVAGE_JOBS=1
+SALVAGE_JOB_TIMEOUT_SECONDS=86400
+SALVAGE_MAX_OUTPUT_BYTES=107374182400
 RECONCILIATION_PROBE_WORKERS=2
 RECONCILIATION_PROBE_CACHE_MAX=4096
 ```
@@ -148,6 +154,11 @@ the admin account. The password hash and generated Flask secret are stored in
   Hidden Channel/
     2025-01-01 - Hidden Video/
       video.mp4 -> /host/source/path/Hidden Channel/Hidden [video_id].mp4
+
+/app/data/media-salvage/
+  video_id/
+    remux-job_id [video_id].mkv
+    reencode-job_id [video_id].mkv
 ```
 
 Livestreams are placed below the channel folder:
@@ -192,6 +203,26 @@ migration.
   probes use a bounded worker pool and a fingerprint cache. The defaults are two
   workers and 4,096 cached fingerprints; keep the worker count low on network
   storage.
+- Media Salvage first hashes and fully decodes each playable audio/video stream
+  (up to the configured safety limit) instead of treating a successful metadata
+  probe as proof that the whole file is
+  readable. An optional known duration helps identify files whose container
+  advertises ten minutes but whose decodable content ends after four. An exact,
+  case-sensitive video-ID candidate can be inspected beside the source, but it
+  is never automatically mixed into or substituted for the damaged file.
+  **Remux surviving packets** copies readable packets into a fresh Matroska
+  container. **Recover decodable media** re-encodes readable video and audio.
+  Both write a new file under `SALVAGE_DIR` and keep the original read-only.
+  They require the source SHA-256 from the completed diagnosis before starting
+  and publish the result only after another complete decode succeeds. The bracketed
+  ID in each output filename keeps it discoverable by exact-ID scans. Missing bytes
+  cannot be recreated; a normal MP4 whose `moov` sample table is gone may not be
+  recoverable with FFmpeg alone. The recorded SHA-256 is a baseline for future
+  comparisons, not proof of historical bit rot without an older known-good hash.
+  Entry-name and resolved-target IDs must agree when both are present; conflicting
+  IDs are rejected. While a salvage or transcode job is active, its source,
+  requested link, and generated output inode are reserved so in-app delete,
+  import, link-repair, and library-move actions cannot invalidate the job.
 - Transcoding replaces the resolved source media file in place after FFmpeg
   completes successfully. It is limited to MP4, Matroska (`.mkv`), and MOV
   containers. It maps every input stream, copies metadata/chapters and
@@ -296,3 +327,7 @@ image. A failed test prevents publication.
 - If the UI lacks icons or fonts, check the browser console for CSP violations.
 - If transcoding fails, confirm FFmpeg can read the translated source path and
   the source volume is writable.
+- If Media Salvage reports `moov atom not found`, look for a complete exact-ID
+  copy before attempting further work. If a salvage result is shorter than the
+  expected duration, preview it before adopting it; the missing tail was not
+  reconstructed.

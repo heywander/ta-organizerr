@@ -67,6 +67,12 @@ def reconciliation_page():
     return _send("reconciliation/index.html")
 
 
+@bp.route("/salvage")
+@requires_auth
+def salvage_page():
+    return _send("salvage/index.html")
+
+
 @bp.route("/<path:path>")
 def static_assets(path):
     """Catch-all for built static files. Whitelist by extension."""

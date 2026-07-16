@@ -102,6 +102,7 @@ def create_app(initialize_db: bool = True) -> Flask:
     from .routes.pages import bp as pages_bp
     from .routes.recovery import bp as recovery_bp
     from .routes.reconciliation import bp as reconciliation_bp
+    from .routes.salvage import bp as salvage_bp
     from .routes.status import bp as status_bp
     from .routes.transcode import bp as transcode_bp
 
@@ -111,6 +112,7 @@ def create_app(initialize_db: bool = True) -> Flask:
     app.register_blueprint(transcode_bp)
     app.register_blueprint(recovery_bp)
     app.register_blueprint(reconciliation_bp)
+    app.register_blueprint(salvage_bp)
     app.register_blueprint(channels_bp)
     app.register_blueprint(hidden_bp)
     app.register_blueprint(pages_bp)  # last — has the static catch-all

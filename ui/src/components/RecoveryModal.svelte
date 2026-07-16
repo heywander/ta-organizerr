@@ -982,6 +982,17 @@
                                             <i class="bi bi-play-circle" aria-hidden="true"></i>
                                             Preview
                                         </button>
+                                        {#if activeTab === "unindexed" && itemPath(item)}
+                                            <a
+                                                class="row-action salvage-action"
+                                                href={`/salvage?path=${encodeURIComponent(item.path)}`}
+                                                aria-label={`Open ${previewName(item)} in Media Salvage`}
+                                                title="Inspect without modifying the source"
+                                            >
+                                                <i class="bi bi-life-preserver" aria-hidden="true"></i>
+                                                Salvage
+                                            </a>
+                                        {/if}
                                         {#if activeTab === "unindexed"}
                                             <button
                                                 class="row-action"
@@ -1711,6 +1722,12 @@
         font-family: Tahoma, Verdana, Arial, sans-serif;
         font-size: 10px;
         font-weight: 700;
+        text-decoration: none;
+    }
+
+    .salvage-action {
+        color: var(--text);
+        border-color: var(--rule);
     }
 
     .row-action:hover:not(:disabled) {

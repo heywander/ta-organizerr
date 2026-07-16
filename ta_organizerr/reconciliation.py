@@ -24,6 +24,7 @@ from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .library_lock import LIBRARY_MUTATION_LOCK
 from .logging_util import log
+from .media_reservations import MediaReservationConflict, media_mutation_guard
 from .recovery import scan_for_unindexed_videos
 from .utils import extract_id_from_filename, is_video, path_within
 
@@ -1415,6 +1416,19 @@ def _assert_unique_db_owner(video_id: str, link_path: str) -> None:
         raise ReconciliationError("Link path does not have one authoritative database owner", 409)
 
 
+def _assert_media_entry_idle(path: Path, action: str) -> None:
+    """Refuse link mutations that would invalidate an active job's path."""
+
+    try:
+        # Reconciliation actions already hold LIBRARY_MUTATION_LOCK for their
+        # entire transaction, so the no-op guard remains authoritative until
+        # the caller finishes the actual rename/unlink/symlink operation.
+        with media_mutation_guard(paths=(path,), action=action):
+            pass
+    except MediaReservationConflict as exc:
+        raise ReconciliationError(str(exc), 409) from exc
+
+
 def _rename_noreplace(source: Path, destination: Path) -> None:
     """Atomically rename without replacing any destination (Linux renameat2)."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -1614,6 +1628,7 @@ def repair_link(data: dict[str, Any]) -> dict[str, Any]:
             raise ReconciliationError(probe["error"] or "Candidate media is invalid", 422)
         if not _managed_entry_is_safe(link_path):
             raise ReconciliationError("Unsafe managed link path", 400)
+        _assert_media_entry_idle(link_path, "repair this organized link")
 
         quarantine: Path | None = None
         if os.path.lexists(link_path):
@@ -1704,6 +1719,7 @@ def remove_broken_link(data: dict[str, Any]) -> dict[str, Any]:
         video_id, link_path_raw, _token = _require_selector(data)
         link_path = Path(link_path_raw)
         _assert_unique_db_owner(video_id, link_path_raw)
+        _assert_media_entry_idle(link_path, "remove this broken organized link")
         quarantine, raw_target, quarantine_identity = _quarantine_symlink(
             link_path, entry["stored_target_path"]
         )

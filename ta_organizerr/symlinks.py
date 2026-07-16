@@ -12,6 +12,7 @@ from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
 from .library_lock import LIBRARY_MUTATION_LOCK
+from .media_reservations import MediaReservationConflict, media_mutation_guard
 from .ta_api import MetadataFetchError, fetch_all_metadata
 from .utils import (
     channel_component,
@@ -160,9 +161,13 @@ def fix_broken_symlinks() -> list[str]:
                     continue
                 size = video_file.stat().st_size
                 if size == 0:
-                    video_file.unlink()
-                    log(f"   [FIXED] Deleted invalid file: {video_file} (was {size} bytes)")
-                    fixed.append(str(video_file))
+                    with media_mutation_guard(
+                        paths=(video_file,),
+                        action="delete this invalid media file",
+                    ):
+                        video_file.unlink()
+                        log(f"   [FIXED] Deleted invalid file: {video_file} (was {size} bytes)")
+                        fixed.append(str(video_file))
                 else:
                     log(f"   ⚠️ Non-symlink media left untouched: {video_file} ({size} bytes)")
             except OSError as exc:
@@ -172,31 +177,37 @@ def fix_broken_symlinks() -> list[str]:
 
 
 def _migrate_channel_dir(wrong: Path, correct: Path) -> None:
-    if not wrong.exists():
-        return
-    managed_roots = (TARGET_DIR, HIDDEN_DIR)
-    if (
-        wrong.is_symlink()
-        or correct.is_symlink()
-        or not path_within(wrong, managed_roots)
-        or not path_in_allowed_tree(correct, managed_roots)
-    ):
-        log(f"   ⛔ Refusing unsafe channel-directory migration: {wrong} -> {correct}")
-        return
     try:
-        correct.parent.mkdir(parents=True, exist_ok=True)
-        if not correct.exists():
-            shutil.move(str(wrong), str(correct))
-            log(f"   [MOVE] Migrated {wrong.name} to {correct.parent.name}")
-            return
-        for item in list(wrong.iterdir()):
-            dest_item = correct / item.name
-            if not dest_item.exists():
-                shutil.move(str(item), str(dest_item))
-        try:
-            wrong.rmdir()
-        except OSError:
-            pass
+        with media_mutation_guard(
+            trees=(wrong,),
+            action="move this channel while its media is being processed",
+        ):
+            if not wrong.exists():
+                return
+            managed_roots = (TARGET_DIR, HIDDEN_DIR)
+            if (
+                wrong.is_symlink()
+                or correct.is_symlink()
+                or not path_within(wrong, managed_roots)
+                or not path_in_allowed_tree(correct, managed_roots)
+            ):
+                log(f"   ⛔ Refusing unsafe channel-directory migration: {wrong} -> {correct}")
+                return
+            correct.parent.mkdir(parents=True, exist_ok=True)
+            if not correct.exists():
+                shutil.move(str(wrong), str(correct))
+                log(f"   [MOVE] Migrated {wrong.name} to {correct.parent.name}")
+                return
+            for item in list(wrong.iterdir()):
+                dest_item = correct / item.name
+                if not dest_item.exists():
+                    shutil.move(str(item), str(dest_item))
+            try:
+                wrong.rmdir()
+            except OSError:
+                pass
+    except MediaReservationConflict as exc:
+        log(f"   ⏳ Deferred channel migration {wrong.name}: {exc}")
     except (OSError, shutil.Error) as exc:
         log(f"   ❌ Migration error for {wrong.name}: {exc}")
 
@@ -327,14 +338,20 @@ def _remove_stale_managed_links(
             target = Path(os.readlink(link))
             if extract_id_from_filename(target.name) != video_id:
                 continue
-            link.unlink()
-            log(f"   🧹 Removed superseded generated link: {link}")
-            parent = link.parent
-            while parent.resolve(strict=False) not in managed_roots:
-                if parent.is_symlink() or not parent.exists() or any(parent.iterdir()):
-                    break
-                parent.rmdir()
-                parent = parent.parent
+            with media_mutation_guard(
+                paths=(link,),
+                action="remove this superseded organized link",
+            ):
+                link.unlink()
+                log(f"   🧹 Removed superseded generated link: {link}")
+                parent = link.parent
+                while parent.resolve(strict=False) not in managed_roots:
+                    if parent.is_symlink() or not parent.exists() or any(parent.iterdir()):
+                        break
+                    parent.rmdir()
+                    parent = parent.parent
+        except MediaReservationConflict as exc:
+            log(f"   ⏳ Deferred superseded link cleanup {link}: {exc}")
         except (OSError, RuntimeError) as exc:
             log(f"   ⚠️ Could not clean superseded link {link}: {exc}")
     link_index[video_id] = [current_link]
@@ -346,26 +363,40 @@ def _ensure_symlink(host_source_path: Path, dest_file: Path, video_dir: Path, ch
     Returns ``(new_or_fixed, verified, error)``. ``error`` is set when no
     usable symlink exists after the attempt.
     """
-    try:
-        # Race-safe: try to create first, then handle pre-existing.
-        channel_dir.mkdir(parents=True, exist_ok=True)
-        video_dir.mkdir(parents=True, exist_ok=True)
-        os.symlink(host_source_path, dest_file)
-        return True, False, None
-    except FileExistsError:
-        if dest_file.is_symlink():
-            try:
-                current_target = Path(os.readlink(dest_file))
-                if not current_target.is_absolute():
-                    current_target = dest_file.parent / current_target
-                if current_target.resolve() != host_source_path.resolve():
+    if not os.path.lexists(dest_file):
+        try:
+            with media_mutation_guard(
+                paths=(dest_file,),
+                action="create this organized link",
+            ):
+                channel_dir.mkdir(parents=True, exist_ok=True)
+                video_dir.mkdir(parents=True, exist_ok=True)
+                os.symlink(host_source_path, dest_file)
+            return True, False, None
+        except FileExistsError:
+            # Another serialized/external writer populated the entry; verify
+            # it below instead of replacing it blindly.
+            pass
+        except (OSError, MediaReservationConflict) as exc:
+            return False, False, str(exc)
+
+    if dest_file.is_symlink():
+        try:
+            current_target = Path(os.readlink(dest_file))
+            if not current_target.is_absolute():
+                current_target = dest_file.parent / current_target
+            if current_target.resolve() != host_source_path.resolve():
+                with media_mutation_guard(
+                    paths=(dest_file,),
+                    action="replace this organized link",
+                ):
                     dest_file.unlink()
                     os.symlink(host_source_path, dest_file)
-                    return True, False, None
-                return False, True, None
-            except OSError as exc:
-                return False, False, str(exc)
-        return False, False, f"Non-symlink file already exists at {dest_file}"
+                return True, False, None
+            return False, True, None
+        except OSError as exc:
+            return False, False, str(exc)
+    return False, False, f"Non-symlink file already exists at {dest_file}"
 
 
 def _destination_for_video(

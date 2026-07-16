@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from flask import Flask
 
-from ta_organizerr import recovery
+from ta_organizerr import media_reservations, recovery
 from ta_organizerr.routes import recovery as recovery_routes
 from ta_organizerr.utils import path_in_allowed_tree, path_within, sanitize
 
@@ -57,6 +57,12 @@ class PathEntrySafetyTests(unittest.TestCase):
 
 
 class AtomicRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        media_reservations._reset_reservations_for_tests()
+
+    def tearDown(self) -> None:
+        media_reservations._reset_reservations_for_tests()
+
     def test_same_source_and_destination_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             media = Path(tmp) / f"Title [{VIDEO_ID}].mp4"
@@ -262,8 +268,77 @@ class AtomicRecoveryTests(unittest.TestCase):
             self.assertEqual(source.read_bytes(), b"original")
             self.assertTrue((import_dir / f"Title [{VIDEO_ID}].info.json").is_file())
 
+    def test_reserved_source_is_copied_without_hardlink_ctime_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source" / f"Title [{VIDEO_ID}].mp4"
+            destination = root / "import" / source.name
+            source.parent.mkdir()
+            destination.parent.mkdir()
+            source.write_bytes(b"original")
+            before = source.stat()
+            reservation = media_reservations.reserve_media(
+                (media_reservations.media_identity(before),),
+                paths=(source,),
+                owner="media salvage job test",
+            )
+            try:
+                staged, method = recovery._prepare_media_stage(source, destination)
+            finally:
+                media_reservations.release_media(reservation)
+
+            try:
+                after = source.stat()
+                self.assertEqual(method, "copied")
+                self.assertEqual(after.st_nlink, before.st_nlink)
+                self.assertEqual(after.st_ctime_ns, before.st_ctime_ns)
+                self.assertEqual(staged.read_bytes(), b"original")
+            finally:
+                staged.unlink(missing_ok=True)
+
+    def test_import_refuses_reserved_destination_and_cleans_staging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media_destination = root / "video.mp4"
+            metadata_destination = root / "video.info.json"
+            media_temp = root / ".media.tmp"
+            metadata_temp = root / ".metadata.tmp"
+            media_destination.write_bytes(b"keep media")
+            metadata_destination.write_text("keep metadata", encoding="utf-8")
+            media_temp.write_bytes(b"replacement")
+            metadata_temp.write_text("{}", encoding="utf-8")
+            reservation = media_reservations.reserve_media(
+                (media_reservations.media_identity(media_destination.stat()),),
+                paths=(media_destination,),
+                owner="media salvage job test",
+            )
+            try:
+                with self.assertRaises(media_reservations.MediaReservationConflict):
+                    recovery._publish_import_pair(
+                        metadata_temp,
+                        metadata_destination,
+                        media_temp,
+                        media_destination,
+                    )
+            finally:
+                media_reservations.release_media(reservation)
+
+            self.assertEqual(media_destination.read_bytes(), b"keep media")
+            self.assertEqual(
+                metadata_destination.read_text(encoding="utf-8"),
+                "keep metadata",
+            )
+            self.assertFalse(media_temp.exists())
+            self.assertFalse(metadata_temp.exists())
+
 
 class DeleteBatchSafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        media_reservations._reset_reservations_for_tests()
+
+    def tearDown(self) -> None:
+        media_reservations._reset_reservations_for_tests()
+
     def test_parent_cleanup_never_removes_source_or_import_roots(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -342,6 +417,39 @@ class DeleteBatchSafetyTests(unittest.TestCase):
             self.assertEqual(payload["fail_count"], 1)
             self.assertIn("db_sync_failed", payload["errors"][0])
             self.assertFalse(media.exists())
+
+    def test_single_delete_returns_conflict_for_salvage_requested_path(self) -> None:
+        app = Flask(__name__)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            source.mkdir()
+            target.mkdir()
+            media = target / f"Title [{VIDEO_ID}].mp4"
+            media.write_bytes(b"target")
+            reservation = media_reservations.reserve_media(
+                (media_reservations.media_identity(media.stat()),),
+                paths=(media,),
+                owner="media salvage job test",
+            )
+            try:
+                with (
+                    app.test_request_context(json={"filepath": str(media)}),
+                    patch.object(
+                        recovery_routes,
+                        "RECOVERY_ALLOWED_BASES",
+                        (source, target),
+                    ),
+                    patch.object(recovery_routes, "SOURCE_DIR", source),
+                ):
+                    response, status = recovery_routes.api_recovery_delete.__wrapped__()
+            finally:
+                media_reservations.release_media(reservation)
+
+            self.assertEqual(status, 409)
+            self.assertIn("currently in use", response.get_json()["error"])
+            self.assertEqual(media.read_bytes(), b"target")
 
     def test_source_lookup_walks_archive_only_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
