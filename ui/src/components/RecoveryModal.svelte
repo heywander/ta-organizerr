@@ -23,6 +23,8 @@
         [key: string]: any;
     };
 
+    const UNKNOWN_SOURCE_CHANNEL = "__unknown_source_channel__";
+
     let activeTab: RecoveryTab = "unindexed";
     let scanning = false;
     let status = "idle";
@@ -43,6 +45,7 @@
     let searchingVideos = false;
     let channelRequestSequence = 0;
     let channelAbortController: AbortController | null = null;
+    let selectedUnindexedChannel = "";
 
     // Media preview state. The backend endpoint supports range requests, so the
     // native media element can seek without downloading an entire archive file.
@@ -111,6 +114,32 @@
     function previewName(item: RecoveryItem): string {
         const path = itemPath(item);
         return item.title || item.filename || (path ? basename(path) : "Untitled media");
+    }
+
+    function sourceChannelId(item: RecoveryItem): string | null {
+        return typeof item.source_channel_id === "string" &&
+            item.source_channel_id.trim()
+            ? item.source_channel_id.trim()
+            : null;
+    }
+
+    function summarizeUnindexedChannels(items: RecoveryItem[]) {
+        const counts = new Map<string, number>();
+        let unknownCount = 0;
+        for (const item of items) {
+            const channelId = sourceChannelId(item);
+            if (channelId) {
+                counts.set(channelId, (counts.get(channelId) || 0) + 1);
+            } else {
+                unknownCount += 1;
+            }
+        }
+        return {
+            channels: Array.from(counts, ([id, count]) => ({ id, count })).sort(
+                (left, right) => left.id.localeCompare(right.id),
+            ),
+            unknownCount,
+        };
     }
 
     function cancelPreviewRequest() {
@@ -631,6 +660,13 @@
         selectedPaths = new Set();
     }
 
+    function handleUnindexedChannelFilter(event: Event) {
+        selectedUnindexedChannel = (
+            event.currentTarget as HTMLSelectElement
+        ).value;
+        selectedPaths = new Set();
+    }
+
     function selectRecoveryTab(tab: RecoveryTab, focusTab = false) {
         activeTab = tab;
         selectedPaths = new Set();
@@ -659,8 +695,24 @@
         selectRecoveryTab(recoveryTabs[nextIndex], true);
     }
 
-    $: visibleItems =
-        activeTab === "channels" ? channelVideos : results[activeTab] || [];
+    $: unindexedChannelSummary = summarizeUnindexedChannels(
+        results.unindexed || [],
+    );
+    $: selectedUnindexedChannelMissing =
+        selectedUnindexedChannel !== "" &&
+        selectedUnindexedChannel !== UNKNOWN_SOURCE_CHANNEL &&
+        !unindexedChannelSummary.channels.some(
+            (channel) => channel.id === selectedUnindexedChannel,
+        );
+    $: visibleItems = activeTab === "channels"
+        ? channelVideos
+        : activeTab === "unindexed" && selectedUnindexedChannel
+          ? (results.unindexed || []).filter((item) =>
+                selectedUnindexedChannel === UNKNOWN_SOURCE_CHANNEL
+                    ? sourceChannelId(item) === null
+                    : sourceChannelId(item) === selectedUnindexedChannel,
+            )
+          : results[activeTab] || [];
     $: selectableItems = visibleItems.filter(canDeleteItem);
     $: allSelected =
         selectableItems.length > 0 &&
@@ -924,6 +976,35 @@
                     <span>Scanning archive…</span>
                 </div>
             {:else}
+                <div
+                    class="recovery-list-view"
+                    class:has-filter={activeTab === "unindexed"}
+                >
+                {#if activeTab === "unindexed"}
+                    <div class="channel-selector unindexed-channel-selector">
+                        <div class="field-group">
+                            <label for="recovery-unindexed-channel">Source channel ID</label>
+                            <select
+                                id="recovery-unindexed-channel"
+                                value={selectedUnindexedChannel}
+                                on:change={handleUnindexedChannelFilter}
+                            >
+                                <option value="">All unindexed videos ({results.unindexed?.length || 0})</option>
+                                {#if selectedUnindexedChannelMissing}
+                                    <option value={selectedUnindexedChannel}>{selectedUnindexedChannel} (0)</option>
+                                {/if}
+                                {#each unindexedChannelSummary.channels as channel}
+                                    <option value={channel.id}>{channel.id} ({channel.count})</option>
+                                {/each}
+                                <option value={UNKNOWN_SOURCE_CHANNEL}>Unknown / other ({unindexedChannelSummary.unknownCount})</option>
+                            </select>
+                        </div>
+                        <div class="filter-summary" aria-live="polite">
+                            <strong>{visibleItems.length}</strong>
+                            <span>of {results.unindexed?.length || 0} videos</span>
+                        </div>
+                    </div>
+                {/if}
                 <div class="table-shell">
                 <table class="recovery-table">
                     <thead>
@@ -945,7 +1026,7 @@
                         </tr>
                     </thead>
                     <tbody>
-                        {#each results[activeTab] || [] as item}
+                        {#each visibleItems as item}
                             <tr class:selected-row={selectedPaths.has(item.path)}>
                                 <td class="selection-column">
                                     <input
@@ -963,9 +1044,19 @@
                                     {item.filename || item.path}
                                 </td>
                                 <td>
-                                    {item.size_mb
-                                        ? item.size_mb + " MB"
-                                        : item.ta_source || "-"}
+                                    {#if activeTab === "unindexed"}
+                                        <span
+                                            class="source-channel-id"
+                                            title={sourceChannelId(item) || item.ta_source || "Unknown or non-source layout"}
+                                        >{sourceChannelId(item) || item.ta_source || "Unknown / other"}</span>
+                                        {#if item.size_mb !== undefined && item.size_mb !== null}
+                                            <span class="item-size"> · {item.size_mb} MB</span>
+                                        {/if}
+                                    {:else}
+                                        {item.size_mb
+                                            ? item.size_mb + " MB"
+                                            : item.ta_source || "-"}
+                                    {/if}
                                     {#if item.requires_destruct}
                                         <span class="source-flag">Source</span>
                                     {/if}
@@ -1035,16 +1126,17 @@
                                 </td>
                             </tr>
                         {/each}
-                        {#if !results[activeTab]?.length}
+                        {#if visibleItems.length === 0}
                             <tr>
                                 <td colspan="5" class="empty-cell">
                                     <i class="bi bi-folder2-open" aria-hidden="true"></i>
-                                    <span>No items in this view.</span>
+                                    <span>{activeTab === "unindexed" && selectedUnindexedChannel ? "No videos match this source channel filter." : "No items in this view."}</span>
                                 </td>
                             </tr>
                         {/if}
                     </tbody>
                 </table>
+                </div>
                 </div>
             {/if}
         </div>
@@ -1088,8 +1180,12 @@
                         {#if previewItem.video_id}
                             <span>ID {previewItem.video_id}</span>
                         {/if}
-                        {#if previewItem.channel || selectedChannel}
-                            <span>{previewItem.channel || selectedChannel}</span>
+                        {#if activeTab === "unindexed" && sourceChannelId(previewItem)}
+                            <span>{sourceChannelId(previewItem)}</span>
+                        {:else if previewItem.channel}
+                            <span>{previewItem.channel}</span>
+                        {:else if activeTab === "channels" && selectedChannel}
+                            <span>{selectedChannel}</span>
                         {/if}
                     </div>
 
@@ -1569,6 +1665,18 @@
         gap: 7px;
     }
 
+    .recovery-list-view {
+        display: grid;
+        height: 100%;
+        min-height: 0;
+        grid-template-rows: minmax(0, 1fr);
+    }
+
+    .recovery-list-view.has-filter {
+        grid-template-rows: auto minmax(0, 1fr);
+        gap: 7px;
+    }
+
     .channel-selector {
         display: flex;
         align-items: flex-end;
@@ -1601,6 +1709,29 @@
 
     .selector-refresh {
         height: 29px;
+    }
+
+    .filter-summary {
+        display: inline-flex;
+        height: 29px;
+        flex: 0 0 auto;
+        align-items: center;
+        gap: 4px;
+        padding: 3px 8px;
+        color: var(--muted);
+        background: var(--frame);
+        border: 1px solid var(--rule-dim);
+        font-size: 10px;
+        white-space: nowrap;
+    }
+
+    .filter-summary strong,
+    .source-channel-id {
+        color: var(--text);
+    }
+
+    .item-size {
+        color: var(--muted);
     }
 
     .table-shell {

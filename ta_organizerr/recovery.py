@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -34,6 +35,7 @@ from .utils import (
 RECOVERY_ALLOWED_BASES = (SOURCE_DIR, TARGET_DIR, HIDDEN_DIR, IMPORT_DIR)
 _MAX_DELETE_BATCH = 500
 _MAX_PATH_LENGTH = 4096
+_YOUTUBE_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 
 
 def _iter_video_files(root: Path):
@@ -205,6 +207,24 @@ def _record_lost_media(video_id: str, source: Path) -> None:
         conn.commit()
 
 
+def _source_channel_id(path: Path, source_dir: Path = SOURCE_DIR) -> str | None:
+    """Return a canonical channel ID encoded by TubeArchivist's source layout.
+
+    TubeArchivist stores source media below ``<source>/<channel id>/...``.  Do
+    not guess from organized display-name folders or filenames: only the first
+    component below the configured source root is authoritative, and only when
+    it has the canonical 24-character YouTube channel-ID shape.
+    """
+    try:
+        relative = path.relative_to(source_dir)
+    except ValueError:
+        return None
+    if len(relative.parts) < 2:
+        return None
+    candidate = relative.parts[0]
+    return candidate if _YOUTUBE_CHANNEL_ID_RE.fullmatch(candidate) else None
+
+
 def scan_for_unindexed_videos() -> dict[str, list[dict[str, Any]]]:
     log("🔍 Scanning for unindexed and legacy files...")
     video_map = fetch_all_metadata()
@@ -231,6 +251,7 @@ def scan_for_unindexed_videos() -> dict[str, list[dict[str, Any]]]:
             "video_id": vid_id,
             "size_mb": round(video_file.stat().st_size / (1024 * 1024), 2),
             "ta_source": "Source Dir",
+            "source_channel_id": _source_channel_id(video_file, SOURCE_DIR),
             "requires_destruct": True,
         }
         bucket = "lost" if vid_id in lost_ids else "unindexed"
@@ -251,6 +272,7 @@ def scan_for_unindexed_videos() -> dict[str, list[dict[str, Any]]]:
                     "video_id": vid_id,
                     "type": "target_realfile",
                     "ta_source": source_label,
+                    "source_channel_id": None,
                     "size_mb": size_mb,
                     "requires_destruct": False,
                 })

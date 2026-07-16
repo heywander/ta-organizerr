@@ -332,6 +332,94 @@ class AtomicRecoveryTests(unittest.TestCase):
             self.assertFalse(metadata_temp.exists())
 
 
+class UnindexedChannelAttributionTests(unittest.TestCase):
+    def test_valid_nested_source_channel_id_is_derived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            channel_id = "UC" + "A" * 22
+            media = source / channel_id / "nested" / f"{VIDEO_ID}.mp4"
+
+            self.assertEqual(
+                recovery._source_channel_id(media, source),
+                channel_id,
+            )
+
+    def test_invalid_channel_folder_and_direct_root_file_are_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+
+            self.assertIsNone(
+                recovery._source_channel_id(
+                    source / "Channel Name" / f"{VIDEO_ID}.mp4",
+                    source,
+                )
+            )
+            self.assertIsNone(
+                recovery._source_channel_id(source / f"{VIDEO_ID}.mp4", source)
+            )
+
+    def test_scan_preserves_two_distinct_source_channel_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            hidden = root / "hidden"
+            for directory in (source, target, hidden):
+                directory.mkdir()
+            first_channel = "UC" + "A" * 22
+            second_channel = "UC" + "B" * 22
+            first = source / first_channel / f"{VIDEO_ID}.mp4"
+            second = source / second_channel / "ABCDEFGHIJK.mkv"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            connection = Mock()
+            connection.execute.return_value.fetchall.return_value = []
+
+            with (
+                patch.object(recovery, "SOURCE_DIR", source),
+                patch.object(recovery, "TARGET_DIR", target),
+                patch.object(recovery, "HIDDEN_DIR", hidden),
+                patch.object(recovery, "fetch_all_metadata", return_value={}),
+                patch.object(recovery, "get_db", return_value=nullcontext(connection)),
+            ):
+                results = recovery.scan_for_unindexed_videos()
+
+            by_video_id = {row["video_id"]: row for row in results["unindexed"]}
+            self.assertEqual(by_video_id[VIDEO_ID]["source_channel_id"], first_channel)
+            self.assertEqual(
+                by_video_id["ABCDEFGHIJK"]["source_channel_id"],
+                second_channel,
+            )
+
+    def test_target_real_file_has_no_source_channel_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            target = root / "target"
+            hidden = root / "hidden"
+            for directory in (source, target, hidden):
+                directory.mkdir()
+            media = target / ("UC" + "A" * 22) / f"{VIDEO_ID}.mp4"
+            media.parent.mkdir()
+            media.write_bytes(b"target copy")
+            connection = Mock()
+            connection.execute.return_value.fetchall.return_value = []
+
+            with (
+                patch.object(recovery, "SOURCE_DIR", source),
+                patch.object(recovery, "TARGET_DIR", target),
+                patch.object(recovery, "HIDDEN_DIR", hidden),
+                patch.object(recovery, "fetch_all_metadata", return_value={}),
+                patch.object(recovery, "get_db", return_value=nullcontext(connection)),
+            ):
+                results = recovery.scan_for_unindexed_videos()
+
+            self.assertEqual(len(results["unindexed"]), 1)
+            self.assertIsNone(results["unindexed"][0]["source_channel_id"])
+
+
 class DeleteBatchSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
         media_reservations._reset_reservations_for_tests()
