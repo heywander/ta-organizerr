@@ -25,6 +25,9 @@ management, and optional FFmpeg transcoding.
   real files on a dedicated page before declaring a broken link truly missing.
 - Deep-scans damaged audio/video streams and creates separately validated,
   non-destructive salvage outputs from packets or frames FFmpeg can still read.
+- Investigates one raw source-channel ID at a time, persists whole-channel
+  decode results and human decisions, then publishes approved files as direct
+  exact-ID links under an administrator-named `[Recovered]` channel.
 - Stages recovered videos and metadata into `/app/import`.
 - Can transcode media to H.264/AAC with FFmpeg.
 - Supports Docker and Unraid-style `PUID`/`PGID` ownership.
@@ -159,6 +162,10 @@ the admin account. The password hash and generated Flask secret are stored in
   video_id/
     remux-job_id [video_id].mkv
     reencode-job_id [video_id].mkv
+
+/app/target/
+  The Oversphere [Recovered]/
+    8jaoFHJ0SQE.mp4 -> /host/source/path/UC.../8jaoFHJ0SQE.mp4
 ```
 
 Livestreams are placed below the channel folder:
@@ -191,6 +198,24 @@ migration.
   browser's container and codec support. **Listen only** provides a compatibility
   fallback by converting the first audio track to a non-seekable MP3 stream with
   FFmpeg; one compatibility stream can run at a time.
+- From **Recovery → Unindexed**, choose one exact raw `UC...` channel ID and
+  open **Investigate channel** to create or resume a durable review. **Inspect
+  all videos** applies the same strict Media Salvage diagnosis to each real,
+  non-empty exact-ID source file. Results are separated into **Likely usable**
+  and **Needs closer review**; this is triage, not proof that historical visual
+  or audible distortion is absent. Set an optional expected full duration when
+  a file appears clean but may contain only the first part of a longer video;
+  changing that baseline clears the old diagnosis and approval until the file
+  is inspected again. Preview or listen, then approve one physical candidate
+  per exact video ID. The final dry run creates only direct symlinks
+  named `<video-id><original-suffix>` beneath the chosen `<name> [Recovered]`
+  folder. It does not move, rename, copy, hardlink, transcode, or delete the
+  investigated source. Held and inconclusive items stay in durable case history
+  for later review, while successfully linked sources leave Unindexed. Saved
+  investigations remain selectable even after all their videos leave Unindexed.
+  Their **Published / link health** view can recreate an absent managed symlink
+  only from that item's original checksum-bound source; it never replaces a
+  real file, a wrong symlink, an unsafe path, or a mismatched database owner.
 - Link Reconciliation classifies healthy links, exact-ID repairs, ambiguous
   matches, invalid media, real files where links were expected, and truly
   missing entries. Repair is limited to one case-sensitive exact video-ID match;
@@ -248,6 +273,15 @@ bin and the filesystem and SQLite changes are not one atomic transaction, so a
 partially successful batch is possible. Confirm the displayed paths, review the
 returned per-item errors, keep a current backup, and test with one disposable
 video before running a large batch.
+
+Recovered-channel case sources and their managed links are excluded from the
+generic import, transcode, delete/destruct, and reconciliation mutation paths.
+Those guards also compare canonical entries and source identities so a spelling
+alias cannot bypass them. Organization revalidates the saved fingerprint and
+SHA-256 immediately before publishing, never overwrites an existing target, and
+uses no-follow directory descriptors so a raced Target or channel-folder swap
+cannot redirect publication. It logs each decision, job, failure, repair, and
+successful link in SQLite.
 
 Link Reconciliation has narrower guarded actions. **Remove Broken Link** accepts
 only a currently broken symlink with one exact database owner, removes that link

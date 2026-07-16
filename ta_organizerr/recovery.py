@@ -16,7 +16,13 @@ from typing import Any, Callable
 from .config import HIDDEN_DIR, IMPORT_DIR, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
+from .library_lock import LIBRARY_MUTATION_LOCK
 from .media_reservations import MediaReservationConflict, media_mutation_guard
+from .recovered_channels import (
+    RecoveredChannelMutationError,
+    is_recovered_media_path,
+    organized_recovered_video_ids,
+)
 from .ta_api import fetch_all_metadata
 from .utils import (
     extract_id_from_filename,
@@ -90,6 +96,20 @@ def _prepare_media_stage(source: Path, destination: Path) -> tuple[Path | None, 
     if not canonical_source.is_file():
         raise OSError(f"Source is not a regular file: {source}")
 
+    # A hard-link stage changes the source inode's link count/ctime again when
+    # an aborted import cleans its private stage. A recovered case could claim
+    # the source between those two moments and immediately inherit a stale
+    # fingerprint. Source-archive media is therefore always copy-staged: the
+    # long copy is read-only, and publication performs the authoritative
+    # ownership recheck under the shared writer lock.
+    if path_within(canonical_source, (SOURCE_DIR,)):
+        with LIBRARY_MUTATION_LOCK:
+            if is_recovered_media_path(canonical_source):
+                raise RecoveredChannelMutationError(
+                    "Recovered-channel source media is immutable; import copying is disabled"
+                )
+        return _copy_to_unique_temp(canonical_source, destination), "copied"
+
     for _ in range(10):
         temp_path = destination.parent / f".stage-{secrets.token_hex(12)}.tmp"
         try:
@@ -101,13 +121,32 @@ def _prepare_media_stage(source: Path, destination: Path) -> tuple[Path | None, 
                 paths=(canonical_source,),
                 action="hard-link this media while it is being processed",
             ):
+                if is_recovered_media_path(canonical_source):
+                    raise RecoveredChannelMutationError(
+                        "Recovered-channel source media is immutable; only its organized symlink may be created"
+                    )
                 os.link(canonical_source, temp_path)
             return temp_path, "hardlinked"
         except FileExistsError:
             continue
+        except RecoveredChannelMutationError:
+            raise
         except MediaReservationConflict:
+            # Copying is read-only, but serialize the immutable ownership check
+            # with case creation while the existing media reservation remains
+            # active in another worker.
+            with LIBRARY_MUTATION_LOCK:
+                if is_recovered_media_path(canonical_source):
+                    raise RecoveredChannelMutationError(
+                        "Recovered-channel source media is immutable; import copying is disabled"
+                    )
             return _copy_to_unique_temp(canonical_source, destination), "copied"
         except OSError:
+            with LIBRARY_MUTATION_LOCK:
+                if is_recovered_media_path(canonical_source):
+                    raise RecoveredChannelMutationError(
+                        "Recovered-channel source media is immutable; import copying is disabled"
+                    )
             return _copy_to_unique_temp(canonical_source, destination), "copied"
     raise OSError("Could not allocate a unique media staging path")
 
@@ -149,6 +188,8 @@ def _publish_import_pair(
     metadata_destination: Path,
     media_temp: Path | None,
     media_destination: Path,
+    *,
+    source: Path | None = None,
 ) -> None:
     """Publish metadata first and media last, rolling metadata back on error."""
     protected_paths = (media_destination,) if media_temp is not None else ()
@@ -156,9 +197,16 @@ def _publish_import_pair(
     metadata_published = False
     try:
         with media_mutation_guard(
-            paths=protected_paths,
+            paths=(*protected_paths, *((source,) if source is not None else ())),
             action="replace this imported media file",
         ):
+            # Defense in depth for callers that staged before the case claim
+            # reservation existed. Production callers also retain a source
+            # reservation across staging and this exact publication point.
+            if source is not None and is_recovered_media_path(source):
+                raise RecoveredChannelMutationError(
+                    "Source was claimed by a recovered-channel case before import publication"
+                )
             try:
                 if os.path.lexists(metadata_destination):
                     if metadata_destination.is_dir() and not metadata_destination.is_symlink():
@@ -229,6 +277,10 @@ def scan_for_unindexed_videos() -> dict[str, list[dict[str, Any]]]:
     log("🔍 Scanning for unindexed and legacy files...")
     video_map = fetch_all_metadata()
     known_ids = set(video_map.keys())
+    # A manually recovered video leaves Unindexed only after its exact source
+    # is backed by a current, database-owned symlink. Failed/held investigation
+    # items remain visible in their durable recovered-channel case.
+    known_ids.update(organized_recovered_video_ids())
 
     with get_db() as conn:
         lost_rows = conn.execute("SELECT video_id FROM lost_media").fetchall()
@@ -346,10 +398,17 @@ def recover_video_metadata(filepath: str) -> tuple[bool, str]:
 
     media_temp: Path | None = None
     try:
-        media_temp, method = _prepare_media_stage(src_path, dest_video)
-        _publish_import_pair(temp_json, dest_json, media_temp, dest_video)
+        canonical_source = src_path.resolve(strict=True)
+        media_temp, method = _prepare_media_stage(canonical_source, dest_video)
+        _publish_import_pair(
+            temp_json,
+            dest_json,
+            media_temp,
+            dest_video,
+            source=canonical_source,
+        )
         log(f"   📂 Media {method} atomically.")
-    except MediaReservationConflict:
+    except (MediaReservationConflict, RecoveredChannelMutationError):
         raise
     except OSError as exc:
         return False, f"Failed to stage recovery: {exc}"
@@ -384,16 +443,23 @@ def force_import(filepath: str) -> tuple[bool, str]:
     metadata_temp: Path | None = None
     try:
         dest_video = IMPORT_DIR / src_path.name
-        media_temp, method = _prepare_media_stage(src_path, dest_video)
+        canonical_source = src_path.resolve(strict=True)
+        media_temp, method = _prepare_media_stage(canonical_source, dest_video)
         metadata_temp = _write_json_temp(json_path, offline_meta)
-        _publish_import_pair(metadata_temp, json_path, media_temp, dest_video)
+        _publish_import_pair(
+            metadata_temp,
+            json_path,
+            media_temp,
+            dest_video,
+            source=canonical_source,
+        )
         log(f"   📂 Media {method} atomically.")
         log("   📝 Generated offline metadata.")
         with get_db() as conn:
             conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
             conn.commit()
         return True, "Force import successful"
-    except MediaReservationConflict:
+    except (MediaReservationConflict, RecoveredChannelMutationError):
         raise
     except OSError as exc:
         log(f"   ❌ Force import failed: {exc}")

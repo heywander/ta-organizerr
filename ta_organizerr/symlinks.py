@@ -13,6 +13,7 @@ from .db import get_db
 from .logging_util import log
 from .library_lock import LIBRARY_MUTATION_LOCK
 from .media_reservations import MediaReservationConflict, media_mutation_guard
+from .recovered_channels import update_recovered_paths_after_move
 from .ta_api import MetadataFetchError, fetch_all_metadata
 from .utils import (
     channel_component,
@@ -67,11 +68,25 @@ def check_orphaned_links() -> list[dict]:
         log("⚠️ Target/hidden directories do not exist")
         return orphaned
 
-    missing_rows: list[tuple[str, str, str, str, str]] = []
+    with get_db() as conn:
+        tracked_by_path = {
+            row["symlink"]: row
+            for row in conn.execute(
+                """
+                SELECT video_id, title, channel, published, symlink
+                FROM videos WHERE symlink IS NOT NULL
+                """
+            )
+            if isinstance(row["symlink"], str)
+        }
+
+    missing_rows: list[tuple[str, str, str, str | None, str]] = []
     for root in roots:
         if not root.exists():
             continue
-        for video_file in root.rglob("video.*"):
+        for video_file in root.rglob("*"):
+            if not is_video(video_file):
+                continue
             total_checked += 1
             if not video_file.is_symlink():
                 continue
@@ -88,12 +103,32 @@ def check_orphaned_links() -> list[dict]:
                     rel_parts = rel_parent.parts
                 except ValueError:
                     rel_parts = ()
-                channel_name = rel_parts[0] if rel_parts else "unknown"
+                tracked = tracked_by_path.get(str(video_file))
+                channel_name = (
+                    tracked["channel"]
+                    if tracked is not None and tracked["channel"]
+                    else rel_parts[0] if rel_parts else "unknown"
+                )
                 folder_name = rel_parts[-1] if rel_parts else video_file.parent.name
                 parts = folder_name.split(" - ", 1)
-                published = parts[0] if parts else "unknown"
-                title = parts[1] if len(parts) > 1 else folder_name
-                video_id = extract_id_from_filename(target.name) or target.stem or "unknown"
+                published = (
+                    tracked["published"]
+                    if tracked is not None
+                    else parts[0] if parts else "unknown"
+                )
+                title = (
+                    tracked["title"]
+                    if tracked is not None and tracked["title"]
+                    else parts[1] if len(parts) > 1 else folder_name
+                )
+                video_id = (
+                    tracked["video_id"]
+                    if tracked is not None
+                    else extract_id_from_filename(target.name)
+                    or extract_id_from_filename(video_file.name)
+                    or target.stem
+                    or "unknown"
+                )
                 orphaned.append({
                     "video_id": video_id,
                     "path": str(video_file),
@@ -125,6 +160,7 @@ def check_orphaned_links() -> list[dict]:
                     status = excluded.status,
                     last_updated = CURRENT_TIMESTAMP
                 WHERE videos.adopted_real = 0
+                  AND videos.status != 'recovered'
                 """,
                 missing_rows,
             )
@@ -196,6 +232,7 @@ def _migrate_channel_dir(wrong: Path, correct: Path) -> None:
             correct.parent.mkdir(parents=True, exist_ok=True)
             if not correct.exists():
                 shutil.move(str(wrong), str(correct))
+                update_recovered_paths_after_move(wrong, correct)
                 log(f"   [MOVE] Migrated {wrong.name} to {correct.parent.name}")
                 return
             for item in list(wrong.iterdir()):
@@ -206,6 +243,7 @@ def _migrate_channel_dir(wrong: Path, correct: Path) -> None:
                 wrong.rmdir()
             except OSError:
                 pass
+            update_recovered_paths_after_move(wrong, correct)
     except MediaReservationConflict as exc:
         log(f"   ⏳ Deferred channel migration {wrong.name}: {exc}")
     except (OSError, shutil.Error) as exc:
@@ -462,7 +500,7 @@ def _process_videos_unlocked() -> str | None:
     with get_db() as conn:
         rows = conn.execute("SELECT channel_name FROM hidden_channels").fetchall()
         prior_link_rows = conn.execute(
-            "SELECT video_id, symlink, adopted_real FROM videos WHERE symlink IS NOT NULL"
+            "SELECT video_id, symlink, adopted_real, status FROM videos WHERE symlink IS NOT NULL"
         ).fetchall()
     hidden_channels = {row["channel_name"] for row in rows}
     all_channel_names = {
@@ -476,6 +514,14 @@ def _process_videos_unlocked() -> str | None:
     cleanup_old_folders()
     _enforce_hidden_locations(hidden_channels, component_map)
     managed_link_index = _index_managed_links(prior_link_rows)
+    # A recovered link is an explicit human classification backed by a durable
+    # inspection record. A later TubeArchivist metadata appearance must not
+    # silently replace or retire that raw-ID link during the automatic scan.
+    recovered_ids = {
+        row["video_id"]
+        for row in prior_link_rows
+        if "status" in row.keys() and row["status"] == "recovered"
+    }
     adopted_paths: dict[str, Path] = {}
     adopted_updates: list[tuple[str, str, str]] = []
     for row in prior_link_rows:
@@ -523,6 +569,8 @@ def _process_videos_unlocked() -> str | None:
             if not video_file.is_file() or not is_video(video_file):
                 continue
             video_id = extract_id_from_filename(video_file.name) or video_file.stem
+            if video_id in recovered_ids:
+                continue
             meta = video_map.get(video_id)
             if not meta:
                 continue

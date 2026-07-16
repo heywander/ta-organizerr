@@ -994,6 +994,18 @@ def _classify_entry(
     elif status == "repair_available" and candidates and not automatic_candidate_safe:
         detail += " The exact match is in the other managed mount; preview it, then repair manually because no portable host path is configured."
 
+    if db_record and db_record.get("status") == "recovered":
+        # Recovered-channel ownership is backed by a durable human review and
+        # immutable-source checksum. Generic reconciliation must not repoint,
+        # adopt, or delete that ownership behind the case workflow's back.
+        allowed_actions = [
+            action for action in allowed_actions if action == "preview_candidate"
+        ]
+        detail += (
+            " This entry belongs to a recovered-channel case; mutating actions "
+            "are managed only from that case."
+        )
+
     link = {
         "path": link_path,
         "exists": fs_entry is not None,

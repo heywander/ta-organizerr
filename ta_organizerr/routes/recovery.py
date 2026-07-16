@@ -29,6 +29,10 @@ from ..recovery import (
     recover_video_metadata,
     scan_for_unindexed_videos,
 )
+from ..recovered_channels import (
+    RecoveredChannelMutationError,
+    is_recovered_media_path,
+)
 from ..ta_api import MetadataFetchError, fetch_all_metadata
 from ..transcode import delete_source_if_idle
 from ..utils import (
@@ -711,9 +715,13 @@ def api_recovery_start():
     media_path, error = _validated_media_source(data.get("filepath"))
     if error:
         return error
+    if is_recovered_media_path(media_path):
+        return jsonify({
+            "error": "Recovered-channel source media is immutable; use its channel case"
+        }), 409
     try:
         success, msg = recover_video_metadata(str(media_path))
-    except MediaReservationConflict as exc:
+    except (MediaReservationConflict, RecoveredChannelMutationError) as exc:
         return jsonify({"error": str(exc)}), 409
     log(f"Recovery Result for {media_path}: {msg}")
     return jsonify({
@@ -732,10 +740,14 @@ def api_recovery_force():
     media_path, error = _validated_media_source(data.get("filepath"))
     if error:
         return error
+    if is_recovered_media_path(media_path):
+        return jsonify({
+            "error": "Recovered-channel source media is immutable; use its channel case"
+        }), 409
     log(f"💪 Force Importing (Lost Media): {media_path.name}")
     try:
         success, msg = force_import(str(media_path))
-    except MediaReservationConflict as exc:
+    except (MediaReservationConflict, RecoveredChannelMutationError) as exc:
         return jsonify({"error": str(exc)}), 409
     if success:
         return jsonify({"success": True, "message": msg})
@@ -762,6 +774,8 @@ def api_recovery_delete():
             allowed_bases=RECOVERY_ALLOWED_BASES,
             source_dir=SOURCE_DIR,
         )
+        if candidate_error is None and is_recovered_media_path(p):
+            candidate_error = "Recovered-channel media is immutable and cannot be deleted"
         if candidate_error:
             status = 404 if candidate_error == "File not found" else 400
             return jsonify({"error": candidate_error}), status
@@ -822,6 +836,8 @@ def api_recovery_delete_batch():
             allowed_bases=RECOVERY_ALLOWED_BASES,
             source_dir=SOURCE_DIR,
         )
+        if candidate_error is None and is_recovered_media_path(p):
+            candidate_error = "Recovered-channel media is immutable and cannot be deleted"
         if candidate_error:
             fail_count += 1
             err = f"{candidate_error}: {path}"
@@ -851,6 +867,10 @@ def api_recovery_delete_batch():
                     allowed_bases=RECOVERY_ALLOWED_BASES,
                     source_dir=SOURCE_DIR,
                 )
+                if candidate_error is None and is_recovered_media_path(p):
+                    candidate_error = (
+                        "Recovered-channel media is immutable and cannot be deleted"
+                    )
                 if candidate_error:
                     raise OSError(candidate_error)
 
@@ -877,6 +897,10 @@ def api_recovery_delete_batch():
                     if source_path is None:
                         raise OSError(
                             f"Exact source file not found for video ID {vid_id or 'unknown'}"
+                        )
+                    if is_recovered_media_path(source_path):
+                        raise OSError(
+                            "Resolved source belongs to an immutable recovered-channel case"
                         )
                     delete_source_if_idle(source_path)
                     filesystem_changed = True

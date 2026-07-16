@@ -8,7 +8,9 @@ from flask import Blueprint, jsonify, request
 from ..auth import requires_auth
 from ..db import get_db
 from ..logging_util import read_transcode_logs, tlog
+from ..library_lock import LIBRARY_MUTATION_LOCK
 from ..recovery import RECOVERY_ALLOWED_BASES
+from ..recovered_channels import is_recovered_media_path
 from ..transcode import detect_encoder, start_transcode_job
 from ..utils import clamp_pagination, path_in_allowed_tree
 
@@ -78,10 +80,18 @@ def api_transcode_start():
         return jsonify({"error": "Invalid filepath"}), 400
     if not path_in_allowed_tree(Path(filepath), RECOVERY_ALLOWED_BASES):
         return jsonify({"error": "Path outside allowed directories"}), 400
+    with LIBRARY_MUTATION_LOCK:
+        if is_recovered_media_path(filepath):
+            return jsonify({
+                "error": (
+                    "Recovered-channel source media is immutable. Transcoding this "
+                    "path in place is disabled."
+                )
+            }), 409
 
-    encoder = detect_encoder()
-    tlog(f"🖥️  Selected encoder: {encoder}")
-    started, message = start_transcode_job(filepath, encoder)
+        encoder = detect_encoder()
+        tlog(f"🖥️  Selected encoder: {encoder}")
+        started, message = start_transcode_job(filepath, encoder)
     if not started:
         message_lower = message.lower()
         if "already" in message_lower or "currently in use" in message_lower:

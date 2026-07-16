@@ -41,6 +41,80 @@ CREATE TABLE IF NOT EXISTS app_config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recovered_channel_cases (
+    case_id TEXT PRIMARY KEY,
+    source_channel_id TEXT NOT NULL UNIQUE,
+    target_channel_name TEXT NOT NULL,
+    target_component TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'draft',
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS recovered_channel_items (
+    item_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    suffix TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    device INTEGER NOT NULL,
+    inode INTEGER NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    ctime_ns INTEGER NOT NULL,
+    sha256 TEXT,
+    inspection_status TEXT NOT NULL DEFAULT 'pending',
+    health_tier TEXT,
+    diagnosis_json TEXT,
+    expected_duration_seconds REAL,
+    decision TEXT NOT NULL DEFAULT 'pending',
+    organized_path TEXT,
+    organized_at TIMESTAMP,
+    error TEXT,
+    manual_title TEXT,
+    manual_published TEXT,
+    metadata_source_url TEXT,
+    metadata_notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(case_id, source_path)
+);
+CREATE INDEX IF NOT EXISTS idx_recovered_items_case
+    ON recovered_channel_items(case_id, inspection_status, health_tier, decision);
+CREATE INDEX IF NOT EXISTS idx_recovered_items_video
+    ON recovered_channel_items(video_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_recovered_one_approved_candidate
+    ON recovered_channel_items(case_id, video_id)
+    WHERE decision = 'approved';
+CREATE TABLE IF NOT EXISTS recovered_channel_jobs (
+    job_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    current INTEGER NOT NULL DEFAULT 0,
+    total INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    cancel_requested BOOLEAN NOT NULL DEFAULT 0,
+    payload_json TEXT,
+    error TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_recovered_jobs_case
+    ON recovered_channel_jobs(case_id, created_at);
+CREATE TABLE IF NOT EXISTS recovered_channel_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id TEXT NOT NULL,
+    item_id TEXT,
+    actor TEXT,
+    event TEXT NOT NULL,
+    details_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_recovered_events_case
+    ON recovered_channel_events(case_id, event_id);
 """
 
 _MIGRATIONS = [
@@ -91,6 +165,36 @@ def init_db() -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+        # Versions before the active-job uniqueness invariant could race two
+        # queued jobs into one case. Normalize such rows before adding the
+        # partial index or an upgrade would fail on every startup. The newest
+        # inserted row remains resumable; older active rows become durable,
+        # explicitly interrupted history.
+        conn.execute(
+            """
+            UPDATE recovered_channel_jobs
+            SET status = 'interrupted',
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                error = COALESCE(
+                    error,
+                    'Interrupted during upgrade: a newer active case job superseded this row'
+                )
+            WHERE status IN ('queued', 'running', 'cancelling')
+              AND rowid NOT IN (
+                  SELECT MAX(rowid)
+                  FROM recovered_channel_jobs
+                  WHERE status IN ('queued', 'running', 'cancelling')
+                  GROUP BY case_id
+              )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_recovered_one_active_job
+            ON recovered_channel_jobs(case_id)
+            WHERE status IN ('queued', 'running', 'cancelling')
+            """
+        )
         conn.commit()
 
 

@@ -1,5 +1,10 @@
 <script lang="ts">
     import { createEventDispatcher, onMount, onDestroy, tick } from "svelte";
+    import RecoveredChannelWorkflow from "./RecoveredChannelWorkflow.svelte";
+    import {
+        normalizeRecoveredChannelInvestigation,
+        type RecoveredChannelInvestigation,
+    } from "../lib/recoveredChannel";
     const dispatch = createEventDispatcher();
 
     type RecoveryTab =
@@ -49,6 +54,14 @@
     let channelRequestSequence = 0;
     let channelAbortController: AbortController | null = null;
     let selectedUnindexedChannel = "";
+    let recoveredChannelWorkflowId = "";
+    let recoveredChannelWorkflowDirty = false;
+    let recoveredInventoryRefreshRequested = false;
+    let savedRecoveredCases: RecoveredChannelInvestigation[] = [];
+    let loadingSavedRecoveredCases = false;
+    let savedRecoveredCasesError: string | null = null;
+    let investigateChannelButton: HTMLButtonElement | null = null;
+    let unindexedChannelSelect: HTMLSelectElement | null = null;
     let mobileView =
         typeof window !== "undefined" && window.matchMedia(MOBILE_QUERY).matches;
     let mobileVisibleCount = MOBILE_BATCH_SIZE;
@@ -149,6 +162,46 @@
         };
     }
 
+    function savedCaseForChannel(
+        channelId: string,
+    ): RecoveredChannelInvestigation | null {
+        return (
+            savedRecoveredCases.find(
+                (item) => item.source_channel_id === channelId,
+            ) || null
+        );
+    }
+
+    async function fetchSavedRecoveredCases() {
+        if (loadingSavedRecoveredCases) return;
+        loadingSavedRecoveredCases = true;
+        savedRecoveredCasesError = null;
+        try {
+            const data = await readResponse(
+                await fetch("/api/recovery/channel-cases"),
+            );
+            const rawCases = Array.isArray(data?.cases) ? data.cases : [];
+            const byChannel = new Map<string, RecoveredChannelInvestigation>();
+            for (const raw of rawCases) {
+                const normalized = normalizeRecoveredChannelInvestigation({
+                    case: raw,
+                });
+                if (
+                    normalized.id &&
+                    normalized.source_channel_id &&
+                    !byChannel.has(normalized.source_channel_id)
+                ) {
+                    byChannel.set(normalized.source_channel_id, normalized);
+                }
+            }
+            savedRecoveredCases = Array.from(byChannel.values());
+        } catch (error) {
+            savedRecoveredCasesError = messageFrom(error);
+        } finally {
+            loadingSavedRecoveredCases = false;
+        }
+    }
+
     function resetMobileBatch() {
         mobileVisibleCount = MOBILE_BATCH_SIZE;
     }
@@ -193,11 +246,19 @@
     }
 
     function closeRecoveryModal() {
+        if (
+            recoveredChannelWorkflowId &&
+            recoveredChannelWorkflowDirty &&
+            !confirm(
+                "Close Recovery and discard unsaved expected-duration edits?",
+            )
+        )
+            return;
         closePreview(false);
         dispatch("close");
     }
 
-    function openPreview(item: RecoveryItem) {
+    function openPreview(item: RecoveryItem, mode: "video" | "audio" = "video") {
         if (!itemPath(item)) {
             recordError("Preview unavailable", "This item has no readable media path");
             return;
@@ -208,7 +269,8 @@
                 ? document.activeElement
                 : null;
         previewItem = item;
-        void startVideoPreview();
+        if (mode === "audio") void startAudioPreview();
+        else void startVideoPreview();
         void tick().then(() => previewCloseButton?.focus());
     }
 
@@ -708,7 +770,60 @@
         resetMobileBatch();
     }
 
+    function openRecoveredChannelWorkflow() {
+        const savedCase = savedCaseForChannel(selectedUnindexedChannel);
+        if (
+            !selectedUnindexedChannel ||
+            selectedUnindexedChannel === UNKNOWN_SOURCE_CHANNEL ||
+            (visibleItems.length === 0 && !savedCase)
+        )
+            return;
+        destructMode = false;
+        selectedPaths = new Set();
+        recoveredChannelWorkflowDirty = false;
+        recoveredInventoryRefreshRequested = false;
+        recoveredChannelWorkflowId = selectedUnindexedChannel;
+    }
+
+    function handleRecoveredChannelExit(
+        event: CustomEvent<{ changed: boolean }>,
+    ) {
+        recoveredChannelWorkflowId = "";
+        recoveredChannelWorkflowDirty = false;
+        selectedPaths = new Set();
+        void fetchSavedRecoveredCases();
+        if (event.detail.changed && !recoveredInventoryRefreshRequested)
+            void startScan();
+        void tick().then(() => {
+            if (investigateChannelButton && !investigateChannelButton.disabled)
+                investigateChannelButton.focus();
+            else unindexedChannelSelect?.focus();
+        });
+    }
+
+    function handleRecoveredChannelOrganized() {
+        recoveredInventoryRefreshRequested = true;
+        void fetchSavedRecoveredCases();
+        void startScan();
+    }
+
+    function handleRecoveredChannelDirty(
+        event: CustomEvent<{ dirty: boolean }>,
+    ) {
+        recoveredChannelWorkflowDirty = event.detail.dirty;
+    }
+
+    function handleRecoveredChannelPreview(
+        event: CustomEvent<{
+            item: RecoveryItem;
+            mode: "video" | "audio";
+        }>,
+    ) {
+        openPreview(event.detail.item, event.detail.mode);
+    }
+
     function selectRecoveryTab(tab: RecoveryTab, focusTab = false) {
+        recoveredChannelWorkflowId = "";
         activeTab = tab;
         selectedPaths = new Set();
         resetMobileBatch();
@@ -740,12 +855,21 @@
     $: unindexedChannelSummary = summarizeUnindexedChannels(
         results.unindexed || [],
     );
+    $: selectedSavedRecoveredCase = savedCaseForChannel(
+        selectedUnindexedChannel,
+    );
+    $: savedOnlyRecoveredCases = savedRecoveredCases.filter(
+        (savedCase) =>
+            !unindexedChannelSummary.channels.some(
+                (channel) => channel.id === savedCase.source_channel_id,
+            ),
+    );
     $: selectedUnindexedChannelMissing =
         selectedUnindexedChannel !== "" &&
         selectedUnindexedChannel !== UNKNOWN_SOURCE_CHANNEL &&
         !unindexedChannelSummary.channels.some(
             (channel) => channel.id === selectedUnindexedChannel,
-        );
+        ) && !selectedSavedRecoveredCase;
     $: visibleItems = activeTab === "channels"
         ? channelVideos
         : activeTab === "unindexed" && selectedUnindexedChannel
@@ -788,6 +912,7 @@
         mobileView = mobileMediaQuery.matches;
         mobileMediaQuery.addEventListener("change", handleMobileViewChange);
         fetchChannels();
+        void fetchSavedRecoveredCases();
         checkPermissions();
         void tick().then(() => recoveryCloseButton?.focus());
     });
@@ -853,6 +978,7 @@
             </div>
         {/if}
 
+        {#if !recoveredChannelWorkflowId}
         <div class="recovery-toolbar">
             <div class="toolbar-actions">
                 <button
@@ -917,14 +1043,26 @@
                 </button>
             {/each}
         </div>
+        {/if}
 
         <div
             id="recovery-tab-panel"
             class="workspace-content"
-            role="tabpanel"
-            aria-labelledby={`recovery-tab-${activeTab}`}
+            class:workflow-active={Boolean(recoveredChannelWorkflowId)}
+            role={recoveredChannelWorkflowId ? "region" : "tabpanel"}
+            aria-label={recoveredChannelWorkflowId ? "Recovered channel workflow" : undefined}
+            aria-labelledby={recoveredChannelWorkflowId ? undefined : `recovery-tab-${activeTab}`}
         >
-            {#if activeTab === "channels"}
+            {#if recoveredChannelWorkflowId}
+                <RecoveredChannelWorkflow
+                    sourceChannelId={recoveredChannelWorkflowId}
+                    sourceItems={visibleItems}
+                    on:exit={handleRecoveredChannelExit}
+                    on:organized={handleRecoveredChannelOrganized}
+                    on:dirtychange={handleRecoveredChannelDirty}
+                    on:preview={handleRecoveredChannelPreview}
+                />
+            {:else if activeTab === "channels"}
                 <div class="channel-view">
                     <div class="channel-selector">
                         <div class="field-group">
@@ -1067,8 +1205,14 @@
                 {#if activeTab === "unindexed"}
                     <div class="channel-selector unindexed-channel-selector">
                         <div class="field-group">
-                            <label for="recovery-unindexed-channel">Source channel ID</label>
+                            <label for="recovery-unindexed-channel">
+                                Source channel ID
+                                <span class:saved-case-error={Boolean(savedRecoveredCasesError)} title={savedRecoveredCasesError || undefined}>
+                                    {loadingSavedRecoveredCases ? "loading history" : savedRecoveredCasesError ? "history unavailable" : `${savedRecoveredCases.length} saved`}
+                                </span>
+                            </label>
                             <select
+                                bind:this={unindexedChannelSelect}
                                 id="recovery-unindexed-channel"
                                 value={selectedUnindexedChannel}
                                 on:change={handleUnindexedChannelFilter}
@@ -1078,8 +1222,15 @@
                                     <option value={selectedUnindexedChannel}>{selectedUnindexedChannel} (0)</option>
                                 {/if}
                                 {#each unindexedChannelSummary.channels as channel}
-                                    <option value={channel.id}>{channel.id} ({channel.count})</option>
+                                    <option value={channel.id}>{channel.id} ({channel.count}){savedCaseForChannel(channel.id) ? " · saved investigation" : ""}</option>
                                 {/each}
+                                {#if savedOnlyRecoveredCases.length > 0}
+                                    <optgroup label="Saved investigations — no current unindexed videos">
+                                        {#each savedOnlyRecoveredCases as savedCase}
+                                            <option value={savedCase.source_channel_id}>{savedCase.source_channel_id} · {savedCase.target_folder_name || savedCase.channel_name} · {savedCase.repair_needed > 0 ? `${savedCase.repair_needed} link repair` : savedCase.status}</option>
+                                        {/each}
+                                    </optgroup>
+                                {/if}
                                 <option value={UNKNOWN_SOURCE_CHANNEL}>Unknown / other ({unindexedChannelSummary.unknownCount})</option>
                             </select>
                         </div>
@@ -1087,6 +1238,25 @@
                             <strong>{visibleItems.length}</strong>
                             <span>of {results.unindexed?.length || 0} videos</span>
                         </div>
+                        <button
+                            bind:this={investigateChannelButton}
+                            class="button investigate-channel-action"
+                            type="button"
+                            on:click={openRecoveredChannelWorkflow}
+                            disabled={!selectedUnindexedChannel || selectedUnindexedChannel === UNKNOWN_SOURCE_CHANNEL || (visibleItems.length === 0 && !selectedSavedRecoveredCase)}
+                            title={
+                                selectedUnindexedChannel === UNKNOWN_SOURCE_CHANNEL
+                                    ? "A canonical source channel ID is required"
+                                    : selectedSavedRecoveredCase
+                                      ? "Resume this saved recovered-channel investigation and check published links"
+                                    : selectedUnindexedChannel
+                                      ? "Inspect and organize this recovered channel"
+                                      : "Choose a source channel ID first"
+                            }
+                        >
+                            <i class="bi bi-collection-play" aria-hidden="true"></i>
+                            {selectedSavedRecoveredCase ? "Resume investigation" : "Investigate channel"}
+                        </button>
                     </div>
                 {/if}
                 <div class="table-shell">
@@ -1786,6 +1956,16 @@
         background: var(--canvas);
     }
 
+    .workspace-content.workflow-active {
+        padding: 0;
+    }
+
+    .investigate-channel-action {
+        height: 29px;
+        flex: 0 0 auto;
+        white-space: nowrap;
+    }
+
     .channel-view {
         display: grid;
         height: 100%;
@@ -1820,11 +2000,18 @@
     }
 
     .field-group label {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
         color: var(--muted);
         font-size: 10px;
         font-weight: 700;
         text-transform: uppercase;
     }
+
+    .field-group label span { color: var(--text-secondary); font-size: 9px; font-weight: 400; text-transform: none; }
+    .field-group label span.saved-case-error { color: var(--danger-text); }
 
     .field-group select {
         width: 100%;
@@ -2460,7 +2647,8 @@
 
         .field-group select,
         .selector-refresh,
-        .filter-summary {
+        .filter-summary,
+        .investigate-channel-action {
             height: 44px;
             min-height: 44px;
         }
@@ -2472,7 +2660,8 @@
         }
 
         .unindexed-channel-selector .field-group,
-        .filter-summary {
+        .filter-summary,
+        .investigate-channel-action {
             width: 100%;
         }
 

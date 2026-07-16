@@ -9,6 +9,7 @@ from ..auth import requires_auth
 from ..db import get_db
 from ..logging_util import read_logs
 from ..library_lock import LIBRARY_MUTATION_LOCK
+from ..recovered_channels import organized_recovered_video_ids
 from ..symlinks import cleanup_old_folders, process_videos, scan_is_running
 
 
@@ -30,9 +31,17 @@ def api_status():
                 "status": row["status"],
             })
     total = len(videos)
-    healthy_statuses = {"linked", "adopted"}
-    linked = sum(1 for v in videos if v["status"] in healthy_statuses)
-    missing = sum(1 for v in videos if v["status"] not in healthy_statuses)
+    healthy_recovered_ids = organized_recovered_video_ids()
+    linked = sum(
+        1
+        for video in videos
+        if video["status"] in {"linked", "adopted"}
+        or (
+            video["status"] == "recovered"
+            and video["video_id"] in healthy_recovered_ids
+        )
+    )
+    missing = total - linked
     return jsonify({
         "total_videos": total,
         "verified_links": linked,
