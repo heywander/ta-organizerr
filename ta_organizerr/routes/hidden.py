@@ -24,8 +24,11 @@ def api_get_hidden():
 @bp.route("", methods=["POST"])
 @requires_auth
 def api_add_hidden():
-    data = request.get_json(silent=True) or {}
-    channel = (data.get("channel") or "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    raw_channel = data.get("channel")
+    channel = raw_channel.strip() if isinstance(raw_channel, str) else ""
     if not channel:
         return jsonify({"error": "No channel name provided"}), 400
     with get_db() as conn:
@@ -38,8 +41,11 @@ def api_add_hidden():
 @bp.route("", methods=["DELETE"])
 @requires_auth
 def api_remove_hidden():
-    data = request.get_json(silent=True) or {}
-    channel = (data.get("channel") or "").strip()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
+    raw_channel = data.get("channel")
+    channel = raw_channel.strip() if isinstance(raw_channel, str) else ""
     if not channel:
         return jsonify({"error": "No channel name provided"}), 400
     with get_db() as conn:

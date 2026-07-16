@@ -6,11 +6,22 @@
     let checkingOrphans = false;
     let orphanResult: string | null = null;
 
+    async function readResponse(res: Response): Promise<any> {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(
+                body.error || body.message || `Request failed with status ${res.status}`,
+            );
+        }
+        return body;
+    }
+
     async function triggerScan() {
         if (!confirm("Start full library scan?")) return;
         scanning = true;
         try {
-            await fetch("/api/scan", { method: "POST" });
+            const res = await fetch("/api/scan", { method: "POST" });
+            await readResponse(res);
             dispatch("scan");
             // Reset scanning state after a bit since it's async background
             setTimeout(() => (scanning = false), 2000);
@@ -27,7 +38,7 @@
             const res = await fetch("/api/check-orphans", {
                 method: "POST",
             });
-            const data = await res.json();
+            const data = await readResponse(res);
             if (data.count === 0) {
                 orphanResult = "✅ All systems nominal. No orphans.";
             } else {

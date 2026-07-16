@@ -52,5 +52,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 # Single worker because the scheduler runs in-process; multiple workers would
 # scan in parallel and clobber the DB.
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", \
-     "--timeout", "300", "--access-logfile", "-", "ta_organizerr.wsgi:app"]
+CMD ["sh", "-c", "exec gunicorn --bind \"${HOST:-0.0.0.0}:${PORT:-5000}\" --workers 1 --threads 4 --timeout 300 --access-logfile - ta_organizerr.wsgi:app"]

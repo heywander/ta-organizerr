@@ -10,6 +10,8 @@ from .auth import get_or_create_secret_key
 from .config import (
     ALLOWED_IPS,
     FLASK_SECRET_KEY_ENV,
+    HOST_SOURCE_BASE,
+    HOST_SOURCE_BASE_CONFIGURED,
     SESSION_COOKIE_SECURE,
     SESSION_LIFETIME_SECONDS,
     STATIC_FOLDER,
@@ -65,7 +67,15 @@ def _apply_security_headers(response):
 
 
 def create_app(initialize_db: bool = True) -> Flask:
-    app = Flask(__name__, static_folder=STATIC_FOLDER, static_url_path="/")
+    # Static files are served through routes/pages.py so built HTML shells cannot
+    # bypass their authentication gates via Flask's automatic static catch-all.
+    app = Flask(__name__, static_folder=None)
+    app.config["STATIC_BUILD_FOLDER"] = STATIC_FOLDER
+    if not HOST_SOURCE_BASE_CONFIGURED:
+        log(
+            "⚠️ HOST_SOURCE_BASE is unset; using legacy fallback "
+            f"{HOST_SOURCE_BASE}. Set it explicitly before the fallback is removed."
+        )
     if initialize_db:
         init_db_with_retry()
 

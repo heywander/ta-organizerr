@@ -18,10 +18,18 @@
     let error: string | null = null;
     let showRecovery = false;
     let showHiddenManager = false;
+    let requestInFlight = false;
+    let refreshQueued = false;
+    let destroyed = false;
 
     let interval: ReturnType<typeof setInterval>;
 
     async function fetchData() {
+        if (requestInFlight) {
+            refreshQueued = true;
+            return;
+        }
+        requestInFlight = true;
         try {
             const res = await fetch("/api/status");
             if (res.status === 401) {
@@ -43,6 +51,12 @@
             console.error("Fetch error", e);
             error = e.toString();
             loading = false;
+        } finally {
+            requestInFlight = false;
+            if (refreshQueued && !destroyed) {
+                refreshQueued = false;
+                void fetchData();
+            }
         }
     }
 
@@ -58,8 +72,12 @@
     });
 
     onDestroy(() => {
+        destroyed = true;
         clearInterval(interval);
     });
+
+    $: systemStatus = loading ? "CHECKING" : error ? "OFFLINE" : "ONLINE";
+    $: systemColor = error ? "red" : loading ? "yellow" : "pink";
 </script>
 
 <div class="space-y-8">
@@ -86,11 +104,20 @@
         <!-- Placeholder for symmetry or future stat -->
         <StatsCard
             title="System Status"
-            value="ONLINE"
-            color="pink"
+            value={systemStatus}
+            color={systemColor}
             icon="bi-cpu"
         />
     </div>
+
+    {#if error}
+        <div
+            class="rounded border border-red-500/40 bg-red-900/20 px-4 py-3 text-sm text-red-300"
+            role="alert"
+        >
+            Status refresh failed: {error}
+        </div>
+    {/if}
 
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
         <div class="lg:col-span-1 space-y-6">

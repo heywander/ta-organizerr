@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
+import unicodedata
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -12,6 +14,9 @@ _VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
 _YOUTUBE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 _BRACKETED_ID_RE = re.compile(r"\[([a-zA-Z0-9_-]{11})\]$")
 _FILENAME_INVALID_RE = re.compile(r'[\/:*?"<>|]')
+_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MAX_COMPONENT_LENGTH = 200
+_SAFE_COMPONENT_FALLBACK = "untitled"
 
 
 def is_video(path: str | Path) -> bool:
@@ -37,8 +42,27 @@ def extract_id_from_filename(filename: str) -> Optional[str]:
 
 def sanitize(text: str) -> str:
     text = text.encode("ascii", "ignore").decode()
+    text = _CONTROL_CHARACTER_RE.sub("", text)
     text = _FILENAME_INVALID_RE.sub("_", text)
-    return text.strip()
+    text = text.strip()[:_MAX_COMPONENT_LENGTH].rstrip()
+    if text in {"", ".", ".."}:
+        return _SAFE_COMPONENT_FALLBACK
+    return text
+
+
+def channel_component(channel_name: str) -> str:
+    """Return a readable, stable, collision-resistant channel directory name.
+
+    Existing names that are unchanged by sanitization retain their historical
+    layout. Lossy names get a stable digest independent of other channels, so
+    directory identity cannot change when the library membership changes.
+    """
+    normalized = unicodedata.normalize("NFC", str(channel_name)).strip()
+    safe = sanitize(normalized)
+    if safe == normalized and safe != _SAFE_COMPONENT_FALLBACK:
+        return safe
+    digest = hashlib.blake2b(normalized.encode("utf-8"), digest_size=5).hexdigest()
+    return f"{safe} [{digest}]"
 
 
 def _relative_to(candidate: Path, base: Path) -> Path | None:
@@ -73,7 +97,7 @@ def translate_host_path(host_path: Optional[str | Path]) -> Optional[Path]:
     p = Path(host_path)
     if _relative_to(p, SOURCE_DIR) is not None:
         return p
-    for prefix in (Path("/mnt/user/tubearchives/bp"), HOST_SOURCE_BASE):
+    for prefix in (HOST_SOURCE_BASE, Path("/mnt/user/tubearchives/bp")):
         rel = _relative_to(p, prefix)
         if rel is not None:
             return SOURCE_DIR / rel
@@ -107,20 +131,31 @@ def path_within(candidate: Path, allowed_bases: Iterable[Path], *, follow_symlin
     """
     try:
         resolved = candidate.resolve(strict=False) if follow_symlinks else Path(os.path.abspath(candidate))
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return False
     for base in allowed_bases:
         try:
             resolved.relative_to(base.resolve(strict=False))
             return True
-        except ValueError:
+        except (OSError, RuntimeError, ValueError):
             continue
     return False
 
 
 def path_in_allowed_tree(candidate: Path, allowed_bases: Iterable[Path]) -> bool:
-    """Validate the directory entry without following the final symlink."""
-    return path_within(candidate, allowed_bases, follow_symlinks=False)
+    """Validate a directory entry while preserving the final symlink.
+
+    Ancestor symlinks must still be resolved: otherwise an entry such as
+    ``allowed/jump/file`` could pass a lexical check even when ``jump`` points
+    outside the allowed tree.  Resolving only the parent keeps deletion of a
+    final symlink safe without trusting symlinked directories above it.
+    """
+    try:
+        resolved_parent = candidate.parent.resolve(strict=False)
+        entry_path = resolved_parent / candidate.name
+    except (OSError, RuntimeError):
+        return False
+    return path_within(entry_path, allowed_bases, follow_symlinks=False)
 
 
 def clamp_pagination(page: object, per_page: object, default_per_page: int = 100) -> tuple[int, int]:

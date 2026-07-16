@@ -1,6 +1,7 @@
 """SQLite connection management and schema bootstrap."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import sys
 import time
@@ -57,8 +58,29 @@ def get_db() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _prepare_db_path() -> None:
+    """Create private state paths before SQLite or secrets touch them."""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        DB_PATH.parent.chmod(0o700)
+    except OSError as exc:
+        log(f"DB security warning: could not chmod {DB_PATH.parent} to 0700: {exc}")
+
+    flags = os.O_WRONLY | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(DB_PATH, flags, 0o600)
+    os.close(fd)
+    try:
+        DB_PATH.chmod(0o600)
+    except OSError as exc:
+        log(f"DB security warning: could not chmod {DB_PATH} to 0600: {exc}")
+
+
 def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_db_path()
     with get_db() as conn:
         conn.executescript(_SCHEMA)
         for stmt in _MIGRATIONS:
@@ -66,7 +88,7 @@ def init_db() -> None:
                 conn.execute(stmt)
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
-                    log(f"DB migration warning: {exc}")
+                    raise
         conn.commit()
 
 

@@ -6,8 +6,10 @@ from pathlib import Path
 from flask import Blueprint, jsonify, request
 
 from ..auth import requires_auth
+from ..config import SOURCE_DIR
 from ..db import get_db
 from ..ta_api import MetadataFetchError, fetch_all_metadata
+from ..utils import path_in_allowed_tree
 
 
 bp = Blueprint("channels", __name__, url_prefix="/api/channels")
@@ -45,6 +47,7 @@ def api_get_channel_videos():
     for row in rows:
         vid_id = row["video_id"]
         meta = video_map.get(vid_id, {})
+        entry_path = Path(row["symlink"]) if row["symlink"] else None
         videos.append({
             "video_id": vid_id,
             "title": row["title"],
@@ -53,5 +56,8 @@ def api_get_channel_videos():
             "source_path": meta.get("filesystem_path"),
             "ta_source": meta.get("channel_name", channel_name),
             "is_live": bool(row["is_live"]) if "is_live" in row.keys() else False,
+            "requires_destruct": bool(
+                entry_path and path_in_allowed_tree(entry_path, (SOURCE_DIR,))
+            ),
         })
     return jsonify(videos)

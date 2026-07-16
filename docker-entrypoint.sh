@@ -16,12 +16,18 @@ if [ "$(id -u app)" != "$PUID" ]; then
     usermod -o -u "$PUID" app
 fi
 
-# App-owned dirs: full recursive chown is safe because they only contain
-# state we manage (DB, import staging).
-for dir in /app/data /app/import; do
-    mkdir -p "$dir"
-    chown -R "$PUID:$PGID" "$dir"
-done
+# Database state is wholly app-owned. Import may be shared with TubeArchivist,
+# so only adjust that mount's root rather than recursively changing its files.
+mkdir -p /app/data /app/import
+chown -R "$PUID:$PGID" /app/data
+chown "$PUID:$PGID" /app/import
+
+# The database contains password hashes and the Flask signing secret. Keep its
+# directory and any existing database private without changing media modes.
+chmod 700 /app/data
+if [ -e /app/data/videos.db ] && [ ! -L /app/data/videos.db ]; then
+    chmod 600 /app/data/videos.db
+fi
 
 # User-curated dirs: only chown the mount root so the app can create new
 # children. Recursive chown could touch huge trees and clobber pre-existing

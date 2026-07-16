@@ -10,7 +10,7 @@ bp = Blueprint("pages", __name__)
 
 
 _ALLOWED_STATIC_EXTENSIONS = {
-    ".html", ".js", ".css", ".map", ".json",
+    ".js", ".css", ".map", ".json",
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".avif",
     ".woff", ".woff2", ".ttf", ".otf", ".eot",
     ".txt", ".xml", ".webmanifest",
@@ -18,7 +18,10 @@ _ALLOWED_STATIC_EXTENSIONS = {
 
 
 def _send(static_relative: str):
-    return send_from_directory(current_app.static_folder, static_relative)
+    return send_from_directory(
+        current_app.config["STATIC_BUILD_FOLDER"],
+        static_relative,
+    )
 
 
 @bp.route("/")

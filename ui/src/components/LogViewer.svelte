@@ -9,26 +9,57 @@
     let interval: ReturnType<typeof setInterval>;
     let nextIndex = 0;
     let mounted = false;
+    let fetching = false;
+    let requestSequence = 0;
+    let activeController: AbortController | null = null;
+
+    const CONNECTION_ERROR = "Error connecting to logs...";
 
     async function fetchLogs() {
-        try {
-            const res = await fetch(`${endpoint}?start=${nextIndex}`);
-            if (!res.ok) return;
-            const data = await res.json();
+        if (fetching) return;
 
-            if (data.logs && data.logs.length > 0) {
-                logs = [...logs, ...data.logs];
-                nextIndex = data.next_index;
+        const requestId = ++requestSequence;
+        const controller = new AbortController();
+        activeController = controller;
+        fetching = true;
+
+        try {
+            const res = await fetch(`${endpoint}?start=${nextIndex}`, {
+                signal: controller.signal,
+            });
+            if (!res.ok) {
+                throw new Error(`Log request failed with status ${res.status}`);
+            }
+            const data = await res.json();
+            if (requestId !== requestSequence) return;
+
+            const responseLogs = Array.isArray(data.logs) ? data.logs : [];
+            if (responseLogs.length > 0) {
+                const currentLogs = logs.filter(
+                    (log) => log !== CONNECTION_ERROR,
+                );
+                logs = [...currentLogs, ...responseLogs];
                 // Limit local buffer
                 if (logs.length > 1000) logs = logs.slice(-1000);
             }
+
+            if (Number.isFinite(Number(data.next_index))) {
+                nextIndex = Number(data.next_index);
+            }
         } catch (e) {
+            if ((e as Error)?.name === "AbortError") return;
+            if (requestId !== requestSequence) return;
             if (
                 logs.length === 0 ||
-                logs[logs.length - 1] !== "Error connecting to logs..."
+                logs[logs.length - 1] !== CONNECTION_ERROR
             ) {
-                logs = [...logs, "Error connecting to logs..."];
+                logs = [...logs, CONNECTION_ERROR];
                 // Don't spam error
+            }
+        } finally {
+            if (requestId === requestSequence) {
+                fetching = false;
+                activeController = null;
             }
         }
     }
@@ -41,6 +72,9 @@
 
     onDestroy(() => {
         clearInterval(interval);
+        mounted = false;
+        requestSequence += 1;
+        activeController?.abort();
     });
 
     // Auto-scroll
@@ -50,7 +84,13 @@
 
     function clearLogs() {
         logs = [];
-        nextIndex = 0;
+        // Preserve the current server cursor. Resetting it to zero would replay
+        // the entire bounded server buffer on the next interval.
+        requestSequence += 1;
+        activeController?.abort();
+        activeController = null;
+        fetching = false;
+        void fetchLogs();
     }
 </script>
 

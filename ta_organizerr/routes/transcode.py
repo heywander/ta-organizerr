@@ -1,20 +1,20 @@
 """Transcode trigger + log endpoints."""
 from __future__ import annotations
 
-import threading
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
 
 from ..auth import requires_auth
 from ..db import get_db
-from ..logging_util import transcode_log_buffer, transcode_log_lock, tlog
+from ..logging_util import read_transcode_logs, tlog
 from ..recovery import RECOVERY_ALLOWED_BASES
-from ..transcode import detect_encoder, transcode_video
+from ..transcode import detect_encoder, start_transcode_job
 from ..utils import clamp_pagination, path_in_allowed_tree
 
 
 bp = Blueprint("transcode", __name__, url_prefix="/api/transcode")
+_MAX_PATH_LENGTH = 4096
 
 
 @bp.route("/videos")
@@ -24,11 +24,29 @@ def api_transcode_videos():
     offset = (page - 1) * per_page
     with get_db() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) AS count FROM videos WHERE status = 'missing'"
+            """
+            SELECT COUNT(*) AS count FROM videos
+            WHERE status = 'linked' AND symlink IS NOT NULL
+              AND (
+                  lower(symlink) LIKE '%.mp4'
+                  OR lower(symlink) LIKE '%.mkv'
+                  OR lower(symlink) LIKE '%.mov'
+              )
+            """
         ).fetchone()["count"]
         videos = []
         for row in conn.execute(
-            "SELECT * FROM videos WHERE status = 'missing' LIMIT ? OFFSET ?",
+            """
+            SELECT * FROM videos
+            WHERE status = 'linked' AND symlink IS NOT NULL
+              AND (
+                  lower(symlink) LIKE '%.mp4'
+                  OR lower(symlink) LIKE '%.mkv'
+                  OR lower(symlink) LIKE '%.mov'
+              )
+            ORDER BY channel, published DESC
+            LIMIT ? OFFSET ?
+            """,
             (per_page, offset),
         ):
             videos.append({
@@ -50,17 +68,30 @@ def api_transcode_videos():
 @bp.route("/start", methods=["POST"])
 @requires_auth
 def api_transcode_start():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     filepath = data.get("filepath")
-    if not filepath:
+    if not isinstance(filepath, str) or not filepath:
         return jsonify({"error": "No filepath provided"}), 400
+    if "\x00" in filepath or len(filepath) > _MAX_PATH_LENGTH:
+        return jsonify({"error": "Invalid filepath"}), 400
     if not path_in_allowed_tree(Path(filepath), RECOVERY_ALLOWED_BASES):
         return jsonify({"error": "Path outside allowed directories"}), 400
 
     encoder = detect_encoder()
     tlog(f"🖥️  Selected encoder: {encoder}")
-    threading.Thread(target=transcode_video, args=(filepath, encoder), daemon=True).start()
-    return jsonify({"message": "Transcode started", "encoder": encoder})
+    started, message = start_transcode_job(filepath, encoder)
+    if not started:
+        message_lower = message.lower()
+        if "already" in message_lower:
+            status = 409
+        elif "busy" in message_lower:
+            status = 429
+        else:
+            status = 400
+        return jsonify({"error": message}), status
+    return jsonify({"message": message, "encoder": encoder}), 202
 
 
 @bp.route("/logs")
@@ -70,8 +101,5 @@ def api_transcode_logs():
         start = max(0, int(request.args.get("start", 0)))
     except (TypeError, ValueError):
         start = 0
-    with transcode_log_lock:
-        return jsonify({
-            "logs": transcode_log_buffer[start:],
-            "next_index": len(transcode_log_buffer),
-        })
+    logs, next_index = read_transcode_logs(start)
+    return jsonify({"logs": logs, "next_index": next_index})

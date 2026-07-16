@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-import shutil
+import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -15,23 +15,27 @@ from ..db import get_db
 from ..logging_util import log
 from ..recovery import (
     RECOVERY_ALLOWED_BASES,
+    _delete_candidate_error,
+    _parse_delete_batch_payload,
+    _resolve_destruct_source,
     force_import,
+    make_source_lookup,
     recover_video_metadata,
     scan_for_unindexed_videos,
 )
 from ..ta_api import MetadataFetchError, fetch_all_metadata
+from ..transcode import delete_source_if_idle
 from ..utils import (
     extract_id_from_filename,
     is_valid_youtube_id,
     path_in_allowed_tree,
     path_within,
     resolve_media_source,
-    translated_symlink_target,
-    translate_ta_path,
 )
 
 
 bp = Blueprint("recovery", __name__, url_prefix="/api/recovery")
+_MAX_PATH_LENGTH = 4096
 
 
 SCAN_CACHE: dict[str, object] = {
@@ -43,8 +47,10 @@ _SCAN_LOCK = threading.Lock()
 
 
 def _validated_entry_path(filepath: str | None) -> tuple[Path | None, tuple[object, int] | None]:
-    if not filepath:
+    if not isinstance(filepath, str) or not filepath or "\x00" in filepath:
         return None, (jsonify({"error": "No filepath provided"}), 400)
+    if len(filepath) > _MAX_PATH_LENGTH:
+        return None, (jsonify({"error": "Filepath is too long"}), 400)
     path = Path(filepath)
     if not path_in_allowed_tree(path, RECOVERY_ALLOWED_BASES):
         return None, (jsonify({"error": "Path outside allowed directories"}), 400)
@@ -61,6 +67,26 @@ def _validated_media_source(filepath: str | None) -> tuple[Path | None, tuple[ob
     return source, None
 
 
+def _cleanup_empty_organized_parent(parent: Path) -> None:
+    """Best-effort cleanup limited to descendants of organized output roots."""
+    try:
+        resolved_parent = parent.resolve(strict=False)
+        resolved_roots = tuple(
+            root.resolve(strict=False) for root in (Path(TARGET_DIR), Path(HIDDEN_DIR))
+        )
+        if not any(
+            resolved_parent != root and resolved_parent.is_relative_to(root)
+            for root in resolved_roots
+        ):
+            return
+        if parent.is_symlink() or not parent.exists() or any(parent.iterdir()):
+            return
+        parent.rmdir()
+        log(f"🧹 [CLEANUP] Removed empty folder: {parent}")
+    except (OSError, RuntimeError) as exc:
+        log(f"⚠️ Could not clean empty organized folder {parent}: {exc}")
+
+
 @bp.route("/scan", methods=["POST"])
 @requires_auth
 def api_recovery_scan():
@@ -69,16 +95,19 @@ def api_recovery_scan():
             return jsonify({"status": "running", "message": "Scan already in progress"}), 202
         SCAN_CACHE["status"] = "scanning"
         SCAN_CACHE["results"] = None
+        SCAN_CACHE["last_run"] = None
 
     def run_scan_async():
         try:
             results = scan_for_unindexed_videos()
-            SCAN_CACHE["results"] = results
-            SCAN_CACHE["status"] = "done"
-            SCAN_CACHE["last_run"] = datetime.now().isoformat()
+            with _SCAN_LOCK:
+                SCAN_CACHE["results"] = results
+                SCAN_CACHE["status"] = "done"
+                SCAN_CACHE["last_run"] = datetime.now().isoformat()
         except Exception as exc:  # noqa: BLE001 — surface async failures via cache
-            SCAN_CACHE["status"] = "error"
-            SCAN_CACHE["results"] = str(exc)
+            with _SCAN_LOCK:
+                SCAN_CACHE["status"] = "error"
+                SCAN_CACHE["results"] = str(exc)
             log(f"❌ Async scan failed: {exc}")
 
     threading.Thread(target=run_scan_async, daemon=True).start()
@@ -88,13 +117,17 @@ def api_recovery_scan():
 @bp.route("/poll", methods=["GET"])
 @requires_auth
 def api_recovery_poll():
-    return jsonify(SCAN_CACHE)
+    with _SCAN_LOCK:
+        snapshot = dict(SCAN_CACHE)
+    return jsonify(snapshot)
 
 
 @bp.route("/start", methods=["POST"])
 @requires_auth
 def api_recovery_start():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     media_path, error = _validated_media_source(data.get("filepath"))
     if error:
         return error
@@ -110,7 +143,9 @@ def api_recovery_start():
 @bp.route("/force", methods=["POST"])
 @requires_auth
 def api_recovery_force():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     media_path, error = _validated_media_source(data.get("filepath"))
     if error:
         return error
@@ -125,146 +160,157 @@ def api_recovery_force():
 @bp.route("/delete", methods=["POST"])
 @requires_auth
 def api_recovery_delete():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object"}), 400
     p, error = _validated_entry_path(data.get("filepath"))
     if error:
         return error
 
-    if not os.path.lexists(p) or p.is_dir():
-        return jsonify({"error": "File not found"}), 404
+    candidate_error = _delete_candidate_error(
+        p,
+        destruct=False,
+        allowed_bases=RECOVERY_ALLOWED_BASES,
+        source_dir=SOURCE_DIR,
+    )
+    if candidate_error:
+        status = 404 if candidate_error == "File not found" else 400
+        return jsonify({"error": candidate_error}), status
 
     vid_id = extract_id_from_filename(p.name)
     try:
         p.unlink()
-        if vid_id and is_valid_youtube_id(vid_id):
-            with get_db() as conn:
+        with get_db() as conn:
+            if vid_id and is_valid_youtube_id(vid_id):
                 conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
-                conn.execute("DELETE FROM videos WHERE symlink = ?", (str(p),))
-                conn.commit()
+            conn.execute("DELETE FROM videos WHERE symlink = ?", (str(p),))
+            conn.commit()
         log(f"🗑️ Deleted file: {p}")
         return jsonify({"success": True, "message": "File deleted"})
     except OSError as exc:
         log(f"❌ Delete failed: {exc}")
         return jsonify({"error": "Delete failed"}), 500
-
-
-def _resolve_destruct_source(p: Path, vid_id: str | None, video_map: dict) -> Path | None:
-    """Find the source file matching ``p``, restricted to allowed bases."""
-    candidates: list[Path | None] = []
-
-    if os.path.islink(p):
-        try:
-            target_raw = os.readlink(p)
-            log(f"   [DESTRUCT] Symlink target: {target_raw}")
-            candidates.append(translated_symlink_target(p))
-        except OSError as exc:
-            log(f"   [DESTRUCT] Warning: Could not read symlink {p}: {exc}")
-
-    if vid_id and is_valid_youtube_id(vid_id):
-        meta = video_map.get(vid_id) or {}
-        raw_ta_path = meta.get("filesystem_path")
-        if raw_ta_path:
-            candidates.append(translate_ta_path(raw_ta_path))
-            log(f"   [DESTRUCT] API Fallback Path: {candidates[-1]}")
-
-    for candidate in candidates:
-        if candidate and candidate.exists() and path_within(candidate, RECOVERY_ALLOWED_BASES):
-            return candidate
-
-    if vid_id and is_valid_youtube_id(vid_id):
-        log(f"   [DESTRUCT] Final fallback: recursive search for ID {vid_id}")
-        video_extensions = {".mp4", ".mkv", ".webm", ".avi", ".mov"}
-        for candidate in SOURCE_DIR.rglob(f"*{vid_id}*"):
-            if "tcconf" in candidate.parts:
-                continue
-            if candidate.suffix.lower() not in video_extensions:
-                continue
-            if candidate.is_file() and path_within(candidate, RECOVERY_ALLOWED_BASES):
-                log(f"   [DESTRUCT] Search found match: {candidate}")
-                return candidate
-    return None
+    except sqlite3.Error as exc:
+        log(
+            "❌ File deletion completed but database synchronization failed "
+            f"for {p}: {exc}. Run a scan to reconcile state."
+        )
+        return jsonify({
+            "error": "File deleted, but database sync failed; run a scan to reconcile",
+            "filesystem_deleted": True,
+            "db_sync_failed": True,
+        }), 500
 
 
 @bp.route("/delete-batch", methods=["POST"])
 @requires_auth
 def api_recovery_delete_batch():
-    data = request.get_json(silent=True) or {}
-    paths = data.get("filepaths", [])
-    destruct = bool(data.get("destruct_mode", False))
-
-    if not isinstance(paths, list):
-        return jsonify({"error": "filepaths must be a list"}), 400
+    paths, destruct, payload_error = _parse_delete_batch_payload(
+        request.get_json(silent=True)
+    )
+    if payload_error or paths is None:
+        return jsonify({"error": payload_error or "Invalid delete request"}), 400
 
     success_count = 0
     fail_count = 0
     errors: list[str] = []
+    valid_paths: list[tuple[str, Path]] = []
 
     log(f"🔥 Batch Delete started. Items: {len(paths)}, Destruct: {destruct}")
 
+    for path in paths:
+        p = Path(path)
+        candidate_error = _delete_candidate_error(
+            p,
+            destruct=destruct,
+            allowed_bases=RECOVERY_ALLOWED_BASES,
+            source_dir=SOURCE_DIR,
+        )
+        if candidate_error:
+            fail_count += 1
+            err = f"{candidate_error}: {path}"
+            log(f"⛔ {err}")
+            if err not in errors:
+                errors.append(err)
+            continue
+        valid_paths.append((path, p))
+
     try:
-        video_map = fetch_all_metadata() if destruct else {}
+        video_map = fetch_all_metadata() if destruct and valid_paths else {}
     except MetadataFetchError as exc:
         log(f"❌ Batch delete aborted before changes; metadata fetch failed: {exc}")
         return jsonify({"error": "Could not fetch TubeArchivist metadata"}), 502
 
-    for path in paths:
-        try:
-            p = Path(path)
-            if not path_in_allowed_tree(p, RECOVERY_ALLOWED_BASES):
-                fail_count += 1
-                err = f"Path outside allowed directories: {path}"
-                log(f"⛔ {err}")
-                if err not in errors:
-                    errors.append(err)
-                continue
+    source_lookup = make_source_lookup(SOURCE_DIR) if destruct else None
 
+    for path, p in valid_paths:
+        filesystem_changed = False
+        try:
+            vid_id = extract_id_from_filename(p.name)
             if destruct:
-                vid_id = extract_id_from_filename(p.name)
-                if not vid_id:
+                if not vid_id or not is_valid_youtube_id(vid_id):
                     with get_db() as conn:
                         row = conn.execute(
                             "SELECT video_id FROM videos WHERE symlink = ?", (path,)
                         ).fetchone()
                         if row:
                             vid_id = row["video_id"]
-                source_path = _resolve_destruct_source(p, vid_id, video_map)
-                if source_path and source_path.exists():
-                    try:
-                        source_path.unlink()
-                        log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
-                    except OSError as exc:
-                        log(f"❌ [DESTRUCT] Failed to delete source {source_path}: {exc}")
-                        raise
-                else:
-                    log(f"⚠️ [DESTRUCT] Source file not found for: {path}")
+                if not vid_id or not is_valid_youtube_id(vid_id):
+                    source_hint = resolve_media_source(p)
+                    if source_hint:
+                        vid_id = extract_id_from_filename(source_hint.name)
+                source_path = _resolve_destruct_source(
+                    p,
+                    vid_id,
+                    video_map,
+                    source_dir=SOURCE_DIR,
+                    fallback_lookup=source_lookup,
+                )
+                if source_path is None:
+                    raise OSError(
+                        f"Exact source file not found for video ID {vid_id or 'unknown'}"
+                    )
+                delete_source_if_idle(source_path)
+                filesystem_changed = True
+                log(f"☢️ [DESTRUCT] Deleted source: {source_path}")
 
             if os.path.lexists(p):
-                if p.is_dir():
-                    shutil.rmtree(p)
-                else:
-                    p.unlink()
+                p.unlink()
+                filesystem_changed = True
                 log(f"🗑️ Deleted target: {path}")
 
-                with get_db() as conn:
-                    conn.execute("DELETE FROM videos WHERE symlink = ?", (path,))
-                    conn.commit()
-                log(f"💾 [SYNC] Removed DB record for: {path}")
-
-                parent = p.parent
-                if parent != Path(TARGET_DIR) and parent != Path(HIDDEN_DIR):
-                    if parent.exists() and not any(parent.iterdir()):
-                        try:
-                            parent.rmdir()
-                            log(f"🧹 [CLEANUP] Removed empty folder: {parent}")
-                        except OSError:
-                            pass
+                _cleanup_empty_organized_parent(p.parent)
             else:
-                log(f"❓ Target path does not exist (skipping): {path}")
+                # This is expected when destruct mode was given a SOURCE_DIR
+                # entry: source and target are the same directory entry.
+                if not destruct or not path_in_allowed_tree(p, (SOURCE_DIR,)):
+                    raise OSError(f"Target path disappeared before deletion: {path}")
+
+            with get_db() as conn:
+                conn.execute("DELETE FROM videos WHERE symlink = ?", (path,))
+                if vid_id and is_valid_youtube_id(vid_id):
+                    conn.execute("DELETE FROM lost_media WHERE video_id = ?", (vid_id,))
+                conn.commit()
+            log(f"💾 [SYNC] Removed DB record for: {path}")
 
             success_count += 1
         except OSError as exc:
             err_msg = str(exc)
+            if filesystem_changed:
+                err_msg = f"Partial filesystem deletion; reconciliation required: {err_msg}"
             log(f"❌ Failed to delete {path}: {err_msg}")
+            fail_count += 1
+            if err_msg not in errors:
+                errors.append(err_msg)
+        except sqlite3.Error as exc:
+            if filesystem_changed:
+                err_msg = (
+                    "filesystem_deleted/db_sync_failed; run a scan to reconcile: "
+                    f"{path}"
+                )
+            else:
+                err_msg = f"Database lookup failed before deletion: {path}"
+            log(f"❌ {err_msg}: {exc}")
             fail_count += 1
             if err_msg not in errors:
                 errors.append(err_msg)

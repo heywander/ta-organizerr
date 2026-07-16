@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request
 
 from ..auth import requires_auth
 from ..db import get_db
-from ..logging_util import log_buffer, log_lock
+from ..logging_util import read_logs
 from ..symlinks import cleanup_old_folders, process_videos, scan_is_running
 
 
@@ -46,11 +46,8 @@ def api_logs():
         start = max(0, int(request.args.get("start", 0)))
     except (TypeError, ValueError):
         start = 0
-    with log_lock:
-        return jsonify({
-            "logs": log_buffer[start:],
-            "next_index": len(log_buffer),
-        })
+    logs, next_index = read_logs(start)
+    return jsonify({"logs": logs, "next_index": next_index})
 
 
 @bp.route("/scan", methods=["POST"])

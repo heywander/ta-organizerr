@@ -11,7 +11,15 @@ from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
 from .ta_api import MetadataFetchError, fetch_all_metadata
-from .utils import extract_id_from_filename, is_video, sanitize, translate_host_path
+from .utils import (
+    channel_component,
+    extract_id_from_filename,
+    is_video,
+    path_in_allowed_tree,
+    path_within,
+    sanitize,
+    translate_host_path,
+)
 
 
 # Module-level state for the dashboard.
@@ -56,54 +64,60 @@ def check_orphaned_links() -> list[dict]:
         log("⚠️ Target/hidden directories do not exist")
         return orphaned
 
-    with get_db() as conn:
-        for root in roots:
-            if not root.exists():
+    missing_rows: list[tuple[str, str, str, str, str]] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        for video_file in root.rglob("video.*"):
+            total_checked += 1
+            if not video_file.is_symlink():
                 continue
-            for video_file in root.rglob("video.*"):
-                total_checked += 1
-                if not video_file.is_symlink():
+            try:
+                target = Path(os.readlink(video_file))
+                if not target.is_absolute():
+                    target = video_file.parent / target
+                translated_target = translate_host_path(target)
+                if target.exists() or (translated_target and translated_target.exists()):
                     continue
-                try:
-                    target = Path(os.readlink(video_file))
-                    if not target.is_absolute():
-                        target = video_file.parent / target
-                    translated_target = translate_host_path(target)
-                    if target.exists() or (translated_target and translated_target.exists()):
-                        continue
 
-                    try:
-                        rel_parent = video_file.parent.relative_to(root)
-                        rel_parts = rel_parent.parts
-                    except ValueError:
-                        rel_parts = ()
-                    channel_name = rel_parts[0] if rel_parts else "unknown"
-                    folder_name = rel_parts[-1] if rel_parts else video_file.parent.name
-                    parts = folder_name.split(" - ", 1)
-                    published = parts[0] if parts else "unknown"
-                    title = parts[1] if len(parts) > 1 else folder_name
-                    video_id = extract_id_from_filename(target.name) or target.stem or "unknown"
-                    orphaned.append({
-                        "video_id": video_id,
-                        "path": str(video_file),
-                        "target": str(target),
-                        "folder": folder_name,
-                        "channel": channel_name,
-                        "title": title,
-                        "published": published,
-                    })
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO videos
-                        (video_id, title, channel, published, symlink, status)
-                        VALUES (?, ?, ?, ?, ?, 'missing')
-                        """,
-                        (video_id, title, channel_name, published, str(video_file)),
-                    )
-                    log(f"   ⚠️ BROKEN: {folder_name} -> {target}")
-                except OSError as exc:
-                    log(f"   ❌ ERROR: {video_file}: {exc}")
-        conn.commit()
+                try:
+                    rel_parent = video_file.parent.relative_to(root)
+                    rel_parts = rel_parent.parts
+                except ValueError:
+                    rel_parts = ()
+                channel_name = rel_parts[0] if rel_parts else "unknown"
+                folder_name = rel_parts[-1] if rel_parts else video_file.parent.name
+                parts = folder_name.split(" - ", 1)
+                published = parts[0] if parts else "unknown"
+                title = parts[1] if len(parts) > 1 else folder_name
+                video_id = extract_id_from_filename(target.name) or target.stem or "unknown"
+                orphaned.append({
+                    "video_id": video_id,
+                    "path": str(video_file),
+                    "target": str(target),
+                    "folder": folder_name,
+                    "channel": channel_name,
+                    "title": title,
+                    "published": published,
+                })
+                missing_rows.append(
+                    (video_id, title, channel_name, published, str(video_file))
+                )
+                log(f"   ⚠️ BROKEN: {folder_name} -> {target}")
+            except OSError as exc:
+                log(f"   ❌ ERROR: {video_file}: {exc}")
+
+    if missing_rows:
+        with get_db() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO videos
+                (video_id, title, channel, published, symlink, status)
+                VALUES (?, ?, ?, ?, ?, 'missing')
+                """,
+                missing_rows,
+            )
+            conn.commit()
     log(f"✅ Check complete. Scanned {total_checked} files, found {len(orphaned)} orphaned symlinks.")
     return orphaned
 
@@ -137,7 +151,17 @@ def fix_broken_symlinks() -> list[str]:
 def _migrate_channel_dir(wrong: Path, correct: Path) -> None:
     if not wrong.exists():
         return
+    managed_roots = (TARGET_DIR, HIDDEN_DIR)
+    if (
+        wrong.is_symlink()
+        or correct.is_symlink()
+        or not path_within(wrong, managed_roots)
+        or not path_in_allowed_tree(correct, managed_roots)
+    ):
+        log(f"   ⛔ Refusing unsafe channel-directory migration: {wrong} -> {correct}")
+        return
     try:
+        correct.parent.mkdir(parents=True, exist_ok=True)
         if not correct.exists():
             shutil.move(str(wrong), str(correct))
             log(f"   [MOVE] Migrated {wrong.name} to {correct.parent.name}")
@@ -154,57 +178,117 @@ def _migrate_channel_dir(wrong: Path, correct: Path) -> None:
         log(f"   ❌ Migration error for {wrong.name}: {exc}")
 
 
-def _enforce_hidden_locations(hidden_channels: set[str]) -> None:
+def _channel_component_map(channel_names: set[str]) -> dict[str, str]:
+    """Build stable channel components independent of current collisions."""
+    return {name: channel_component(name) for name in channel_names}
+
+
+def _enforce_hidden_locations(
+    hidden_channels: set[str],
+    component_map: dict[str, str] | None = None,
+) -> None:
     log("🙈 Enforcing hidden channel status...")
-    sanitized_hidden = {sanitize(name) for name in hidden_channels}
+    component_map = component_map or _channel_component_map(hidden_channels)
+    sanitized_hidden: set[str] = set()
+    for name in hidden_channels:
+        component = component_map.get(name, channel_component(name))
+        sanitized_hidden.add(component)
+        # Treat the old lossy component as hidden during migration. If a
+        # public and hidden channel once collided, hiding stale content is the
+        # privacy-preserving behavior until new hashed links are generated.
+        legacy_component = sanitize(name)
+        if legacy_component != component:
+            sanitized_hidden.add(legacy_component)
 
     # Move Hidden FROM Target TO Hidden.
     if TARGET_DIR.exists():
         for channel_dir in TARGET_DIR.iterdir():
+            if channel_dir.is_symlink():
+                log(f"   ⛔ Skipping symlinked channel directory: {channel_dir}")
+                continue
             if not channel_dir.is_dir() or channel_dir.name not in sanitized_hidden:
                 continue
             dest = HIDDEN_DIR / channel_dir.name
             log(f"   [MOVE] Found hidden channel in Public: {channel_dir.name}")
-            try:
-                if not dest.exists():
-                    shutil.move(str(channel_dir), str(dest))
-                    log("   ---> Moved to Hidden")
-                else:
-                    for item in channel_dir.iterdir():
-                        dest_item = dest / item.name
-                        if not dest_item.exists():
-                            shutil.move(str(item), str(dest_item))
-                    try:
-                        channel_dir.rmdir()
-                        log("   ---> Merged to Hidden")
-                    except OSError:
-                        log("   ---> Merged to Hidden (Old dir not empty)")
-            except (OSError, shutil.Error) as exc:
-                log(f"   ❌ Error moving {channel_dir.name}: {exc}")
+            _migrate_channel_dir(channel_dir, dest)
 
     # Move Public FROM Hidden TO Target.
     if HIDDEN_DIR.exists():
         for channel_dir in HIDDEN_DIR.iterdir():
+            if channel_dir.is_symlink():
+                log(f"   ⛔ Skipping symlinked channel directory: {channel_dir}")
+                continue
             if not channel_dir.is_dir() or channel_dir.name in sanitized_hidden:
                 continue
             dest = TARGET_DIR / channel_dir.name
             log(f"   [MOVE] Found public channel in Hidden: {channel_dir.name}")
+            _migrate_channel_dir(channel_dir, dest)
+
+
+def _index_managed_links(db_rows) -> dict[str, list[Path]]:
+    """Index only DB-owned prior links, including a hidden/public move."""
+    result: dict[str, list[Path]] = {}
+    target_root = TARGET_DIR.resolve(strict=False)
+    hidden_root = HIDDEN_DIR.resolve(strict=False)
+    for row in db_rows:
+        video_id = row["video_id"]
+        raw_path = row["symlink"]
+        if not isinstance(video_id, str) or not isinstance(raw_path, str):
+            continue
+        prior = Path(raw_path)
+        candidates = [prior]
+        try:
+            prior_entry = prior.parent.resolve(strict=False) / prior.name
+            if prior_entry.is_relative_to(target_root):
+                candidates.append(HIDDEN_DIR / prior_entry.relative_to(target_root))
+            elif prior_entry.is_relative_to(hidden_root):
+                candidates.append(TARGET_DIR / prior_entry.relative_to(hidden_root))
+        except (OSError, RuntimeError, ValueError):
+            pass
+        for link in candidates:
+            if not link.is_symlink() or not path_in_allowed_tree(
+                link, (TARGET_DIR, HIDDEN_DIR)
+            ):
+                continue
             try:
-                if not dest.exists():
-                    shutil.move(str(channel_dir), str(dest))
-                    log("   ---> Moved to Public")
-                else:
-                    for item in channel_dir.iterdir():
-                        dest_item = dest / item.name
-                        if not dest_item.exists():
-                            shutil.move(str(item), str(dest_item))
-                    try:
-                        channel_dir.rmdir()
-                        log("   ---> Merged to Public")
-                    except OSError:
-                        log("   ---> Merged to Public (Old dir not empty)")
-            except (OSError, shutil.Error) as exc:
-                log(f"   ❌ Error moving {channel_dir.name}: {exc}")
+                target_id = extract_id_from_filename(Path(os.readlink(link)).name)
+            except OSError:
+                continue
+            if target_id == video_id:
+                result.setdefault(video_id, []).append(link)
+                break
+    return result
+
+
+def _remove_stale_managed_links(
+    video_id: str,
+    current_link: Path,
+    link_index: dict[str, list[Path]],
+) -> None:
+    """Retire old generated paths only after the replacement link is valid."""
+    managed_roots = tuple(root.resolve(strict=False) for root in (TARGET_DIR, HIDDEN_DIR))
+    current_entry = current_link.parent.resolve(strict=False) / current_link.name
+    for link in link_index.get(video_id, []):
+        try:
+            link_entry = link.parent.resolve(strict=False) / link.name
+            if link_entry == current_entry or not link.is_symlink():
+                continue
+            if not path_in_allowed_tree(link, (TARGET_DIR, HIDDEN_DIR)):
+                continue
+            target = Path(os.readlink(link))
+            if extract_id_from_filename(target.name) != video_id:
+                continue
+            link.unlink()
+            log(f"   🧹 Removed superseded generated link: {link}")
+            parent = link.parent
+            while parent.resolve(strict=False) not in managed_roots:
+                if parent.is_symlink() or not parent.exists() or any(parent.iterdir()):
+                    break
+                parent.rmdir()
+                parent = parent.parent
+        except (OSError, RuntimeError) as exc:
+            log(f"   ⚠️ Could not clean superseded link {link}: {exc}")
+    link_index[video_id] = [current_link]
 
 
 def _ensure_symlink(host_source_path: Path, dest_file: Path, video_dir: Path, channel_dir: Path) -> tuple[bool, bool, str | None]:
@@ -233,6 +317,35 @@ def _ensure_symlink(host_source_path: Path, dest_file: Path, video_dir: Path, ch
             except OSError as exc:
                 return False, False, str(exc)
         return False, False, f"Non-symlink file already exists at {dest_file}"
+
+
+def _destination_for_video(
+    channel_dir: Path,
+    folder_name: str,
+    video_id: str,
+    suffix: str,
+) -> tuple[Path, Path]:
+    """Keep the legacy layout unless it would collide with another video."""
+    preferred_dir = channel_dir / folder_name
+    try:
+        existing_links = list(preferred_dir.glob("video.*"))
+    except OSError:
+        existing_links = []
+
+    for existing in existing_links:
+        if not existing.is_symlink():
+            unique_dir = channel_dir / f"{folder_name} [{video_id}]"
+            return unique_dir, unique_dir / f"video{suffix}"
+        try:
+            target = Path(os.readlink(existing))
+        except OSError:
+            unique_dir = channel_dir / f"{folder_name} [{video_id}]"
+            return unique_dir, unique_dir / f"video{suffix}"
+        existing_id = extract_id_from_filename(target.name)
+        if existing_id != video_id:
+            unique_dir = channel_dir / f"{folder_name} [{video_id}]"
+            return unique_dir, unique_dir / f"video{suffix}"
+    return preferred_dir, preferred_dir / f"video{suffix}"
 
 
 def process_videos() -> str | None:
@@ -265,44 +378,63 @@ def _process_videos_unlocked() -> str | None:
 
     with get_db() as conn:
         rows = conn.execute("SELECT channel_name FROM hidden_channels").fetchall()
+        prior_link_rows = conn.execute(
+            "SELECT video_id, symlink FROM videos WHERE symlink IS NOT NULL"
+        ).fetchall()
     hidden_channels = {row["channel_name"] for row in rows}
+    all_channel_names = {
+        str(meta["channel_name"])
+        for meta in video_map.values()
+        if isinstance(meta, dict) and meta.get("channel_name") is not None
+    } | hidden_channels
+    component_map = _channel_component_map(all_channel_names)
 
     HIDDEN_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_old_folders()
-    _enforce_hidden_locations(hidden_channels)
+    _enforce_hidden_locations(hidden_channels, component_map)
+    managed_link_index = _index_managed_links(prior_link_rows)
 
     new_links = 0
     verified_links = 0
 
-    with get_db() as conn:
-        conn.execute("DELETE FROM videos WHERE status IN ('linked', 'error')")
-        try:
-            for video_file in SOURCE_DIR.rglob("*"):
-                if not video_file.is_file() or not is_video(video_file):
-                    continue
-                video_id = extract_id_from_filename(video_file.name) or video_file.stem
-                meta = video_map.get(video_id)
-                if not meta:
-                    continue
+    db_rows: list[tuple] = []
+    stale_link_retirements: list[tuple[str, Path]] = []
+    try:
+        for video_file in SOURCE_DIR.rglob("*"):
+            if not video_file.is_file() or not is_video(video_file):
+                continue
+            video_id = extract_id_from_filename(video_file.name) or video_file.stem
+            meta = video_map.get(video_id)
+            if not meta:
+                continue
 
-                sanitized_channel = sanitize(meta["channel_name"])
-                is_hidden = meta["channel_name"] in hidden_channels
-                target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
-                other_root = TARGET_DIR if is_hidden else HIDDEN_DIR
+            channel_name = str(meta["channel_name"])
+            sanitized_channel = component_map.get(
+                channel_name,
+                channel_component(channel_name),
+            )
+            is_hidden = meta["channel_name"] in hidden_channels
+            target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
 
-                _migrate_channel_dir(other_root / sanitized_channel, target_root / sanitized_channel)
+            channel_dir = target_root / sanitized_channel
+            if meta.get("is_live"):
+                channel_dir = channel_dir / "#streams"
 
-                channel_dir = target_root / sanitized_channel
-                if meta.get("is_live"):
-                    channel_dir = channel_dir / "#streams"
+            published = sanitize(str(meta["published"]))
+            folder_name = f"{published} - {sanitize(meta['title'])}"
+            host_source_path = HOST_SOURCE_BASE / video_file.relative_to(SOURCE_DIR)
+            video_dir, dest_file = _destination_for_video(
+                channel_dir,
+                folder_name,
+                video_id,
+                video_file.suffix,
+            )
 
-                folder_name = f"{meta['published']} - {sanitize(meta['title'])}"
-                video_dir = channel_dir / folder_name
-                host_source_path = HOST_SOURCE_BASE / video_file.relative_to(SOURCE_DIR)
-                dest_file = video_dir / f"video{video_file.suffix}"
-
-                link_error = None
-                try:
+            link_error = None
+            try:
+                if not path_in_allowed_tree(dest_file, (target_root,)):
+                    link_error = f"Destination escapes target root: {dest_file}"
+                else:
                     is_new, is_verified, link_error = _ensure_symlink(
                         host_source_path,
                         dest_file,
@@ -314,43 +446,61 @@ def _process_videos_unlocked() -> str | None:
                         log(f"   [NEW/FIX] Linked: {folder_name}")
                     elif is_verified:
                         verified_links += 1
-                except OSError as exc:
-                    link_error = str(exc)
+                    if not link_error:
+                        stale_link_retirements.append((video_id, dest_file))
+            except OSError as exc:
+                link_error = str(exc)
 
-                row_status = "error" if link_error else "linked"
-                if link_error:
-                    log(f"   ❌ Link error for {folder_name}: {link_error}")
+            row_status = "error" if link_error else "linked"
+            if link_error:
+                log(f"   ❌ Link error for {folder_name}: {link_error}")
 
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO videos
-                    (video_id, title, channel, published, symlink, is_live, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        video_id,
-                        meta["title"],
-                        meta["channel_name"],
-                        meta["published"],
-                        str(dest_file),
-                        1 if meta.get("is_live") else 0,
-                        row_status,
-                    ),
-                )
-                processed_videos.append({
-                    "video_id": video_id,
-                    "title": meta["title"],
-                    "channel": meta["channel_name"],
-                    "published": meta["published"],
-                    "symlink": str(dest_file),
-                    "status": row_status,
-                })
-        except Exception as exc:  # noqa: BLE001 — ensure rollback path covers everything
-            conn.rollback()
-            log(f"❌❌❌ CRITICAL ERROR in process_videos: {exc}")
-            log(f"Traceback: {traceback.format_exc()}")
-            return str(exc)
-        conn.commit()
+            db_rows.append((
+                video_id,
+                meta["title"],
+                meta["channel_name"],
+                meta["published"],
+                str(dest_file),
+                1 if meta.get("is_live") else 0,
+                row_status,
+            ))
+            processed_videos.append({
+                "video_id": video_id,
+                "title": meta["title"],
+                "channel": meta["channel_name"],
+                "published": meta["published"],
+                "symlink": str(dest_file),
+                "status": row_status,
+            })
+    except Exception as exc:  # noqa: BLE001 — leave the previous DB snapshot intact
+        log(f"❌❌❌ CRITICAL ERROR in process_videos: {exc}")
+        log(f"Traceback: {traceback.format_exc()}")
+        return str(exc)
+
+    try:
+        with get_db() as conn:
+            conn.execute("DELETE FROM videos WHERE status IN ('linked', 'error')")
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO videos
+                (video_id, title, channel, published, symlink, is_live, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                db_rows,
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 — surface DB consistency failures
+        log(f"❌ Could not persist scan results: {exc}")
+        return str(exc)
+
+    # The DB is now authoritative for the replacement paths. Only at this
+    # point is it safe to retire DB-owned links from the previous snapshot.
+    for video_id, dest_file in stale_link_retirements:
+        _remove_stale_managed_links(
+            video_id,
+            dest_file,
+            managed_link_index,
+        )
 
     log(f"✅ Scan complete. Processed {len(processed_videos)} videos.")
     log(f"   - New/Fixed Links: {new_links}")

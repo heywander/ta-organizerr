@@ -2,12 +2,27 @@
     import { createEventDispatcher, onMount, onDestroy } from "svelte";
     const dispatch = createEventDispatcher();
 
-    let activeTab: "unindexed" | "rescue" | "redundant" | "lost" | "channels" = "unindexed";
+    type RecoveryTab =
+        | "unindexed"
+        | "rescue"
+        | "redundant"
+        | "lost"
+        | "channels";
+
+    type RecoveryItem = {
+        path: string;
+        requires_destruct?: boolean;
+        [key: string]: any;
+    };
+
+    let activeTab: RecoveryTab = "unindexed";
     let scanning = false;
     let status = "idle";
-    let results: any = { unindexed: [], rescue: [], redundant: [], lost: [] };
-    let pollInterval: ReturnType<typeof setInterval>;
-    
+    let results: Record<string, RecoveryItem[]> = emptyResults();
+    let pollInterval: ReturnType<typeof setInterval> | undefined;
+    let pollRequestInFlight = false;
+    let operationError: string | null = null;
+
     // State for Destruct Mode & Multi-selection
     let destructMode = false;
     let selectedPaths = new Set<string>();
@@ -15,21 +30,54 @@
     // Channel specific state
     let channels: string[] = [];
     let selectedChannel = "";
-    let channelVideos: any[] = [];
+    let channelVideos: RecoveryItem[] = [];
     let loadingChannels = false;
     let searchingVideos = false;
+    let channelRequestSequence = 0;
+    let channelAbortController: AbortController | null = null;
 
     // Permissions state
     let permissions: any = null;
     let loadingPermissions = false;
+    let readOnlyPermissions: [string, any][] = [];
+
+    function emptyResults(): Record<string, RecoveryItem[]> {
+        return { unindexed: [], rescue: [], redundant: [], lost: [] };
+    }
+
+    function messageFrom(error: unknown): string {
+        return error instanceof Error ? error.message : String(error);
+    }
+
+    async function readResponse(res: Response): Promise<any> {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(
+                body.error ||
+                    body.message ||
+                    `Request failed with status ${res.status}`,
+            );
+        }
+        return body;
+    }
+
+    function recordError(context: string, error: unknown) {
+        operationError = `${context}: ${messageFrom(error)}`;
+    }
+
+    function canDeleteItem(item: RecoveryItem): boolean {
+        // Fail closed if an older/malformed response omits the capability flag.
+        return destructMode || item.requires_destruct === false;
+    }
 
     async function checkPermissions() {
         loadingPermissions = true;
         try {
             const res = await fetch("/api/system/check-permissions");
-            permissions = await res.json();
+            permissions = await readResponse(res);
         } catch (e) {
             console.error("Failed to check permissions", e);
+            recordError("Permission check failed", e);
         } finally {
             loadingPermissions = false;
         }
@@ -37,35 +85,61 @@
 
     async function startScan() {
         scanning = true;
+        status = "starting";
+        results = emptyResults();
+        selectedPaths = new Set();
+        operationError = null;
         try {
-            await fetch("/api/recovery/scan", {
+            const res = await fetch("/api/recovery/scan", {
                 method: "POST",
             });
+            const data = await readResponse(res);
+            status = data.status || "scanning";
             pollResults();
         } catch (e) {
-            alert("Scan start failed: " + e);
+            recordError("Scan start failed", e);
+            alert("Scan start failed: " + messageFrom(e));
             scanning = false;
+            status = "error";
         }
     }
 
     function pollResults() {
         if (pollInterval) clearInterval(pollInterval);
         pollInterval = setInterval(async () => {
+            if (pollRequestInFlight) return;
+            pollRequestInFlight = true;
             try {
                 const res = await fetch("/api/recovery/poll");
-                const data = await res.json();
+                const data = await readResponse(res);
                 status = data.status;
                 if (data.status === "done") {
-                    results = data.results || results;
+                    const next = data.results || {};
+                    results = {
+                        unindexed: next.unindexed || [],
+                        rescue: next.rescue || [],
+                        redundant: next.redundant || [],
+                        lost: next.lost || [],
+                    };
+                    selectedPaths = new Set();
                     scanning = false;
-                    clearInterval(pollInterval);
+                    if (pollInterval) clearInterval(pollInterval);
+                    pollInterval = undefined;
                 } else if (data.status === "error") {
                     scanning = false;
-                    clearInterval(pollInterval);
+                    if (pollInterval) clearInterval(pollInterval);
+                    pollInterval = undefined;
                     alert("Scan error: " + data.results);
                 }
             } catch (e) {
                 console.error(e);
+                recordError("Scan polling failed", e);
+                scanning = false;
+                status = "error";
+                if (pollInterval) clearInterval(pollInterval);
+                pollInterval = undefined;
+            } finally {
+                pollRequestInFlight = false;
             }
         }, 2000);
     }
@@ -74,143 +148,244 @@
         loadingChannels = true;
         try {
             const res = await fetch("/api/channels");
-            channels = await res.json();
+            const data = await readResponse(res);
+            if (!Array.isArray(data)) {
+                throw new Error("Channel response was not a list");
+            }
+            channels = data;
         } catch (e) {
             console.error("Failed to fetch channels", e);
+            recordError("Failed to fetch channels", e);
         } finally {
             loadingChannels = false;
         }
     }
 
     async function fetchChannelVideos(channel: string) {
-        if (!channel) return;
-        searchingVideos = true;
+        const requestSequence = ++channelRequestSequence;
+        channelAbortController?.abort();
+        channelAbortController = null;
         selectedChannel = channel;
+        channelVideos = [];
         selectedPaths = new Set();
-        try {
-            const res = await fetch(`/api/channels/videos?channel=${encodeURIComponent(channel)}`);
-            channelVideos = await res.json();
-        } catch (e) {
-            console.error("Failed to fetch channel videos", e);
-        } finally {
+        if (!channel) {
             searchingVideos = false;
+            return;
+        }
+
+        searchingVideos = true;
+        operationError = null;
+        const controller = new AbortController();
+        channelAbortController = controller;
+        try {
+            const res = await fetch(
+                `/api/channels/videos?channel=${encodeURIComponent(channel)}`,
+                { signal: controller.signal },
+            );
+            const data = await readResponse(res);
+            if (!Array.isArray(data)) {
+                throw new Error("Channel video response was not a list");
+            }
+            if (requestSequence === channelRequestSequence) {
+                channelVideos = data;
+                selectedPaths = new Set();
+            }
+        } catch (e) {
+            if ((e as Error)?.name === "AbortError") return;
+            console.error("Failed to fetch channel videos", e);
+            if (requestSequence === channelRequestSequence) {
+                channelVideos = [];
+                recordError("Failed to fetch channel videos", e);
+            }
+        } finally {
+            if (requestSequence === channelRequestSequence) {
+                searchingVideos = false;
+                channelAbortController = null;
+            }
         }
     }
 
     onDestroy(() => {
         if (pollInterval) clearInterval(pollInterval);
+        channelRequestSequence += 1;
+        channelAbortController?.abort();
     });
 
-    async function recoverFile(path: string, isBatch = false) {
-        if (!isBatch && !confirm("Recover this file?")) return;
+    async function runRecoveryAction(
+        endpoint: string,
+        path: string,
+        action: "Recover" | "Rescue" | "Force import",
+    ) {
+        if (!confirm(`${action} this file?`)) return;
+        operationError = null;
         try {
-            const res = await fetch("/api/recovery/start", {
+            const res = await fetch(endpoint, {
                 method: "POST",
                 body: JSON.stringify({ filepath: path }),
                 headers: { "Content-Type": "application/json" },
             });
-            const d = await res.json();
-            if (!isBatch) {
-                alert(d.message);
-                if (activeTab === "channels") fetchChannelVideos(selectedChannel);
-                else startScan();
+            const data = await readResponse(res);
+            if (data.success === false) {
+                throw new Error(data.message || `${action} failed`);
+            }
+            alert(data.message || `${action} completed.`);
+            if (activeTab === "channels") {
+                await fetchChannelVideos(selectedChannel);
+            } else {
+                await startScan();
             }
         } catch (e) {
-            alert(e);
+            recordError(`${action} failed`, e);
+            alert(`${action} failed: ${messageFrom(e)}`);
         }
     }
 
-    async function deleteFile(path: string) {
+    function recoverFile(path: string) {
+        return runRecoveryAction("/api/recovery/start", path, "Recover");
+    }
+
+    function rescueFile(path: string) {
+        return runRecoveryAction("/api/recovery/start", path, "Rescue");
+    }
+
+    function forceFile(path: string) {
+        return runRecoveryAction("/api/recovery/force", path, "Force import");
+    }
+
+    async function deleteFile(item: RecoveryItem) {
+        if (!canDeleteItem(item)) {
+            alert("Enable Destruct Mode to delete this source archive file.");
+            return;
+        }
+
         let msg = "Delete file? This cannot be undone.";
         if (destructMode) {
             msg = "☢️ DESTRUCT MODE ACTIVE ☢️\n\nThis will delete BOTH the target folder AND the source file in your archive.\n\nAre you absolutely sure?";
         }
-        
+
         if (!confirm(msg)) return;
         if (destructMode && !confirm("FINAL WARNING: This is IRREVERSIBLE. Delete source file now?")) return;
 
+        operationError = null;
         try {
             const res = await fetch("/api/recovery/delete-batch", {
                 method: "POST",
-                body: JSON.stringify({ 
-                    filepaths: [path],
-                    destruct_mode: destructMode 
+                body: JSON.stringify({
+                    filepaths: [item.path],
+                    destruct_mode: destructMode,
                 }),
                 headers: { "Content-Type": "application/json" },
             });
-            const d = await res.json();
+            const d = await readResponse(res);
             if (d.success_count > 0) {
                 alert("Deleted.");
-                if (activeTab === "channels") fetchChannelVideos(selectedChannel);
-                else startScan();
+                if (activeTab === "channels") {
+                    await fetchChannelVideos(selectedChannel);
+                } else {
+                    await startScan();
+                }
             } else {
                 const err = d.errors?.[0] || "Unknown error";
                 alert(`Error deleting file: ${err}`);
             }
         } catch (e) {
-            alert(e);
+            recordError("Delete failed", e);
+            alert("Delete failed: " + messageFrom(e));
         }
     }
 
     async function deleteSelected() {
-        if (selectedPaths.size === 0) return;
-        
-        let msg = `Delete ${selectedPaths.size} selected items?`;
-        if (destructMode) {
-            msg = `☢️ DESTRUCT MODE ACTIVE ☢️\n\nYou are about to delete ${selectedPaths.size} items from BOTH Target and Source.\n\nAre you sure you want to proceed?`;
+        const selectedItems = visibleItems.filter(
+            (item) => selectedPaths.has(item.path) && canDeleteItem(item),
+        );
+        const paths = selectedItems.map((item) => item.path);
+        if (paths.length === 0) {
+            selectedPaths = new Set();
+            return;
         }
-        
+
+        // Never submit stale selections that are no longer in the visible dataset.
+        selectedPaths = new Set(paths);
+        let msg = `Delete ${paths.length} selected items?`;
+        if (destructMode) {
+            msg = `☢️ DESTRUCT MODE ACTIVE ☢️\n\nYou are about to delete ${paths.length} items from BOTH Target and Source.\n\nAre you sure you want to proceed?`;
+        }
+
         if (!confirm(msg)) return;
         if (destructMode && !confirm("FINAL WARNING: This will permanently delete SOURCE FILES. Continue?")) return;
 
+        operationError = null;
         try {
             const res = await fetch("/api/recovery/delete-batch", {
                 method: "POST",
-                body: JSON.stringify({ 
-                    filepaths: Array.from(selectedPaths),
-                    destruct_mode: destructMode 
+                body: JSON.stringify({
+                    filepaths: paths,
+                    destruct_mode: destructMode,
                 }),
                 headers: { "Content-Type": "application/json" },
             });
-            const d = await res.json();
-            
+            const d = await readResponse(res);
+
             if (d.fail_count > 0) {
                 const firstErr = d.errors?.[0] || "Check backend logs.";
                 alert(`Batch partially failed.\nSuccess: ${d.success_count}\nFailed: ${d.fail_count}\n\nFirst error: ${firstErr}`);
             } else {
                 alert(`Batch complete. Deleted ${d.success_count} items.`);
             }
-            
+
             selectedPaths = new Set();
-            if (activeTab === "channels") fetchChannelVideos(selectedChannel);
-            else startScan();
+            if (activeTab === "channels") {
+                await fetchChannelVideos(selectedChannel);
+            } else {
+                await startScan();
+            }
         } catch (e) {
-            alert("Batch delete failed: " + e);
+            recordError("Batch delete failed", e);
+            alert("Batch delete failed: " + messageFrom(e));
         }
     }
 
-    function toggleSelect(path: string) {
-        if (selectedPaths.has(path)) {
-            selectedPaths.delete(path);
+    function toggleSelect(item: RecoveryItem) {
+        if (!canDeleteItem(item)) return;
+        const next = new Set(selectedPaths);
+        if (next.has(item.path)) {
+            next.delete(item.path);
         } else {
-            selectedPaths.add(path);
+            next.add(item.path);
         }
-        selectedPaths = selectedPaths;
+        selectedPaths = next;
     }
 
     function toggleAll() {
-        const items = activeTab === "channels" ? channelVideos : (results[activeTab] || []);
-        if (selectedPaths.size === items.length && items.length > 0) {
+        if (
+            selectableItems.length > 0 &&
+            selectableItems.every((item) => selectedPaths.has(item.path))
+        ) {
             selectedPaths = new Set();
         } else {
-            selectedPaths = new Set(items.map((i: any) => i.path));
+            selectedPaths = new Set(selectableItems.map((item) => item.path));
         }
     }
 
-    $: allSelected = (activeTab === "channels" ? channelVideos : results[activeTab])?.length > 0 && selectedPaths.size === (activeTab === "channels" ? channelVideos : results[activeTab])?.length;
+    function handleDestructModeChange(event: Event) {
+        destructMode = (event.currentTarget as HTMLInputElement).checked;
+        selectedPaths = new Set();
+    }
 
-    $: sourceRO = permissions?.source?.writeable === false;
-    $: targetRO = permissions?.target?.writeable === false;
+    $: visibleItems =
+        activeTab === "channels" ? channelVideos : results[activeTab] || [];
+    $: selectableItems = visibleItems.filter(
+        (item) => destructMode || item.requires_destruct === false,
+    );
+    $: allSelected =
+        selectableItems.length > 0 &&
+        selectableItems.every((item) => selectedPaths.has(item.path));
+
+    $: readOnlyPermissions = permissions
+        ? (Object.entries(permissions).filter(
+              ([, details]: [string, any]) => details?.writeable === false,
+          ) as [string, any][])
+        : [];
 
     onMount(() => {
         fetchChannels();
@@ -242,25 +417,30 @@
         </div>
 
         <!-- Permission Warnings -->
-        {#if sourceRO || targetRO}
+        {#if readOnlyPermissions.length > 0}
             <div class="bg-red-900/30 border-b border-red-500/50 p-3 flex items-center gap-3 animate-in fade-in slide-in-from-top duration-300">
                 <i class="bi bi-exclamation-octagon-fill text-red-500 text-lg"></i>
                 <div class="text-xs text-red-200">
                     <span class="font-bold uppercase">Filesystem Alert:</span>
-                    {#if sourceRO && targetRO}
-                        Both Source AND Target directories are currently <span class="text-white underline">READ-ONLY</span>.
-                        <div class="mt-1 opacity-70 italic">Errors: {permissions?.source?.message} | {permissions?.target?.message}</div>
-                    {:else if sourceRO}
-                        Source archive is <span class="text-white underline">READ-ONLY</span>. Destruct Mode will fail.
-                        <div class="mt-1 opacity-70 italic">Error: {permissions?.source?.message}</div>
-                    {:else}
-                        Target library is <span class="text-white underline">READ-ONLY</span>. Symlink cleanup will fail.
-                        <div class="mt-1 opacity-70 italic">Error: {permissions?.target?.message}</div>
-                    {/if}
+                    These paths are not writable. The backend will validate each operation:
+                    {#each readOnlyPermissions as [name, details]}
+                        <div class="mt-1 opacity-70 italic capitalize">
+                            {name}: {details?.message || details?.status || "not writable"}
+                        </div>
+                    {/each}
                 </div>
                 <button on:click={checkPermissions} class="ml-auto text-[10px] bg-red-500/20 hover:bg-red-500/40 px-2 py-1 rounded border border-red-500/30 transition-colors">
                     Retry Check
                 </button>
+            </div>
+        {/if}
+
+        {#if operationError}
+            <div
+                class="bg-red-900/20 border-b border-red-500/30 px-4 py-2 text-xs text-red-300"
+                role="alert"
+            >
+                {operationError}
             </div>
         {/if}
 
@@ -279,7 +459,6 @@
                     <button
                         class="px-6 py-2 rounded font-bold text-white bg-red-600 hover:bg-red-500 transition-all transform active:scale-95 flex items-center gap-2 shadow-[0_0_15px_rgba(220,38,38,0.4)]"
                         on:click={deleteSelected}
-                        disabled={targetRO || (destructMode && sourceRO)}
                     >
                         <i class="bi bi-trash"></i> Delete Selected ({selectedPaths.size})
                     </button>
@@ -289,7 +468,12 @@
             <div class="flex items-center gap-6">
                 <!-- Destruct Mode Toggle -->
                 <label class="relative inline-flex items-center cursor-pointer group">
-                    <input type="checkbox" bind:checked={destructMode} class="sr-only peer">
+                    <input
+                        type="checkbox"
+                        checked={destructMode}
+                        on:change={handleDestructModeChange}
+                        class="sr-only peer"
+                    >
                     <div class="w-11 h-6 bg-gray-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-red-600"></div>
                     <span class="ml-3 text-sm font-medium text-gray-300 group-hover:text-white transition-colors flex items-center gap-2">
                         Destruct Mode
@@ -367,6 +551,7 @@
                                                 type="checkbox" 
                                                 checked={allSelected} 
                                                 on:change={toggleAll}
+                                                disabled={selectableItems.length === 0}
                                                 class="accent-neon-cyan"
                                             >
                                         </th>
@@ -382,8 +567,10 @@
                                                 <input 
                                                     type="checkbox" 
                                                     checked={selectedPaths.has(item.path)} 
-                                                    on:change={() => toggleSelect(item.path)}
-                                                    class="accent-neon-cyan"
+                                                    on:change={() => toggleSelect(item)}
+                                                    disabled={!canDeleteItem(item)}
+                                                    title={!canDeleteItem(item) ? "Enable Destruct Mode to select this source file" : "Select item"}
+                                                    class="accent-neon-cyan disabled:opacity-30"
                                                 >
                                             </td>
                                             <td class="p-3 text-neon-pink font-bold">{item.video_id}</td>
@@ -391,8 +578,9 @@
                                             <td class="p-3 text-right">
                                                 <button
                                                     class="text-red-500 hover:text-red-400 font-bold transition-colors disabled:opacity-30"
-                                                    on:click={() => deleteFile(item.path)}
-                                                    disabled={targetRO || (destructMode && sourceRO)}
+                                                    on:click={() => deleteFile(item)}
+                                                    disabled={!canDeleteItem(item)}
+                                                    aria-label="Delete video"
                                                 >
                                                     <i class="bi bi-trash"></i>
                                                 </button>
@@ -425,6 +613,7 @@
                                     type="checkbox" 
                                     checked={allSelected} 
                                     on:change={toggleAll}
+                                    disabled={selectableItems.length === 0}
                                     class="accent-neon-cyan"
                                 >
                             </th>
@@ -443,8 +632,10 @@
                                     <input 
                                         type="checkbox" 
                                         checked={selectedPaths.has(item.path)} 
-                                        on:change={() => toggleSelect(item.path)}
-                                        class="accent-neon-cyan"
+                                        on:change={() => toggleSelect(item)}
+                                        disabled={!canDeleteItem(item)}
+                                        title={!canDeleteItem(item) ? "Enable Destruct Mode to select this source file" : "Select item"}
+                                        class="accent-neon-cyan disabled:opacity-30"
                                     >
                                 </td>
                                 <td class="p-3 text-neon-pink font-bold"
@@ -460,7 +651,10 @@
                                 <td class="p-3"
                                     >{item.size_mb
                                         ? item.size_mb + " MB"
-                                        : item.ta_source || "-"}</td
+                                        : item.ta_source || "-"}
+                                    {#if item.requires_destruct}
+                                        <span class="ml-2 text-[9px] text-red-400">SOURCE</span>
+                                    {/if}</td
                                 >
                                 <td class="p-3 text-right">
                                     <div class="flex justify-end gap-3">
@@ -475,25 +669,27 @@
                                             <button
                                                 class="text-red-500 hover:underline font-bold transition-all hover:scale-105 disabled:opacity-30"
                                                 on:click={() =>
-                                                    deleteFile(item.path)}
-                                                disabled={targetRO || (destructMode && sourceRO)}
+                                                    deleteFile(item)}
+                                                disabled={!canDeleteItem(item)}
                                                 ><i class="bi bi-trash"></i> DELETE</button
                                             >
                                         {:else if activeTab === "lost"}
                                             <button
                                                 class="text-neon-yellow hover:underline flex items-center gap-1"
+                                                on:click={() => forceFile(item.path)}
                                                 ><i class="bi bi-lightning-fill"></i> FORCE</button
                                             >
                                             <button
                                                 class="text-red-500 hover:underline font-bold disabled:opacity-30"
                                                 on:click={() =>
-                                                    deleteFile(item.path)}
-                                                disabled={targetRO || (destructMode && sourceRO)}
+                                                    deleteFile(item)}
+                                                disabled={!canDeleteItem(item)}
                                                 ><i class="bi bi-trash"></i> DELETE</button
                                             >
                                         {:else}
                                             <button
                                                 class="text-neon-pink hover:underline flex items-center gap-1"
+                                                on:click={() => rescueFile(item.path)}
                                                 ><i class="bi bi-rescue-ambulance"></i> RESCUE</button
                                             >
                                         {/if}

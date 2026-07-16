@@ -3,7 +3,16 @@
     import LogViewer from "./LogViewer.svelte";
 
     let running = false;
-    let fixed = 0;
+
+    async function readResponse(res: Response): Promise<any> {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(
+                body.error || body.message || `Request failed with status ${res.status}`,
+            );
+        }
+        return body;
+    }
 
     async function fixSymlinks() {
         if (!confirm("Fix broken symlinks? This will:\n\n1. Delete 0-byte files left by crashes\n2. Rescan to recreate proper symlinks\n\nContinue?")) return;
@@ -13,7 +22,7 @@
             const res = await fetch("/api/maintenance/fix-symlinks", {
                 method: "POST",
             });
-            const d = await res.json();
+            const d = await readResponse(res);
             if (d.status === "started") {
                 alert("Symlink repair started. Check logs for progress.");
             } else {
@@ -34,7 +43,7 @@
             const res = await fetch("/api/cleanup", {
                 method: "POST",
             });
-            const d = await res.json();
+            await readResponse(res);
             alert("Cleanup started. Check logs.");
         } catch (e) {
             alert("Error: " + e);
@@ -51,7 +60,7 @@
             const res = await fetch("/api/scan", {
                 method: "POST",
             });
-            const d = await res.json();
+            await readResponse(res);
             alert("Scan started. Check logs for progress.");
         } catch (e) {
             alert("Error: " + e);

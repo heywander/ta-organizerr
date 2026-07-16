@@ -9,10 +9,33 @@ def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _positive_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1, got {value}")
+    return value
+
+
+def _host_source_base() -> tuple[bool, Path]:
+    """Return a configured absolute host path or the legacy absolute fallback."""
+    raw_value = os.getenv("HOST_SOURCE_BASE")
+    if raw_value is None or not raw_value.strip():
+        return False, Path("/mnt/user/tubearchives/bp")
+    value = Path(raw_value.strip())
+    if not value.is_absolute():
+        raise ValueError(
+            f"HOST_SOURCE_BASE must be an absolute host path, got {raw_value!r}"
+        )
+    return True, value
+
+
 API_URL = os.getenv("API_URL", "http://localhost:8457/api")
-VIDEO_URL = os.getenv("VIDEO_URL", "http://localhost:8457/video/")
 API_TOKEN = os.getenv("API_TOKEN", "")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "60"))
+SCAN_INTERVAL = _positive_int("SCAN_INTERVAL", 60)
 ALLOWED_IPS = _split_csv(os.getenv("ALLOWED_IPS", "127.0.0.1"))
 
 SOURCE_DIR = Path(os.getenv("SOURCE_DIR", "/app/source"))
@@ -20,16 +43,21 @@ TARGET_DIR = Path(os.getenv("TARGET_DIR", "/app/target"))
 HIDDEN_DIR = Path(os.getenv("HIDDEN_DIR", "/app/hidden"))
 IMPORT_DIR = Path(os.getenv("IMPORT_DIR", "/app/import"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-HOST_SOURCE_BASE = Path(os.getenv("HOST_SOURCE_BASE", "/mnt/user/tubearchives/bp"))
+# Preserve the historical fallback for bare-Docker/local upgrades. Compose
+# requires an explicit value, and app startup logs a warning when this fallback
+# is active so it can be removed in a future breaking release.
+HOST_SOURCE_BASE_CONFIGURED, HOST_SOURCE_BASE = _host_source_base()
 
 DB_PATH = DATA_DIR / "videos.db"
 
 FLASK_SECRET_KEY_ENV = os.getenv("FLASK_SECRET_KEY")
 SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
-SESSION_LIFETIME_SECONDS = int(os.getenv("SESSION_LIFETIME_SECONDS", str(8 * 3600)))
+SESSION_LIFETIME_SECONDS = _positive_int("SESSION_LIFETIME_SECONDS", 8 * 3600)
 
 # Pagination caps applied to API endpoints to prevent unbounded queries.
-MAX_PER_PAGE = int(os.getenv("MAX_PER_PAGE", "500"))
+MAX_PER_PAGE = _positive_int("MAX_PER_PAGE", 500)
+MAX_METADATA_PAGES = _positive_int("MAX_METADATA_PAGES", 10_000)
+MAX_CONCURRENT_TRANSCODES = _positive_int("MAX_CONCURRENT_TRANSCODES", 1)
 
 HEADERS = {"Authorization": f"Token {API_TOKEN}"} if API_TOKEN else {}
 

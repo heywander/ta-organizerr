@@ -17,6 +17,10 @@ _MAX_PASSWORD_LENGTH = 256
 _MAX_USERNAME_LENGTH = 64
 
 
+class AdminAlreadyExists(RuntimeError):
+    """Raised when first-run setup loses a race to another request."""
+
+
 def admin_exists() -> bool:
     with get_db() as conn:
         row = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -28,8 +32,10 @@ def get_or_create_secret_key(env_value: Optional[str]) -> str:
     if env_value:
         return env_value
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute("SELECT value FROM app_config WHERE key = 'secret_key'").fetchone()
         if row:
+            conn.commit()
             return row["value"]
         new_key = secrets.token_urlsafe(48)
         conn.execute(
@@ -61,6 +67,10 @@ def validate_credentials(username: str, password: str) -> Optional[str]:
 def create_admin(username: str, password: str) -> None:
     password_hash = generate_password_hash(password)
     with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            conn.rollback()
+            raise AdminAlreadyExists("Setup already complete")
         conn.execute(
             "INSERT INTO users (username, password_hash) VALUES (?, ?)",
             (username, password_hash),
