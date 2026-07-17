@@ -18,6 +18,7 @@ import stat
 import subprocess
 import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +32,8 @@ from .config import (
     AVAILABILITY_PROBE_RETRIES,
     AVAILABILITY_PROBE_TIMEOUT_SECONDS,
     AVAILABILITY_RETRY_BACKOFF_SECONDS,
+    AVAILABILITY_VIDEO_START_INTERVAL_SECONDS,
+    AVAILABILITY_VIDEO_WORKERS,
     HIDDEN_DIR,
     MAX_PER_PAGE,
     SOURCE_DIR,
@@ -107,6 +110,23 @@ _local_inventory_cache: dict[
     tuple[str, str, str, str], tuple[float, dict[str, dict[str, Any]]]
 ] = {}
 _inventory_key_locks: dict[tuple[str, ...], threading.Lock] = {}
+_video_probe_start_lock = threading.Lock()
+_last_video_probe_started = 0.0
+
+_SMART_TTLS = {
+    "available": timedelta(days=30),
+    "private": timedelta(days=7),
+    "restricted": timedelta(hours=24),
+    "live_processing": timedelta(hours=24),
+    "unavailable_unknown": timedelta(hours=24),
+    "transient_failure": timedelta(hours=24),
+}
+_SMART_TERMINAL_VIDEO_STATES = {
+    "community_guidelines_removed",
+    "other_policy_removed",
+    "uploader_removed",
+    "account_terminated",
+}
 
 
 class AvailabilityError(RuntimeError):
@@ -782,10 +802,15 @@ def list_videos(
             for row in conn.execute(
                 """
                 SELECT availability.*, observations.raw_reason,
-                       observations.evidence_json, observations.provider
+                       observations.evidence_json, observations.provider,
+                       designations.designation,
+                       designations.storage_component AS designated_component
                 FROM video_availability AS availability
                 LEFT JOIN availability_observations AS observations
                   ON observations.observation_id = availability.last_observation_id
+                LEFT JOIN video_designations AS designations
+                  ON designations.channel_id = availability.channel_id
+                 AND designations.video_id = availability.video_id
                 WHERE availability.channel_id = ?
                 """,
                 (channel_id,),
@@ -803,6 +828,8 @@ def list_videos(
             "raw_reason": row["raw_reason"] if row else None,
             "evidence": _decode_json(row["evidence_json"], {}) if row else {},
             "provider": row["provider"] if row else None,
+            "designation": row["designation"] if row else None,
+            "designated_component": row["designated_component"] if row else None,
         })
         if state and item["state"] != state:
             continue
@@ -1233,6 +1260,71 @@ def _api_probe(subject_type: str, subject_id: str) -> dict[str, Any] | None:
         "raw_reason": "YouTube Data API did not return the exact resource",
         "evidence": {"item_count": 0},
     }
+
+
+def _api_probe_video_batch(
+    video_ids: list[str], expected_channel_id: str
+) -> tuple[dict[str, dict[str, Any]], list[str], bool, bool]:
+    """Return exact, channel-owned API hits and IDs needing detail probes.
+
+    An absent API item is deliberately unresolved, never evidence of removal.
+    The booleans report whether the key must be disabled and whether the whole
+    job should pause after a quota/rate response.
+    """
+
+    if not YOUTUBE_API_KEY or not video_ids:
+        return {}, list(video_ids), False, False
+    try:
+        response = requests.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            params={
+                "part": "id,snippet,status",
+                "id": ",".join(video_ids),
+                "key": YOUTUBE_API_KEY,
+            },
+            timeout=AVAILABILITY_PROBE_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return {}, list(video_ids), False, False
+    if response.status_code in {400, 401, 403}:
+        return {}, list(video_ids), True, False
+    if response.status_code == 429:
+        return {}, list(video_ids), False, True
+    if response.status_code != 200:
+        # Service failures are not identity evidence. Fall back to bounded
+        # public detail probes; only an explicit rate/challenge response pauses.
+        return {}, list(video_ids), False, False
+    try:
+        data = response.json()
+    except ValueError:
+        return {}, list(video_ids), False, False
+    requested = set(video_ids)
+    resolved: dict[str, dict[str, Any]] = {}
+    items = data.get("items") if isinstance(data, dict) else None
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            video_id = item.get("id")
+            snippet = item.get("snippet")
+            returned_channel_id = (
+                snippet.get("channelId") if isinstance(snippet, dict) else None
+            )
+            if video_id not in requested or returned_channel_id != expected_channel_id:
+                continue
+            resolved[video_id] = {
+                "state": "available",
+                "reason_code": "api_resource_returned_for_channel",
+                "raw_reason": "YouTube Data API returned the exact video for the expected channel",
+                "provider": "youtube-data-api-batch",
+                "tool_version": None,
+                "evidence": {
+                    "item_count": 1,
+                    "returned_id": video_id,
+                    "returned_channel_id": returned_channel_id,
+                },
+            }
+    return resolved, [item for item in video_ids if item not in resolved], False, False
 
 
 def _combine_probe(subject_type: str, ytdlp: dict[str, Any], api: dict[str, Any] | None) -> dict[str, Any]:
@@ -2051,9 +2143,105 @@ def _job_row(row: sqlite3.Row) -> dict[str, Any]:
         "phase": row["phase"],
         "success_count": int(row["success_count"]), "fail_count": int(row["fail_count"]),
         "cancel_requested": bool(row["cancel_requested"]), "error": row["error"],
+        "message": row["message"] if "message" in row.keys() else None,
         "created_at": row["created_at"], "started_at": row["started_at"],
         "completed_at": row["completed_at"],
     }
+
+
+def _database_video_inventory(channel_id: str) -> dict[str, dict[str, Any]]:
+    """Read durable ownership without walking or resolving the source tree."""
+
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT video_id, title, symlink AS path, 'tracked' AS source
+            FROM videos WHERE channel_id = ?
+            UNION ALL
+            SELECT items.video_id, COALESCE(items.manual_title, items.video_id),
+                   COALESCE(items.organized_path, items.source_path), 'recovered'
+            FROM recovered_channel_items AS items
+            JOIN recovered_channel_cases AS cases USING (case_id)
+            WHERE cases.source_channel_id = ?
+            """,
+            (channel_id, channel_id),
+        ).fetchall()
+    inventory: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not is_valid_youtube_id(row["video_id"]):
+            continue
+        inventory.setdefault(row["video_id"], {
+            "video_id": row["video_id"],
+            "title": row["title"] or row["video_id"],
+            "preview_path": row["path"],
+            "path_kind": row["source"],
+        })
+    return inventory
+
+
+def _smart_video_ids(channel_id: str, inventory_ids: set[str]) -> list[str]:
+    now = datetime.now(timezone.utc)
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT video_id, current_state, current_state_at
+            FROM video_availability WHERE channel_id = ?
+            """,
+            (channel_id,),
+        ).fetchall()
+    states = {row["video_id"]: row for row in rows}
+    selected: list[str] = []
+    for video_id in sorted(inventory_ids):
+        row = states.get(video_id)
+        if row is None or not row["current_state_at"]:
+            selected.append(video_id)
+            continue
+        state = row["current_state"]
+        if state in _SMART_TERMINAL_VIDEO_STATES:
+            continue
+        ttl = _SMART_TTLS.get(state, timedelta(hours=24))
+        try:
+            due = now - _parse_time(row["current_state_at"]) >= ttl
+        except (TypeError, ValueError):
+            due = True
+        if due:
+            selected.append(video_id)
+    return selected
+
+
+def _select_video_job_subjects(
+    channel_id: str, payload: dict[str, Any]
+) -> list[tuple[str, str]]:
+    refresh = bool(payload.get("refresh_inventory"))
+    scope = str(payload.get("scope") or "smart")
+    requested = payload.get("requested_ids")
+    inventory = (
+        _local_inventory(channel_id, force_source_scan=True)
+        if refresh
+        else _database_video_inventory(channel_id)
+    )
+    inventory_ids = set(inventory)
+    if scope == "selected":
+        requested_ids = requested if isinstance(requested, list) else []
+        missing = sorted(set(requested_ids) - inventory_ids)
+        if missing:
+            raise AvailabilityError(
+                "Every requested video ID must belong to the durable local channel inventory",
+                409,
+            )
+        ids = list(requested_ids)
+    elif scope == "all":
+        ids = sorted(inventory_ids)
+    elif scope == "smart":
+        ids = _smart_video_ids(channel_id, inventory_ids)
+    else:
+        raise AvailabilityError("Stored video job scope is invalid", 409)
+    if len(ids) > _MAX_VIDEO_JOB_SUBJECTS:
+        raise AvailabilityError(
+            f"A single availability job is limited to {_MAX_VIDEO_JOB_SUBJECTS} local video IDs",
+            409,
+        )
+    return [(video_id, str(inventory[video_id].get("path_kind") or "inventory")) for video_id in ids]
 
 
 def get_job(job_id: str) -> dict[str, Any]:
@@ -2187,12 +2375,22 @@ def start_video_check(
     channel_id: str,
     video_ids: list[str] | None = None,
     *,
+    scope: str | None = None,
+    refresh_inventory: bool = False,
     actor: str | None = None,
     background: bool = True,
 ) -> dict[str, Any]:
     channel_id = validate_channel_id(channel_id)
+    legacy_compat = scope is None
+    if scope is None:
+        scope = "selected" if video_ids is not None else "all"
     requested_ids: list[str] | None = None
     if video_ids is not None:
+        if not legacy_compat and scope != "selected":
+            raise AvailabilityError(
+                "video_ids may be supplied only with selected scope"
+            )
+        scope = "selected"
         if not isinstance(video_ids, list) or not video_ids:
             raise AvailabilityError("video_ids must be a non-empty array when supplied")
         if len(video_ids) > _MAX_VIDEO_JOB_SUBJECTS:
@@ -2206,11 +2404,32 @@ def start_video_check(
                 f"video_ids must contain unique exact IDs (maximum {_MAX_VIDEO_JOB_SUBJECTS})"
             )
         requested_ids = list(video_ids)
+    if scope not in {"smart", "selected", "all"}:
+        raise AvailabilityError("scope must be smart, selected, or all")
+    if scope == "selected" and requested_ids is None:
+        raise AvailabilityError("selected scope requires a non-empty video_ids array")
+    if not isinstance(refresh_inventory, bool):
+        raise AvailabilityError("refresh_inventory must be true or false")
     with get_db() as conn:
         upsert_channel_identity(conn, channel_id, provenance="source")
         conn.commit()
-    # Inventory discovery belongs to the durable job. The request returns a job
-    # ID immediately even when the selected channel lives on a slow NAS mount.
+    # Direct Python callers from the original API retain the old forced-scan
+    # contract. HTTP callers always provide an explicit scope and use the new
+    # channel-gated durable-subject workflow below.
+    if legacy_compat:
+        return _start_job(
+            "videos",
+            channel_id,
+            [],
+            actor=actor,
+            background=background,
+            job_payload={
+                "discover_inventory": True,
+                "requested_ids": requested_ids,
+                "legacy_compat": True,
+            },
+            initial_total=len(requested_ids or []),
+        )
     return _start_job(
         "videos",
         channel_id,
@@ -2218,14 +2437,15 @@ def start_video_check(
         actor=actor,
         background=background,
         job_payload={
-            "discover_inventory": True,
+            "scope": scope,
+            "refresh_inventory": refresh_inventory,
             "requested_ids": requested_ids,
         },
         initial_total=len(requested_ids or []),
     )
 
 
-def run_job(job_id: str) -> None:
+def _run_job_legacy(job_id: str) -> None:
     with _job_guard:
         with get_db() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2417,6 +2637,342 @@ def run_job(job_id: str) -> None:
                 ),
             )
             conn.commit()
+
+
+def _rate_limited_video_probe(video_id: str, channel_id: str) -> dict[str, Any]:
+    global _last_video_probe_started
+    with _video_probe_start_lock:
+        remaining = (
+            _last_video_probe_started
+            + AVAILABILITY_VIDEO_START_INTERVAL_SECONDS
+            - time.monotonic()
+        )
+        if remaining > 0:
+            time.sleep(remaining)
+        _last_video_probe_started = time.monotonic()
+    latest: dict[str, Any] | None = None
+    for attempt in range(1, AVAILABILITY_PROBE_RETRIES + 1):
+        latest = _yt_dlp_probe(
+            "video", video_id, expected_channel_id=channel_id
+        )
+        if latest.get("pause") or not latest.get("retry"):
+            break
+        if attempt < AVAILABILITY_PROBE_RETRIES and AVAILABILITY_RETRY_BACKOFF_SECONDS:
+            time.sleep(AVAILABILITY_RETRY_BACKOFF_SECONDS * attempt)
+    assert latest is not None
+    return _combine_probe("video", latest, None)
+
+
+def _finish_video_job(
+    job_id: str,
+    *,
+    status: str,
+    phase: str,
+    successes: int,
+    failures: int,
+    total: int | None = None,
+    message: str | None = None,
+    error: str | None = None,
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE availability_jobs
+            SET status = ?, phase = ?, success_count = ?, fail_count = ?,
+                total = COALESCE(?, total), completed_at = ?, message = ?, error = ?
+            WHERE job_id = ? AND status IN ('running', 'cancelling')
+            """,
+            (status, phase, successes, failures, total, _now(), message, error, job_id),
+        )
+        conn.commit()
+
+
+def _persist_video_result(
+    job_id: str,
+    channel_id: str,
+    video_id: str,
+    result: dict[str, Any],
+) -> int:
+    observation_id = record_observation(
+        job_id, "video", video_id, channel_id, result
+    )
+    failed = result.get("state") == "transient_failure"
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE availability_job_subjects
+            SET status = ?, attempts = attempts + 1, observation_id = ?,
+                error = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ? AND video_id = ?
+            """,
+            (
+                "failed" if failed else "completed",
+                observation_id,
+                _clean_reason(result.get("raw_reason")) if failed else None,
+                job_id,
+                video_id,
+            ),
+        )
+        counts = conn.execute(
+            """
+            SELECT COUNT(*) AS current,
+                   SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS successes,
+                   SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failures
+            FROM availability_job_subjects
+            WHERE job_id = ? AND status IN ('completed', 'failed')
+            """,
+            (job_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            UPDATE availability_jobs
+            SET current = ?, success_count = ?, fail_count = ?
+            WHERE job_id = ?
+            """,
+            (
+                int(counts["current"] or 0),
+                int(counts["successes"] or 0),
+                int(counts["failures"] or 0),
+                job_id,
+            ),
+        )
+        conn.commit()
+    return observation_id
+
+
+def run_job(job_id: str) -> None:
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT kind, payload_json FROM availability_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+    if existing is None:
+        raise AvailabilityError("Availability job not found", 404)
+    existing_payload = _decode_json(existing["payload_json"], {})
+    if existing["kind"] != "videos" or (
+        isinstance(existing_payload, dict) and existing_payload.get("legacy_compat")
+    ):
+        _run_job_legacy(job_id)
+        return
+
+    with _job_guard:
+        with get_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM availability_jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise AvailabilityError("Availability job not found", 404)
+            if row["cancel_requested"] or row["status"] == "cancelling":
+                conn.execute(
+                    "UPDATE availability_jobs SET status='cancelled', phase='cancelled', completed_at=? WHERE job_id=?",
+                    (_now(), job_id),
+                )
+                conn.commit()
+                return
+            if row["status"] != "queued":
+                conn.rollback()
+                return
+            payload = _decode_json(row["payload_json"], {})
+            if not isinstance(payload, dict):
+                raise AvailabilityError("Stored video job options are invalid", 409)
+            channel_id = row["channel_id"]
+            conn.execute(
+                """
+                UPDATE availability_jobs
+                SET status='running', phase='checking_channel', started_at=?,
+                    message='Checking the channel before any individual video probes',
+                    error=NULL
+                WHERE job_id=?
+                """,
+                (_now(), job_id),
+            )
+            conn.commit()
+
+        channel_result = probe(
+            "channel", channel_id, expected_channel_id=channel_id, include_api=True
+        )
+        record_observation(job_id, "channel", channel_id, channel_id, channel_result)
+        with get_db() as conn:
+            identity = conn.execute(
+                "SELECT designation FROM channel_identities WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+        channel_state = channel_result.get("state")
+        already_terminated = bool(identity and identity["designation"] == "terminated")
+        if already_terminated or channel_state == "terminated_explicit":
+            _finish_video_job(
+                job_id,
+                status="completed",
+                phase="channel_terminated",
+                successes=0,
+                failures=0,
+                total=0,
+                message="Channel is explicitly terminated; individual video probes were skipped",
+            )
+            return
+        if channel_state != "accessible":
+            _finish_video_job(
+                job_id,
+                status="completed",
+                phase="channel_gate_blocked",
+                successes=0,
+                failures=0,
+                total=0,
+                message="Individual video probes were skipped because the fresh channel result was not accessible",
+                error=f"Channel gate returned {channel_state or 'unknown'}; no filesystem changes were made",
+            )
+            return
+        if _job_cancel_requested(job_id):
+            _finish_video_job(
+                job_id, status="cancelled", phase="cancelled",
+                successes=0, failures=0, message="Cancelled after channel check"
+            )
+            return
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE availability_jobs SET phase='inventory', message='Selecting durable local video identities' WHERE job_id=?",
+                (job_id,),
+            )
+            conn.commit()
+        subjects = _select_video_job_subjects(channel_id, payload)
+        if not subjects:
+            _finish_video_job(
+                job_id,
+                status="completed",
+                phase="nothing_due",
+                successes=0,
+                failures=0,
+                total=0,
+                message="No local videos are due under this scope",
+            )
+            return
+        with get_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.executemany(
+                """
+                INSERT INTO availability_job_subjects
+                    (job_id, video_id, ordinal, source)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (job_id, video_id, ordinal, source)
+                    for ordinal, (video_id, source) in enumerate(subjects, 1)
+                ],
+            )
+            conn.execute(
+                """
+                UPDATE availability_jobs
+                SET total=?, phase='api_batch',
+                    message='Checking exact IDs in API batches of up to 50'
+                WHERE job_id=?
+                """,
+                (len(subjects), job_id),
+            )
+            conn.commit()
+
+        unresolved: list[str] = []
+        api_enabled = bool(YOUTUBE_API_KEY)
+        paused = False
+        ids = [video_id for video_id, _source in subjects]
+        if api_enabled:
+            for offset in range(0, len(ids), 50):
+                if _job_cancel_requested(job_id):
+                    break
+                batch = ids[offset:offset + 50]
+                resolved, missing, disable_api, api_pause = _api_probe_video_batch(
+                    batch, channel_id
+                )
+                for video_id, result in resolved.items():
+                    _persist_video_result(job_id, channel_id, video_id, result)
+                unresolved.extend(missing)
+                if disable_api:
+                    api_enabled = False
+                    unresolved.extend(ids[offset + len(batch):])
+                    break
+                if api_pause:
+                    paused = True
+                    unresolved.extend(ids[offset + len(batch):])
+                    break
+        else:
+            unresolved = ids
+
+        if unresolved and not paused and not _job_cancel_requested(job_id):
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    UPDATE availability_jobs
+                    SET phase='detail_probes',
+                        message='Resolving API-absent IDs with bounded yt-dlp detail probes'
+                    WHERE job_id=?
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+            pool = ThreadPoolExecutor(
+                max_workers=AVAILABILITY_VIDEO_WORKERS,
+                thread_name_prefix=f"video-probe-{job_id[:6]}",
+            )
+            futures: dict[Future, str] = {
+                pool.submit(_rate_limited_video_probe, video_id, channel_id): video_id
+                for video_id in unresolved
+            }
+            try:
+                while futures:
+                    completed, _pending = wait(
+                        futures, return_when=FIRST_COMPLETED
+                    )
+                    for future in completed:
+                        video_id = futures.pop(future)
+                        try:
+                            result = future.result()
+                        except Exception as exc:  # noqa: BLE001
+                            result = {
+                                "state": "transient_failure",
+                                "reason_code": "probe_worker_failure",
+                                "raw_reason": str(exc)[:1000],
+                                "provider": "yt-dlp",
+                                "evidence": {},
+                            }
+                        _persist_video_result(job_id, channel_id, video_id, result)
+                        if result.get("pause"):
+                            paused = True
+                    if paused or _job_cancel_requested(job_id):
+                        for future in futures:
+                            future.cancel()
+                        break
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+
+        with get_db() as conn:
+            counts = conn.execute(
+                """
+                SELECT COUNT(*) AS current,
+                       SUM(CASE WHEN status='completed' THEN 1 ELSE 0 END) AS successes,
+                       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failures
+                FROM availability_job_subjects
+                WHERE job_id=? AND status IN ('completed','failed')
+                """,
+                (job_id,),
+            ).fetchone()
+        successes = int(counts["successes"] or 0)
+        failures = int(counts["failures"] or 0)
+        cancelled = _job_cancel_requested(job_id)
+        _finish_video_job(
+            job_id,
+            status="cancelled" if cancelled else "paused" if paused else "completed",
+            phase="cancelled" if cancelled else "paused" if paused else "completed",
+            successes=successes,
+            failures=failures,
+            message=(
+                "Check cancelled"
+                if cancelled
+                else "Checks paused after a rate limit or bot challenge"
+                if paused
+                else f"Checked {successes + failures} local video identities"
+            ),
+            error=(f"{failures} probe(s) were inconclusive" if failures else None),
+        )
 
 
 def cancel_job(job_id: str) -> dict[str, Any]:

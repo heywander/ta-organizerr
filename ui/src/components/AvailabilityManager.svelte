@@ -89,6 +89,7 @@
         localPath: string;
         previewUrl: string;
         audioPreviewUrl: string;
+        designation: string;
     };
 
     type AvailabilityJob = {
@@ -143,13 +144,9 @@
         ["available", "Available"],
         ["private", "Private"],
         ["community_guidelines", "Community guidelines"],
-        ["policy_removed", "Other policy / copyright"],
-        ["uploader_removed", "Uploader removed"],
+        ["policy_removed", "Policy / copyright removed"],
         ["account_terminated", "Account terminated"],
-        ["restricted", "Restricted"],
-        ["live_processing", "Live / processing"],
         ["unavailable_unknown", "Unavailable — unknown"],
-        ["transient", "Transient / indeterminate"],
     ];
 
     let channels: ChannelRecord[] = [];
@@ -171,6 +168,12 @@
     let videoTotal = 0;
     const videosPerPage = 100;
     let videoFilterTimer: ReturnType<typeof setTimeout> | null = null;
+    let selectedVideoIds = new Set<string>();
+    let refreshInventory = false;
+    let videoDesignationPlan: any = null;
+    let videoDesignationConfirmation = "";
+    let videoDesignationError = "";
+    let videoDesignationBusy = false;
     let channelRequestController: AbortController | null = null;
     let videoRequestController: AbortController | null = null;
     let evidenceRequestController: AbortController | null = null;
@@ -421,6 +424,7 @@
             ),
             previewUrl: textValue(raw?.preview_url, raw?.video_preview_url),
             audioPreviewUrl: textValue(raw?.audio_preview_url),
+            designation: textValue(raw?.designation),
         };
     }
 
@@ -731,6 +735,10 @@
         applyingDesignation = false;
         confirmation = "";
         videoPage = 1;
+        selectedVideoIds = new Set();
+        videoDesignationPlan = null;
+        videoDesignationConfirmation = "";
+        videoDesignationError = "";
         bindJobToSelectedChannel(
             channels.find((item) => item.channelId === channelId),
         );
@@ -746,6 +754,7 @@
     async function startCheck(
         kind: "channel" | "videos",
         videoIds: string[] | null = null,
+        scope: "smart" | "selected" | "all" = "smart",
     ) {
         if (!selectedChannelId || jobRunning(activeJob)) return;
         const channelId = selectedChannelId;
@@ -759,8 +768,12 @@
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body:
-                        kind === "videos" && videoIds
-                            ? JSON.stringify({ video_ids: videoIds })
+                        kind === "videos"
+                            ? JSON.stringify({
+                                  scope: videoIds ? "selected" : scope,
+                                  ...(videoIds ? { video_ids: videoIds } : {}),
+                                  refresh_inventory: refreshInventory,
+                              })
                             : "{}",
                 },
             );
@@ -790,6 +803,78 @@
             scheduleJobPoll(500);
         } catch (error) {
             jobError = errorMessage(error);
+        }
+    }
+
+    function toggleVideo(videoId: string) {
+        const next = new Set(selectedVideoIds);
+        if (next.has(videoId)) next.delete(videoId);
+        else next.add(videoId);
+        selectedVideoIds = next;
+        videoDesignationPlan = null;
+    }
+
+    function toggleShownVideos() {
+        const shown = filteredVideos.map((video) => video.videoId);
+        const next = new Set(selectedVideoIds);
+        const allSelected = shown.length > 0 && shown.every((id) => next.has(id));
+        shown.forEach((id) => allSelected ? next.delete(id) : next.add(id));
+        selectedVideoIds = next;
+        videoDesignationPlan = null;
+    }
+
+    async function planVideoDesignation(action: "designate" | "restore") {
+        if (!selectedChannelId || selectedVideoIds.size === 0) return;
+        videoDesignationBusy = true;
+        videoDesignationError = "";
+        videoDesignationPlan = null;
+        videoDesignationConfirmation = "";
+        try {
+            const response = await fetch(
+                `/api/availability/channels/${encodeURIComponent(selectedChannelId)}/videos/designation/plan`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        video_ids: Array.from(selectedVideoIds),
+                        action,
+                    }),
+                },
+            );
+            const data = await readResponse(response);
+            videoDesignationPlan = data?.plan || data;
+        } catch (error) {
+            videoDesignationError = errorMessage(error);
+        } finally {
+            videoDesignationBusy = false;
+        }
+    }
+
+    async function applyVideoDesignation() {
+        if (!videoDesignationPlan?.plan_token || !selectedChannelId) return;
+        videoDesignationBusy = true;
+        videoDesignationError = "";
+        try {
+            const response = await fetch(
+                `/api/availability/channels/${encodeURIComponent(selectedChannelId)}/videos/designation/apply`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        plan_token: videoDesignationPlan.plan_token,
+                        confirmation: videoDesignationConfirmation,
+                    }),
+                },
+            );
+            await readResponse(response);
+            videoDesignationPlan = null;
+            videoDesignationConfirmation = "";
+            selectedVideoIds = new Set();
+            await loadVideos(selectedChannelId, videoPage);
+        } catch (error) {
+            videoDesignationError = errorMessage(error);
+        } finally {
+            videoDesignationBusy = false;
         }
     }
 
@@ -1193,19 +1278,25 @@
                             <i class="bi bi-broadcast" aria-hidden="true"></i>
                             Check channel now
                         </button>
-                        <button class="button" on:click={() => startCheck("videos")} disabled={jobRunning(activeJob) || (selectedChannel.localVideoCount === 0 && videoTotal === 0)}>
+                        <button class="button" on:click={() => startCheck("videos", null, "smart")} disabled={jobRunning(activeJob) || (selectedChannel.localVideoCount === 0 && videoTotal === 0)}>
                             <i class="bi bi-collection-play" aria-hidden="true"></i>
-                            Check {selectedChannel.localVideoCount || videoTotal} local video IDs
+                            Smart video check
                         </button>
                         <button
                             class="button button-quiet"
-                            on:click={() => startCheck("videos", videos.map((video) => video.videoId))}
-                            disabled={jobRunning(activeJob) || loadingVideos || videos.length === 0}
-                            title="Check only the exact IDs on the current filtered page"
+                            on:click={() => startCheck("videos", Array.from(selectedVideoIds))}
+                            disabled={jobRunning(activeJob) || selectedVideoIds.size === 0}
+                            title="Check only selected exact IDs"
                         >
                             <i class="bi bi-list-check" aria-hidden="true"></i>
-                            Check {videos.length} shown IDs
+                            Check {selectedVideoIds.size} selected
                         </button>
+                        <button class="button button-quiet" on:click={() => startCheck("videos", null, "all")} disabled={jobRunning(activeJob) || (selectedChannel.localVideoCount === 0 && videoTotal === 0)}>
+                            Check all
+                        </button>
+                        <label class="inline-check" title="Explicitly walk the source tree before selecting IDs; this may be slow on network storage">
+                            <input type="checkbox" bind:checked={refreshInventory} /> Refresh source inventory
+                        </label>
                         <span>Checks do not download, move, or rename media.</span>
                     </div>
                 </section>
@@ -1443,6 +1534,10 @@
                         <span class="count-label">{filteredVideos.length} shown · {videoTotal} total</span>
                     </div>
                     <div class="video-controls">
+                        <button class="button button-quiet" on:click={toggleShownVideos} disabled={filteredVideos.length === 0}>
+                            <i class="bi bi-check2-square"></i>
+                            {filteredVideos.length > 0 && filteredVideos.every((video) => selectedVideoIds.has(video.videoId)) ? "Clear shown" : "Select shown"}
+                        </button>
                         <label>
                             <span class="sr-only">Search local videos</span>
                             <i class="bi bi-search" aria-hidden="true"></i>
@@ -1467,6 +1562,7 @@
                             {#each filteredVideos as video (video.videoId)}
                                 {@const videoState = canonicalVideoState(video.state)}
                                 <article class="video-row">
+                                    <input class="video-row__select" type="checkbox" checked={selectedVideoIds.has(video.videoId)} on:change={() => toggleVideo(video.videoId)} aria-label={`Select ${video.videoId}`} />
                                     <div class="video-row__identity">
                                         <div class="video-row__title">
                                             <strong>{video.title}</strong>
@@ -1476,6 +1572,7 @@
                                         {#if video.rawReason}<p>{video.rawReason}</p>{/if}
                                         {#if video.detail}<small>{video.detail}</small>{/if}
                                         <span class="video-row__path" title={video.localPath}>{video.localPath ? basename(video.localPath) : "Local path unavailable"}</span>
+                                        {#if video.designation}<small>Folder designation: {stateLabel(video.designation)}</small>{/if}
                                     </div>
                                     <div class="video-row__actions">
                                         <time>{formatTime(video.lastCheckedAt)}</time>
@@ -1498,6 +1595,57 @@
                                 Next <i class="bi bi-chevron-right"></i>
                             </button>
                         </nav>
+                    {/if}
+                </section>
+
+                <section class="panel video-designation-panel" aria-labelledby="video-designation-title">
+                    <div class="panel-header">
+                        <div>
+                            <span class="eyebrow">Guarded filesystem action</span>
+                            <h2 class="section-title" id="video-designation-title"><i class="bi bi-folder-check"></i> Video folder labels</h2>
+                            <p class="section-description">Only selected metadata-backed video folders with a current explicit yt-dlp reason are eligible. Existing destinations and nested layouts are blocked; media and symlink targets are not rewritten.</p>
+                        </div>
+                        <span class="count-label">{selectedVideoIds.size} selected</span>
+                    </div>
+                    <div class="identity-actions">
+                        <button class="button" on:click={() => planVideoDesignation("designate")} disabled={videoDesignationBusy || selectedVideoIds.size === 0}>
+                            Review reason labels
+                        </button>
+                        <button class="button button-quiet" on:click={() => planVideoDesignation("restore")} disabled={videoDesignationBusy || selectedVideoIds.size === 0}>
+                            Review restoration
+                        </button>
+                    </div>
+                    {#if videoDesignationError}<div class="notice notice--error">{videoDesignationError}</div>{/if}
+                    {#if videoDesignationPlan}
+                        <div class="video-plan-summary">
+                            <strong>{videoDesignationPlan.can_apply ? "Ready for confirmation" : "Plan blocked"}</strong>
+                            <span>{videoDesignationPlan.operations?.length || 0} folder operation(s)</span>
+                        </div>
+                        {#if videoDesignationPlan.blockers?.length}
+                            <div class="plan-message plan-message--blocker">
+                                <strong>Blockers</strong>
+                                <ul>{#each videoDesignationPlan.blockers as blocker}<li><code>{blocker.video_id}</code>: {stateLabel(blocker.code)}</li>{/each}</ul>
+                            </div>
+                        {/if}
+                        <div class="plan-inventory">
+                            {#each videoDesignationPlan.operations || [] as operation}
+                                <div class="plan-inventory__row">
+                                    <code>{operation.video_id}</code>
+                                    <span>{basename(operation.source_path || "")}</span>
+                                    <span>→ {basename(operation.destination_path || "")}</span>
+                                </div>
+                            {/each}
+                        </div>
+                        <div class="apply-dock">
+                            <div class="apply-dock__copy">
+                                <strong>Typed confirmation</strong>
+                                <span>Type <code>{videoDesignationPlan.confirmation}</code> exactly.</span>
+                            </div>
+                            <input bind:value={videoDesignationConfirmation} autocomplete="off" spellcheck="false" placeholder={videoDesignationPlan.confirmation} disabled={!videoDesignationPlan.can_apply} />
+                            <button class="button-danger" on:click={applyVideoDesignation} disabled={videoDesignationBusy || !videoDesignationPlan.can_apply || videoDesignationConfirmation !== videoDesignationPlan.confirmation}>
+                                Apply folder changes
+                            </button>
+                        </div>
                     {/if}
                 </section>
 
@@ -1710,9 +1858,13 @@
     .designation-body > button { width: 100%; }
     .video-panel { min-width: 0; overflow: hidden; }
     .video-panel__heading { flex-wrap: wrap; }
-    .video-controls { grid-template-columns: minmax(180px, 1fr) minmax(170px, 260px); }
+    .video-controls { grid-template-columns: auto minmax(180px, 1fr) minmax(170px, 260px); align-items: center; }
     .video-list { max-height: min(700px, 68dvh); min-height: 120px; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
-    .video-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 9px 10px; border-bottom: 1px solid var(--line-soft); }
+    .video-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; padding: 9px 10px; border-bottom: 1px solid var(--line-soft); }
+    .video-row__select { width: 16px; height: 16px; margin-top: 2px; accent-color: var(--accent); }
+    .inline-check { display: inline-flex; align-items: center; gap: 6px; color: var(--text-muted); font-size: 10px; }
+    .inline-check input { width: 15px; height: 15px; }
+    .video-plan-summary { display: flex; justify-content: space-between; gap: 12px; padding: 9px 10px; border-top: 1px solid var(--line-soft); }
     .video-row:last-child { border-bottom: 0; }
     .video-row:hover { background: var(--surface-hover); }
     .video-row__identity { display: grid; min-width: 0; gap: 3px; }
@@ -1789,7 +1941,8 @@
         .job-panel__numbers { grid-column: auto; }
         .job-panel__numbers button { margin-left: auto; }
         .video-controls { grid-template-columns: minmax(0, 1fr); }
-        .video-row { grid-template-columns: minmax(0, 1fr); padding: 10px; }
+        .video-row { grid-template-columns: auto minmax(0, 1fr); padding: 10px; }
+        .video-row__actions { grid-column: 2; }
         .video-row__actions { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
         .video-row__actions time { text-align: left; }
         .video-row__actions a { width: 100%; min-height: 44px; }

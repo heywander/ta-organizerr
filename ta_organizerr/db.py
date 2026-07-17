@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS availability_jobs (
     cancel_requested BOOLEAN NOT NULL DEFAULT 0,
     payload_json TEXT,
     error TEXT,
+    message TEXT,
     created_by TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     started_at TIMESTAMP,
@@ -91,6 +92,20 @@ CREATE TABLE IF NOT EXISTS availability_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_availability_jobs_channel
     ON availability_jobs(channel_id, created_at);
+CREATE TABLE IF NOT EXISTS availability_job_subjects (
+    job_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    source TEXT NOT NULL DEFAULT 'inventory',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    observation_id INTEGER,
+    error TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (job_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_availability_job_subjects_progress
+    ON availability_job_subjects(job_id, status, ordinal);
 CREATE TABLE IF NOT EXISTS availability_observations (
     observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL,
@@ -123,6 +138,42 @@ CREATE TABLE IF NOT EXISTS availability_designation_events (
 );
 CREATE INDEX IF NOT EXISTS idx_availability_designation_events_channel
     ON availability_designation_events(channel_id, event_id);
+CREATE TABLE IF NOT EXISTS video_designations (
+    channel_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    designation TEXT NOT NULL,
+    reason_code TEXT NOT NULL,
+    original_component TEXT NOT NULL,
+    storage_component TEXT NOT NULL,
+    observation_id INTEGER NOT NULL,
+    confirmed_at TIMESTAMP NOT NULL,
+    confirmed_by TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel_id, video_id)
+);
+CREATE INDEX IF NOT EXISTS idx_video_designations_channel
+    ON video_designations(channel_id, designation, video_id);
+CREATE TABLE IF NOT EXISTS video_designation_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    event TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_video_designation_events_channel
+    ON video_designation_events(channel_id, event_id);
+CREATE TABLE IF NOT EXISTS video_designation_plans (
+    token_hash TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS recovered_channel_cases (
     case_id TEXT PRIMARY KEY,
     source_channel_id TEXT NOT NULL UNIQUE,
@@ -205,6 +256,7 @@ _MIGRATIONS = [
     "ALTER TABLE videos ADD COLUMN adopted_real BOOLEAN DEFAULT 0",
     "ALTER TABLE videos ADD COLUMN channel_id TEXT",
     "ALTER TABLE availability_jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'queued'",
+    "ALTER TABLE availability_jobs ADD COLUMN message TEXT",
 ]
 
 

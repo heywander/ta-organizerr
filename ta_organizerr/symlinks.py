@@ -8,7 +8,7 @@ import threading
 import traceback
 from pathlib import Path
 
-from . import availability, channel_designation, db as db_module
+from . import availability, channel_designation, db as db_module, video_designation
 from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
@@ -543,7 +543,8 @@ def process_videos() -> str | None:
                 journal_dir=db_module.DB_PATH.parent
                 / "channel-designation-journals"
             ):
-                return _process_videos_unlocked()
+                with video_designation.mutation_guard():
+                    return _process_videos_unlocked()
         except channel_designation.ChannelDesignationError as exc:
             msg = f"Scan blocked by channel-designation recovery: {exc}"
             log(f"⛔ {msg}")
@@ -571,8 +572,21 @@ def _process_videos_unlocked() -> str | None:
     with get_db() as conn:
         rows = conn.execute("SELECT channel_name FROM hidden_channels").fetchall()
         prior_link_rows = conn.execute(
-            "SELECT video_id, symlink, adopted_real, status FROM videos WHERE symlink IS NOT NULL"
+            """
+            SELECT videos.video_id, videos.symlink, videos.adopted_real,
+                   videos.status, designations.storage_component AS designated_component
+            FROM videos
+            LEFT JOIN video_designations AS designations
+              ON designations.channel_id = videos.channel_id
+             AND designations.video_id = videos.video_id
+            WHERE videos.symlink IS NOT NULL
+            """
         ).fetchall()
+        designated_video_components = {
+            row["video_id"]: row["designated_component"]
+            for row in prior_link_rows
+            if "designated_component" in row.keys() and row["designated_component"]
+        }
     hidden_channels = {row["channel_name"] for row in rows}
     all_channel_names = {
         str(meta["channel_name"])
@@ -662,6 +676,7 @@ def _process_videos_unlocked() -> str | None:
 
             published = sanitize(str(meta["published"]))
             folder_name = f"{published} - {sanitize(meta['title'])}"
+            folder_name = designated_video_components.get(video_id, folder_name)
             host_source_path = HOST_SOURCE_BASE / video_file.relative_to(SOURCE_DIR)
             video_dir, dest_file = _destination_for_video(
                 channel_dir,

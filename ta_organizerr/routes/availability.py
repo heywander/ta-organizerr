@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from flask import Blueprint, jsonify, request, session
 
-from .. import availability, availability_designation
+from .. import availability, availability_designation, video_designation
 from ..auth import requires_auth
 from ..config import YOUTUBE_API_KEY
 
@@ -133,8 +133,10 @@ def api_availability_channel_videos(channel_id: str):
 @requires_auth
 def api_availability_video_check(channel_id: str):
     data = _optional_body()
-    if not set(data).issubset({"video_ids"}):
-        raise availability.AvailabilityError("Video check accepts only video_ids")
+    if not set(data).issubset({"video_ids", "scope", "refresh_inventory"}):
+        raise availability.AvailabilityError(
+            "Video check accepts only scope, video_ids, and refresh_inventory"
+        )
     if "video_ids" in data and data["video_ids"] is None:
         raise availability.AvailabilityError(
             "video_ids must be a non-empty array when supplied"
@@ -142,10 +144,52 @@ def api_availability_video_check(channel_id: str):
     job = availability.start_video_check(
         channel_id,
         data.get("video_ids"),
+        scope=data.get(
+            "scope", "selected" if "video_ids" in data else "smart"
+        ),
+        refresh_inventory=data.get("refresh_inventory", False),
         actor=_actor(),
         background=True,
     )
     return jsonify({"job": job}), 202
+
+
+@bp.post("/channels/<channel_id>/videos/designation/plan")
+@requires_auth
+def api_availability_video_designation_plan(channel_id: str):
+    data = _optional_body()
+    if not set(data).issubset({"video_ids", "action"}) or "video_ids" not in data:
+        raise availability.AvailabilityError(
+            "Video designation plan requires video_ids and optionally action"
+        )
+    return jsonify({
+        "plan": video_designation.build_plan(
+            channel_id,
+            data["video_ids"],
+            action=data.get("action", "designate"),
+            actor=_actor(),
+        )
+    })
+
+
+@bp.post("/channels/<channel_id>/videos/designation/apply")
+@requires_auth
+def api_availability_video_designation_apply(channel_id: str):
+    data = _optional_body()
+    if not {"plan_token", "confirmation"}.issubset(data) or not set(data).issubset({
+        "plan_token", "confirmation"
+    }):
+        raise availability.AvailabilityError(
+            "Video designation apply requires plan_token and confirmation"
+        )
+    return jsonify({
+        "result": video_designation.apply_plan(
+            channel_id,
+            data["plan_token"],
+            data["confirmation"],
+            actor=_actor(),
+        )
+    })
 
 
 @bp.get("/channels/<channel_id>/observations")

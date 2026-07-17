@@ -104,7 +104,28 @@ AVAILABILITY_MAX_CONCURRENT_JOBS=1
 AVAILABILITY_PROBE_RETRIES=2
 AVAILABILITY_PROBE_DELAY_SECONDS=6
 AVAILABILITY_RETRY_BACKOFF_SECONDS=1
+AVAILABILITY_VIDEO_WORKERS=3
+AVAILABILITY_VIDEO_START_INTERVAL_SECONDS=1
 ```
+
+Video availability jobs first recheck the exact channel. Accessible channels
+use database-backed smart selection by default; a full source-tree refresh is
+an explicit UI option. With a YouTube API key, exact video IDs are checked in
+batches of 50 and only absent or identity-mismatched results fall back to
+yt-dlp. Without a key, at most `AVAILABILITY_VIDEO_WORKERS` detail probes run
+at once and their starts are separated by
+`AVAILABILITY_VIDEO_START_INTERVAL_SECONDS`. API absence alone never labels a
+video removed.
+
+For an accessible channel, explicit per-video yt-dlp results can be reviewed
+and applied as reason suffixes on the immediate metadata-backed video folder
+(`Private`, `Community Guidelines Removed`, `Copyright Removed`, `Policy
+Removed`, `Uploader Removed`, or `Account Terminated`). The action is a typed,
+actor-bound dry run; it refuses flat recovered files, nested channel layouts,
+and existing destinations. It journals whole-directory renames, preserves real
+files and raw symlink targets, updates database paths atomically, survives
+restart recovery, and can restore a designated folder after a later Available
+result. Organizer scans consult the persistent designation and retain it.
 
 Compose reads these values from `.env`; values in the shell can override them.
 Compose preserves the project's Unraid-compatible `PUID`/`PGID` default of
