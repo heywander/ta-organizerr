@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
@@ -394,16 +395,22 @@ class AvailabilityDesignationTests(unittest.TestCase):
                 override_minimum_separation=True,
             )
 
-        result = availability_designation.apply_designation(
-            CHANNEL_ID,
-            override_plan["plan_token"],
-            f"BYPASS 24H AND TERMINATE {CHANNEL_ID}",
-            actor="tester",
-            override_minimum_separation=True,
-        )
+        with patch.object(
+            channel_designation,
+            "_rename_noreplace",
+            side_effect=OSError(errno.EINVAL, os.strerror(errno.EINVAL)),
+        ):
+            result = availability_designation.apply_designation(
+                CHANNEL_ID,
+                override_plan["plan_token"],
+                f"BYPASS 24H AND TERMINATE {CHANNEL_ID}",
+                actor="tester",
+                override_minimum_separation=True,
+            )
 
         destination = self.target / f"{component} [Terminated]"
         self.assertTrue(result["minimum_separation_overridden"])
+        self.assertEqual(result["rename_method"], "renameat_compat")
         self.assertFalse(source.exists())
         self.assertEqual((destination / real.name).read_bytes(), b"real media")
         moved_stat = (destination / real.name).stat()
@@ -427,6 +434,7 @@ class AvailabilityDesignationTests(unittest.TestCase):
         self.assertEqual(event["actor"], "tester")
         self.assertEqual(event["event"], "channel_designated_terminated")
         self.assertTrue(details["minimum_separation_overridden"])
+        self.assertEqual(details["rename_method"], "renameat_compat")
         self.assertEqual(len(details["override_basis"]), 2)
         self.assertEqual(len(details["plan_token_sha256"]), 64)
         self.assertEqual(identity["designation_confirmed_by"], "tester")

@@ -778,6 +778,7 @@ def _commit_designation(
     *,
     old_root: Path | None,
     new_root: Path | None,
+    rename_method: str | None = None,
 ) -> None:
     payload = details["payload"]
     channel_id = payload["channel_id"]
@@ -830,6 +831,7 @@ def _commit_designation(
                                 "override_minimum_separation"
                             ],
                             "override_basis": payload["override_basis"],
+                            "rename_method": rename_method,
                         }),
                     ),
                 )
@@ -876,6 +878,7 @@ def _commit_designation(
                             "override_minimum_separation"
                         ],
                         "override_basis": payload["override_basis"],
+                        "rename_method": rename_method,
                         "plan_token_sha256": plan_token_hash,
                     }),
                 ),
@@ -1021,8 +1024,17 @@ def apply_designation(
         with get_db() as conn:
             _validate_precondition_conn(conn, details)
 
-    def update(_mutation: dict[str, Any]) -> None:
-        _commit_designation(details, actor, old_root=old_root, new_root=new_root)
+    def update(mutation: dict[str, Any]) -> None:
+        rename_method = mutation.get("rename_method")
+        _commit_designation(
+            details,
+            actor,
+            old_root=old_root,
+            new_root=new_root,
+            rename_method=(
+                rename_method if isinstance(rename_method, str) else None
+            ),
+        )
 
     try:
         result = channel_designation.apply_designation_plan(
@@ -1045,6 +1057,11 @@ def apply_designation(
     log(
         f"🏷️ [AVAILABILITY] Confirmed terminated channel {channel_id}: "
         f"{result['old_path']} -> {result['new_path']}"
+        + (
+            " (filesystem compatibility rename)"
+            if result.get("rename_method") == "renameat_compat"
+            else ""
+        )
         + (
             f" (administrator {actor} bypassed the 24-hour separation)"
             if override_minimum_separation

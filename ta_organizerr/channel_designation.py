@@ -51,6 +51,11 @@ _JOURNAL_SCHEMA = 1
 _PLAN_SCHEMA = 1
 _AT_FDCWD = -100
 _RENAME_NOREPLACE = 1
+_RENAME_NOREPLACE_UNSUPPORTED = frozenset({
+    errno.EINVAL,
+    errno.ENOSYS,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+})
 _DIRECTORY_FLAGS = (
     os.O_RDONLY
     | getattr(os, "O_CLOEXEC", 0)
@@ -851,6 +856,82 @@ def _rename_noreplace(
         raise OSError(error_number, os.strerror(error_number), source_name)
 
 
+def _rename_directory_noreplace_compat(
+    root_fd: int,
+    source_name: str,
+    destination_name: str,
+    expected_source_identity: Iterable[int],
+) -> str:
+    """Rename one whole directory on filesystems lacking NOREPLACE.
+
+    ``renameat2(RENAME_NOREPLACE)`` remains the preferred operation. Some
+    virtual filesystems, notably Unraid's shfs, expose ordinary rename support
+    but reject that flag with ``EINVAL``. Only whole channel-directory moves
+    may use this compatibility path; consolidation entries continue to fail
+    closed because ordinary rename could replace a raced media file.
+
+    A filesystem without ``RENAME_NOREPLACE`` cannot provide the same atomic
+    destination-absence guarantee. The shared mutation lock, pinned parent
+    descriptor, immediate destination recheck, directory-only type rules, and
+    post-move identity/inventory validation bound that compatibility gap.
+    """
+
+    try:
+        _rename_noreplace(root_fd, source_name, root_fd, destination_name)
+        return "renameat2_noreplace"
+    except ChannelDesignationError as exc:
+        if exc.code != "rename_noreplace_unavailable":
+            raise
+    except OSError as exc:
+        if exc.errno not in _RENAME_NOREPLACE_UNSUPPORTED:
+            raise
+
+    source_state = _directory_child_stat(
+        root_fd, source_name, "Source channel folder"
+    )
+    if not _same_identity(source_state, expected_source_identity):
+        raise ChannelDesignationError(
+            "Source channel folder changed before compatibility rename",
+            409,
+            code="stale_plan",
+        )
+    if _child_stat(root_fd, destination_name) is not None:
+        raise FileExistsError(
+            errno.EEXIST,
+            os.strerror(errno.EEXIST),
+            destination_name,
+        )
+    try:
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=root_fd,
+            dst_dir_fd=root_fd,
+        )
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(
+                errno.EEXIST,
+                os.strerror(errno.EEXIST),
+                destination_name,
+            ) from exc
+        raise
+
+    source_after = _child_stat(root_fd, source_name)
+    destination_after = _directory_child_stat(
+        root_fd, destination_name, "Renamed channel folder"
+    )
+    if source_after is not None or not _same_identity(
+        destination_after, expected_source_identity
+    ):
+        raise ChannelDesignationError(
+            "Compatibility rename outcome could not be proven safe",
+            409,
+            code="identity_mismatch",
+        )
+    return "renameat_compat"
+
+
 def _ensure_journal_dir(journal_dir: Path | None) -> Path:
     directory = Path(journal_dir or (DATA_DIR / "channel-designation-journals"))
     if not directory.is_absolute():
@@ -986,6 +1067,8 @@ def _journal_from_plan(plan: dict[str, Any]) -> dict[str, Any]:
             for directory in plan["merged_directories"]
         ],
         "source_directory_removed": False,
+        "rename_method": None,
+        "rollback_rename_method": None,
         "error": None,
     }
 
@@ -1099,6 +1182,7 @@ def _assert_inventory_matches(
 
 
 def _validate_applied_snapshot(
+    root_fd: int,
     journal: dict[str, Any],
     managed_roots: tuple[Path, ...],
 ) -> None:
@@ -1115,6 +1199,12 @@ def _validate_applied_snapshot(
             code="inventory_changed",
         )
     if journal["mode"] == "rename":
+        if _child_stat(root_fd, journal["source_component"]) is not None:
+            raise ChannelDesignationError(
+                "The old channel path reappeared during designation",
+                409,
+                code="inventory_changed",
+            )
         expected_destination = {item["path"]: item for item in plan["inventory"]}
         _assert_inventory_matches(
             current_destination,
@@ -1181,7 +1271,12 @@ def _apply_filesystem(
                 "Destination appeared after the dry run", 409, code="stale_plan"
             )
         try:
-            _rename_noreplace(root_fd, source_component, root_fd, destination_component)
+            journal["rename_method"] = _rename_directory_noreplace_compat(
+                root_fd,
+                source_component,
+                destination_component,
+                journal["source_identity"],
+            )
         except FileExistsError as exc:
             raise ChannelDesignationError(
                 "Destination appeared after the dry run", 409, code="stale_plan"
@@ -1194,7 +1289,7 @@ def _apply_filesystem(
             )
         _fsync_fd(root_fd)
         journal["source_directory_removed"] = True
-        _validate_applied_snapshot(journal, managed_roots)
+        _validate_applied_snapshot(root_fd, journal, managed_roots)
         _persist_status(journal_dir, journal, "filesystem_applied")
         return
 
@@ -1283,7 +1378,7 @@ def _apply_filesystem(
         # ownership, mode, ACLs, xattrs, and timestamps) until the DB CAS has
         # committed.  A failed DB update can then restore entries without
         # manufacturing a lookalike source folder.
-        _validate_applied_snapshot(journal, managed_roots)
+        _validate_applied_snapshot(root_fd, journal, managed_roots)
         _persist_status(journal_dir, journal, "filesystem_applied")
     finally:
         os.close(destination_fd)
@@ -1391,7 +1486,14 @@ def _rollback_filesystem(
             and destination_state is not None
             and _same_identity(destination_state, journal["source_identity"])
         ):
-            _rename_noreplace(root_fd, destination_component, root_fd, source_component)
+            journal["rollback_rename_method"] = (
+                _rename_directory_noreplace_compat(
+                    root_fd,
+                    destination_component,
+                    source_component,
+                    journal["source_identity"],
+                )
+            )
             _fsync_fd(root_fd)
         else:
             raise ChannelDesignationError(
@@ -1560,6 +1662,16 @@ def apply_designation_plan(
                             code="stale_plan",
                         )
                     _apply_filesystem(root_fd, journal_directory, journal, roots)
+                    if (
+                        journal["mode"] == "rename"
+                        and _child_stat(root_fd, journal["source_component"])
+                        is not None
+                    ):
+                        raise ChannelDesignationError(
+                            "The old channel path reappeared before the database update",
+                            409,
+                            code="inventory_changed",
+                        )
                     mutation = {
                         **journal,
                         "old_path": str(source),
@@ -1666,6 +1778,7 @@ def apply_designation_plan(
             "new_path": str(destination),
             "mode": plan["mode"],
             "counts": plan["counts"],
+            "rename_method": journal.get("rename_method"),
         }
 
 

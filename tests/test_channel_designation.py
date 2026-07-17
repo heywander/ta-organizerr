@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import tempfile
@@ -124,6 +125,198 @@ class ChannelDesignationTests(unittest.TestCase):
             journal_dir=self.journals, include_terminal=True
         )
         self.assertEqual(journals[0]["status"], "committed")
+
+    def test_unsupported_noreplace_uses_whole_directory_compatibility_rename(self) -> None:
+        source = self.target / "The Oversphere [Recovered]"
+        source.mkdir()
+        media = source / "real.mp4"
+        media.write_bytes(b"unaltered media bytes")
+        link = source / "video.mp4"
+        raw_target = "/archive/UCtbyZ5js_2m1LLi4nrrnFfw/g58pQud8er0.mp4"
+        link.symlink_to(raw_target)
+        source_identity = media_identity(os.lstat(source))
+        media_file_identity = media_identity(os.lstat(media))
+        link_identity = media_identity(os.lstat(link))
+        plan = self._plan()
+
+        unsupported = OSError(
+            errno.EINVAL,
+            os.strerror(errno.EINVAL),
+            source.name,
+        )
+        with patch.object(
+            channel_designation,
+            "_rename_noreplace",
+            side_effect=unsupported,
+        ):
+            result = self._apply(plan, lambda _mutation: None)
+
+        destination = self.target / "The Oversphere [Recovered] [Terminated]"
+        self.assertEqual(result["rename_method"], "renameat_compat")
+        self.assertFalse(source.exists())
+        self.assertEqual(media_identity(os.lstat(destination)), source_identity)
+        self.assertEqual(
+            media_identity(os.lstat(destination / media.name)),
+            media_file_identity,
+        )
+        self.assertEqual(
+            media_identity(os.lstat(destination / link.name)),
+            link_identity,
+        )
+        self.assertEqual(os.readlink(destination / link.name), raw_target)
+
+    def test_compatibility_rename_rolls_back_after_database_failure(self) -> None:
+        source = self.target / "Channel"
+        source.mkdir()
+        media = source / "video.mp4"
+        media.write_bytes(b"media")
+        source_identity = media_identity(os.lstat(source))
+        media_file_identity = media_identity(os.lstat(media))
+        plan = self._plan("Channel")
+
+        with (
+            patch.object(
+                channel_designation,
+                "_rename_noreplace",
+                side_effect=OSError(errno.EINVAL, os.strerror(errno.EINVAL)),
+            ),
+            self.assertRaises(channel_designation.ChannelDesignationError),
+        ):
+            self._apply(
+                plan,
+                lambda _mutation: (_ for _ in ()).throw(RuntimeError("DB failed")),
+            )
+
+        self.assertEqual(media_identity(os.lstat(source)), source_identity)
+        self.assertEqual(media_identity(os.lstat(media)), media_file_identity)
+        self.assertFalse((self.target / "Channel [Terminated]").exists())
+        journals = channel_designation.list_designation_journals(
+            journal_dir=self.journals,
+            include_terminal=True,
+        )
+        self.assertEqual(journals[0]["status"], "rolled_back")
+        self.assertEqual(journals[0]["rename_method"], "renameat_compat")
+        self.assertEqual(
+            journals[0]["rollback_rename_method"],
+            "renameat_compat",
+        )
+
+    def test_compatibility_rename_never_replaces_destination_seen_on_recheck(self) -> None:
+        source = self.target / "Channel"
+        destination = self.target / "Channel [Terminated]"
+        source.mkdir()
+        (source / "video.mp4").write_bytes(b"media")
+        plan = self._plan("Channel")
+        updated = False
+
+        def destination_race(*_args):
+            destination.mkdir()
+            (destination / "foreign.mp4").write_bytes(b"foreign")
+            raise OSError(errno.EINVAL, os.strerror(errno.EINVAL))
+
+        def update(_mutation):
+            nonlocal updated
+            updated = True
+
+        with (
+            patch.object(
+                channel_designation,
+                "_rename_noreplace",
+                side_effect=destination_race,
+            ),
+            self.assertRaises(channel_designation.ChannelDesignationError) as raised,
+        ):
+            self._apply(plan, update)
+
+        self.assertEqual(raised.exception.code, "stale_plan")
+        self.assertFalse(updated)
+        self.assertEqual((source / "video.mp4").read_bytes(), b"media")
+        self.assertEqual(
+            (destination / "foreign.mp4").read_bytes(),
+            b"foreign",
+        )
+
+    def test_unexpected_noreplace_error_does_not_use_compatibility_rename(self) -> None:
+        source = self.target / "Channel"
+        source.mkdir()
+        (source / "video.mp4").write_bytes(b"media")
+        plan = self._plan("Channel")
+
+        with (
+            patch.object(
+                channel_designation,
+                "_rename_noreplace",
+                side_effect=OSError(errno.EACCES, os.strerror(errno.EACCES)),
+            ),
+            patch.object(channel_designation.os, "rename") as fallback,
+            self.assertRaises(channel_designation.ChannelDesignationError),
+        ):
+            self._apply(plan, lambda _mutation: None)
+
+        fallback.assert_not_called()
+        self.assertEqual((source / "video.mp4").read_bytes(), b"media")
+        self.assertFalse((self.target / "Channel [Terminated]").exists())
+
+    def test_consolidation_does_not_use_directory_compatibility_fallback(self) -> None:
+        source = self.target / "Channel"
+        destination = self.target / "Channel [Terminated]"
+        source.mkdir()
+        destination.mkdir()
+        (source / "source.mp4").write_bytes(b"source")
+        (destination / "existing.mp4").write_bytes(b"existing")
+        plan = self._plan("Channel", destination_channel_id=CHANNEL_ID)
+
+        with (
+            patch.object(
+                channel_designation,
+                "_rename_noreplace",
+                side_effect=OSError(errno.EINVAL, os.strerror(errno.EINVAL)),
+            ),
+            patch.object(channel_designation.os, "rename") as fallback,
+            self.assertRaises(channel_designation.ChannelDesignationError),
+        ):
+            self._apply(plan, lambda _mutation: None)
+
+        fallback.assert_not_called()
+        self.assertEqual((source / "source.mp4").read_bytes(), b"source")
+        self.assertEqual(
+            (destination / "existing.mp4").read_bytes(),
+            b"existing",
+        )
+        self.assertFalse((destination / "source.mp4").exists())
+
+    def test_old_source_path_reappearing_after_rename_fails_closed(self) -> None:
+        source = self.target / "Channel"
+        destination = self.target / "Channel [Terminated]"
+        source.mkdir()
+        (source / "video.mp4").write_bytes(b"media")
+        plan = self._plan("Channel")
+        original = channel_designation._rename_directory_noreplace_compat
+
+        def rename_then_recreate(*args, **kwargs):
+            method = original(*args, **kwargs)
+            source.mkdir()
+            (source / "foreign.mp4").write_bytes(b"foreign")
+            return method
+
+        with (
+            patch.object(
+                channel_designation,
+                "_rename_directory_noreplace_compat",
+                side_effect=rename_then_recreate,
+            ),
+            self.assertRaises(channel_designation.ChannelDesignationError) as raised,
+        ):
+            self._apply(plan, lambda _mutation: None)
+
+        self.assertEqual(raised.exception.code, "recovery_blocked")
+        self.assertEqual((source / "foreign.mp4").read_bytes(), b"foreign")
+        self.assertEqual((destination / "video.mp4").read_bytes(), b"media")
+        journals = channel_designation.list_designation_journals(
+            journal_dir=self.journals,
+            include_terminal=True,
+        )
+        self.assertEqual(journals[0]["status"], "recovery_blocked")
 
     def test_relative_internal_symlink_keeps_meaning(self) -> None:
         source = self.target / "Channel"
