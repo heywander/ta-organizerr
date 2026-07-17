@@ -63,13 +63,24 @@ def api_availability_channel_check(channel_id: str):
 @requires_auth
 def api_availability_designation_plan(channel_id: str):
     data = _optional_body()
-    if set(data) != {"designation"}:
+    if "designation" not in data or not set(data).issubset({
+        "designation", "override_minimum_separation"
+    }):
         raise availability.AvailabilityError(
-            "Designation plan requires only designation"
+            "Designation plan requires designation and optionally "
+            "override_minimum_separation"
+        )
+    override = data.get("override_minimum_separation", False)
+    if not isinstance(override, bool):
+        raise availability.AvailabilityError(
+            "override_minimum_separation must be true or false"
         )
     return jsonify({
         "plan": availability_designation.build_designation_plan(
-            channel_id, data["designation"]
+            channel_id,
+            data["designation"],
+            override_minimum_separation=override,
+            actor=_actor(),
         )
     })
 
@@ -78,9 +89,17 @@ def api_availability_designation_plan(channel_id: str):
 @requires_auth
 def api_availability_designation_apply(channel_id: str):
     data = _optional_body()
-    if set(data) != {"plan_token", "confirmation"}:
+    if not {"plan_token", "confirmation"}.issubset(data) or not set(data).issubset({
+        "plan_token", "confirmation", "override_minimum_separation"
+    }):
         raise availability.AvailabilityError(
-            "Designation apply requires only plan_token and confirmation"
+            "Designation apply requires plan_token and confirmation, with optional "
+            "override_minimum_separation"
+        )
+    override = data.get("override_minimum_separation", False)
+    if not isinstance(override, bool):
+        raise availability.AvailabilityError(
+            "override_minimum_separation must be true or false"
         )
     return jsonify({
         "result": availability_designation.apply_designation(
@@ -88,6 +107,7 @@ def api_availability_designation_apply(channel_id: str):
             data["plan_token"],
             data["confirmation"],
             actor=_actor(),
+            override_minimum_separation=override,
         )
     })
 

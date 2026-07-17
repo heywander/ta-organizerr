@@ -171,6 +171,51 @@ class AvailabilityTests(unittest.TestCase):
         )
         self.assertTrue(availability.termination_eligibility(CHANNEL_ID)["eligible"])
 
+    def test_channel_response_surfaces_server_owned_wait_override(self) -> None:
+        self._identity()
+        raw_reason = self._channel_error(
+            "This channel was removed because it violated our Community Guidelines."
+        )
+        result = {
+            "state": "terminated_explicit",
+            "reason_code": "channel_terminated",
+            "raw_reason": raw_reason,
+            "provider": "yt-dlp",
+            "evidence": {
+                "classifier_version": "availability-v2",
+                "api_resource_exists": False,
+                "youtube_api": None,
+                "yt_dlp": {"returncode": 1, "raw_reason": raw_reason},
+            },
+        }
+        availability.record_observation(
+            "first-job",
+            "channel",
+            CHANNEL_ID,
+            CHANNEL_ID,
+            result,
+            observed_at="2026-07-17T02:34:00+00:00",
+        )
+        availability.record_observation(
+            "second-job",
+            "channel",
+            CHANNEL_ID,
+            CHANNEL_ID,
+            result,
+            observed_at="2026-07-17T02:38:00+00:00",
+        )
+
+        eligibility = availability.termination_eligibility(CHANNEL_ID)
+        channel = availability.get_channel(CHANNEL_ID)
+
+        self.assertFalse(eligibility["eligible"])
+        self.assertTrue(eligibility["minimum_separation_override_available"])
+        self.assertTrue(
+            channel["termination_eligibility"][
+                "minimum_separation_override_available"
+            ]
+        )
+
     def test_accessible_observation_between_explicit_results_blocks_candidate(self) -> None:
         self._identity()
         terminated = {
@@ -660,6 +705,7 @@ class AvailabilityTests(unittest.TestCase):
             waiting["next_qualifying_observation_at"],
             "2026-07-18T02:34:00+00:00",
         )
+        self.assertFalse(waiting["minimum_separation_override_available"])
 
         reset_rows = waiting_rows + [{
             "observation_id": 3,
@@ -707,6 +753,220 @@ class AvailabilityTests(unittest.TestCase):
             mixed_offset_reset["last_blocking_observation"]["state"],
             "accessible",
         )
+
+    def test_minimum_separation_override_requires_two_exact_v2_jobs(self) -> None:
+        raw_reason = self._channel_error(
+            "This channel was removed because it violated our Community Guidelines."
+        )
+        common = {
+            "subject_id": CHANNEL_ID,
+            "normalized_state": "terminated_explicit",
+            "reason_code": "channel_terminated",
+            "provider": "yt-dlp",
+            "raw_reason": raw_reason,
+            "evidence_json": json.dumps({
+                "classifier_version": "availability-v2",
+                "api_resource_exists": False,
+                "youtube_api": None,
+                "yt_dlp": {"returncode": 1, "raw_reason": raw_reason},
+            }),
+        }
+        rows = [
+            {
+                **common,
+                "observation_id": 1,
+                "job_id": "first-job",
+                "observed_at": "2026-07-17T02:34:00+00:00",
+            },
+            {
+                **common,
+                "observation_id": 2,
+                "job_id": "second-job",
+                "observed_at": "2026-07-17T02:38:00+00:00",
+            },
+        ]
+        result = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            rows,
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(result["eligible"])
+        self.assertTrue(result["minimum_separation_override_available"])
+        self.assertEqual(
+            [item["job_id"] for item in result["minimum_separation_override_basis"]],
+            ["first-job", "second-job"],
+        )
+
+        duplicate_job = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            [rows[0], {**rows[1], "job_id": "first-job"}],
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(
+            duplicate_job["minimum_separation_override_available"]
+        )
+
+        wrong_identity = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            [
+                rows[0],
+                {
+                    **rows[1],
+                    "raw_reason": self._channel_error(
+                        "This channel was removed because it violated our Community Guidelines.",
+                        OTHER_CHANNEL_ID,
+                    ),
+                },
+            ],
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(
+            wrong_identity["minimum_separation_override_available"]
+        )
+
+        arbitrary_reason_rows = [
+            {**row, "reason_code": "account_terminated"}
+            for row in rows
+        ]
+        arbitrary_reason = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "account_terminated",
+            arbitrary_reason_rows,
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(
+            arbitrary_reason["minimum_separation_override_available"]
+        )
+
+        contradictory_evidence = json.dumps({
+            "classifier_version": "availability-v2",
+            "api_resource_exists": True,
+            "youtube_api": {"state": "accessible"},
+            "yt_dlp": {"returncode": 1, "raw_reason": raw_reason},
+        })
+        contradiction = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            [
+                {**row, "provider": "yt-dlp+youtube-data-api",
+                 "evidence_json": contradictory_evidence}
+                for row in rows
+            ],
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(
+            contradiction["minimum_separation_override_available"]
+        )
+
+        for malformed_api_evidence in (
+            None,
+            "accessible",
+            ["accessible"],
+            {},
+            {"state": None},
+            {"state": True},
+            {"state": "Accessible"},
+            {"state": "unexpected"},
+        ):
+            malformed_composite = availability._termination_eligibility_from_rows(
+                "terminated_explicit",
+                "channel_terminated",
+                [
+                    {
+                        **row,
+                        "provider": "yt-dlp+youtube-data-api",
+                        "evidence_json": json.dumps({
+                            "classifier_version": "availability-v2",
+                            "api_resource_exists": False,
+                            "youtube_api": malformed_api_evidence,
+                            "yt_dlp": {
+                                "returncode": 1,
+                                "raw_reason": raw_reason,
+                            },
+                        }),
+                    }
+                    for row in rows
+                ],
+                now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+                requested_channel_id=CHANNEL_ID,
+            )
+            self.assertFalse(
+                malformed_composite["minimum_separation_override_available"]
+            )
+
+        valid_composite_evidence = json.dumps({
+            "classifier_version": "availability-v2",
+            "api_resource_exists": False,
+            "youtube_api": {"state": "unavailable_unknown"},
+            "yt_dlp": {"returncode": 1, "raw_reason": raw_reason},
+        })
+        valid_composite = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            [
+                {
+                    **row,
+                    "provider": "yt-dlp+youtube-data-api",
+                    "evidence_json": valid_composite_evidence,
+                }
+                for row in rows
+            ],
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertTrue(
+            valid_composite["minimum_separation_override_available"]
+        )
+
+        plain_with_api_evidence = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            [
+                {
+                    **row,
+                    "evidence_json": json.dumps({
+                        "classifier_version": "availability-v2",
+                        "api_resource_exists": False,
+                        "youtube_api": {"state": "unavailable_unknown"},
+                        "yt_dlp": {
+                            "returncode": 1,
+                            "raw_reason": raw_reason,
+                        },
+                    }),
+                }
+                for row in rows
+            ],
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(
+            plain_with_api_evidence["minimum_separation_override_available"]
+        )
+
+        incomplete = availability._termination_eligibility_from_rows(
+            "terminated_explicit",
+            "channel_terminated",
+            [
+                {
+                    **row,
+                    "evidence_json": json.dumps({
+                        "classifier_version": "availability-v2",
+                    }),
+                }
+                for row in rows
+            ],
+            now=availability._parse_time("2026-07-17T03:00:00+00:00"),
+            requested_channel_id=CHANNEL_ID,
+        )
+        self.assertFalse(incomplete["minimum_separation_override_available"])
 
     def test_eligibility_uses_exact_utc_boundary_and_exact_qualifying_pair(self) -> None:
         rows = [

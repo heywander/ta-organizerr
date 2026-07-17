@@ -136,3 +136,22 @@ test("preserves the server-selected qualifying pair without inventing rows", () 
     });
     assert.deepEqual(normalized.countingObservationIds, ["1", "3"]);
 });
+
+test("exposes only a literal server-owned minimum-separation override", () => {
+    assert.equal(
+        normalizeTerminationEligibility({
+            minimum_separation_override_available: true,
+        }).minimumSeparationOverrideAvailable,
+        true,
+    );
+    for (const value of [undefined, false, 1, "true"]) {
+        assert.equal(
+            normalizeTerminationEligibility({
+                minimum_separation_override_available: value,
+                matching_observations: 99,
+                status: "waiting_for_interval",
+            }).minimumSeparationOverrideAvailable,
+            false,
+        );
+    }
+});

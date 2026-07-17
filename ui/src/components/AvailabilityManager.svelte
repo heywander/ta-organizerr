@@ -56,6 +56,7 @@
             observedAt: string;
         } | null;
         apiCorroborationRequired: boolean;
+        minimumSeparationOverrideAvailable: boolean;
     };
 
     type ChannelRecord = {
@@ -121,6 +122,8 @@
         counts: Record<string, number | string>;
         inventory: PlanInventoryItem[];
         expiresAt: string;
+        minimumSeparationOverridden: boolean;
+        confirmationPhrase: string;
     };
 
     const channelStates = [
@@ -218,15 +221,15 @@
         );
     });
 
-    $: confirmationPhrase = selectedChannel
-        ? `TERMINATE ${selectedChannel.channelId}`
-        : "";
+    $: confirmationPhrase = designationPlan?.confirmationPhrase || (
+        selectedChannel ? `TERMINATE ${selectedChannel.channelId}` : ""
+    );
 
     $: mayApplyPlan = Boolean(
-        designationPlan?.token &&
+            designationPlan?.token &&
             designationPlan.canApply &&
             designationPlan.blockers.length === 0 &&
-            confirmation.trim() === confirmationPhrase,
+            confirmation === confirmationPhrase,
     );
 
     function normalize(value: unknown): string {
@@ -504,6 +507,9 @@
             counts: plan?.counts && typeof plan.counts === "object" ? plan.counts : {},
             inventory: flattenInventory(plan),
             expiresAt: textValue(plan?.expires_at),
+            minimumSeparationOverridden:
+                plan?.minimum_separation_overridden === true,
+            confirmationPhrase: textValue(plan?.confirmation),
         };
     }
 
@@ -856,7 +862,7 @@
         }
     }
 
-    async function createDesignationPlan() {
+    async function createDesignationPlan(overrideMinimumSeparation = false) {
         if (!selectedChannelId || planningDesignation || applyingDesignation) return;
         const channelId = selectedChannelId;
         const generation = ++designationGeneration;
@@ -871,7 +877,10 @@
                 {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ designation: "terminated" }),
+                    body: JSON.stringify({
+                        designation: "terminated",
+                        override_minimum_separation: overrideMinimumSeparation,
+                    }),
                 },
             );
             const planned = normalizePlan(await readResponse(response));
@@ -904,6 +913,8 @@
                     body: JSON.stringify({
                         plan_token: planToken,
                         confirmation,
+                        override_minimum_separation:
+                            designationPlan.minimumSeparationOverridden,
                     }),
                 },
             );
@@ -1389,6 +1400,11 @@
                                     <i class="bi bi-exclamation-diamond"></i>
                                     <span><strong>Eligible for administrator review</strong>Repeated explicit observations satisfy the evidence threshold.</span>
                                 </div>
+                            {:else if selectedChannel.terminationEligibility.minimumSeparationOverrideAvailable}
+                                <div class="designation-state designation-state--override">
+                                    <i class="bi bi-shield-exclamation"></i>
+                                    <span><strong>24-hour override available</strong>At least two distinct exact termination responses exist. An administrator may bypass only their required time separation.</span>
+                                </div>
                             {:else}
                                 <div class="designation-state">
                                     <i class="bi bi-shield-lock"></i>
@@ -1398,10 +1414,22 @@
 
                             <p class="designation-explainer">The dry run inventories both symlinks and real files. Applying it changes the top-level channel folder name while preserving media contents and link targets.</p>
 
-                            <button class="button" on:click={createDesignationPlan} disabled={!selectedChannel.terminationCandidate || planningDesignation || applyingDesignation || jobRunning(activeJob)}>
-                                <i class:spin={planningDesignation} class="bi bi-clipboard-check"></i>
-                                {planningDesignation ? "Building dry run…" : "Review folder rename"}
-                            </button>
+                            {#if selectedChannel.terminationCandidate}
+                                <button class="button" on:click={() => createDesignationPlan(false)} disabled={planningDesignation || applyingDesignation || jobRunning(activeJob)}>
+                                    <i class:spin={planningDesignation} class="bi bi-clipboard-check"></i>
+                                    {planningDesignation ? "Building dry run…" : "Review folder rename"}
+                                </button>
+                            {:else if selectedChannel.terminationEligibility.minimumSeparationOverrideAvailable}
+                                <p class="override-explainer"><strong>This does not rename immediately.</strong> Identity, ownership, collision, active-job, journal, dry-run, plan-token, and typed-confirmation checks remain mandatory.</p>
+                                <button class="button button-override" on:click={() => createDesignationPlan(true)} disabled={planningDesignation || applyingDesignation || jobRunning(activeJob)}>
+                                    <i class:spin={planningDesignation} class="bi bi-hourglass-split"></i>
+                                    {planningDesignation ? "Building override dry run…" : "Bypass 24-hour wait and review"}
+                                </button>
+                            {:else}
+                                <button class="button" disabled>
+                                    <i class="bi bi-shield-lock"></i> Review folder rename
+                                </button>
+                            {/if}
                         </div>
                     </section>
                 </div>
@@ -1481,7 +1509,7 @@
                     <section class="panel dry-run-panel" aria-labelledby="dry-run-title">
                         <div class="panel-header">
                             <div>
-                                <span class="eyebrow">No changes made</span>
+                                <span class="eyebrow">{designationPlan.minimumSeparationOverridden ? "24-hour override · no changes made" : "No changes made"}</span>
                                 <h2 class="section-title" id="dry-run-title"><i class="bi bi-clipboard-data"></i> Folder designation dry run</h2>
                             </div>
                             <span class="state-badge state-badge--{designationPlan.canApply && designationPlan.blockers.length === 0 ? "good" : "danger"}">
@@ -1531,7 +1559,7 @@
 
                         <div class="apply-dock">
                             <div class="apply-dock__copy">
-                                <strong>Administrator confirmation</strong>
+                                <strong>{designationPlan.minimumSeparationOverridden ? "Administrator override confirmation" : "Administrator confirmation"}</strong>
                                 <span>Type <code>{confirmationPhrase}</code> exactly. The plan token and current registry revision are revalidated by the server.</span>
                             </div>
                             <input bind:value={confirmation} autocomplete="off" spellcheck="false" aria-label="Typed termination confirmation" placeholder={confirmationPhrase} disabled={!designationPlan.canApply || designationPlan.blockers.length > 0} />
@@ -1669,11 +1697,16 @@
     .designation-state > i { margin-top: 2px; color: var(--text-muted); }
     .designation-state--candidate { border-color: var(--warning); }
     .designation-state--candidate > i { color: var(--warning); }
+    .designation-state--override { border-color: var(--warning); background: color-mix(in srgb, var(--warning) 7%, var(--page-deep)); }
+    .designation-state--override > i { color: var(--warning); }
     .designation-state--confirmed { border-color: var(--success); }
     .designation-state--confirmed > i { color: var(--success); }
     .designation-state span { display: grid; gap: 2px; color: var(--text-muted); font-size: 10px; }
     .designation-state strong { color: var(--text); font-size: 11px; }
     .designation-explainer { margin: 0; color: var(--text-muted); font-size: 10px; }
+    .override-explainer { margin: 0; padding: 8px 9px; border-left: 2px solid var(--warning); background: color-mix(in srgb, var(--warning) 6%, transparent); color: var(--text-muted); font-size: 10px; }
+    .override-explainer strong { color: var(--warning); }
+    .button-override { border-color: var(--warning); color: var(--warning); white-space: normal; }
     .designation-body > button { width: 100%; }
     .video-panel { min-width: 0; overflow: hidden; }
     .video-panel__heading { flex-wrap: wrap; }
@@ -1766,6 +1799,7 @@
         .rename-paths > i { transform: rotate(90deg); justify-self: center; }
         .plan-inventory { max-height: 52dvh; }
         .plan-inventory__row { grid-template-columns: minmax(0, 1fr); gap: 3px; padding: 9px 10px; }
+        .button-override { min-height: 46px; line-height: 1.25; }
         .apply-dock { grid-template-columns: minmax(0, 1fr); padding-bottom: max(10px, env(safe-area-inset-bottom)); }
         .apply-dock button { grid-column: auto; min-height: 48px; }
         .apply-dock input { min-height: 46px; }

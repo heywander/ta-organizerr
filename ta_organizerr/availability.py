@@ -323,8 +323,9 @@ def list_channels() -> list[dict[str, Any]]:
         channel_observations: dict[str, list[sqlite3.Row]] = {}
         for observation in conn.execute(
             """
-            SELECT observation_id, channel_id, normalized_state, reason_code,
-                   observed_at
+            SELECT observation_id, job_id, subject_id, channel_id,
+                   normalized_state, reason_code, provider, raw_reason,
+                   evidence_json, observed_at
             FROM availability_observations
             WHERE subject_type = 'channel'
               AND normalized_state IN (
@@ -346,6 +347,7 @@ def list_channels() -> list[dict[str, Any]]:
                 row["current_state"],
                 row["current_reason_code"],
                 channel_observations.get(row["channel_id"], []),
+                requested_channel_id=row["channel_id"],
             ),
         )
         for row in rows
@@ -1682,6 +1684,7 @@ def _termination_eligibility_from_rows(
     rows: list[sqlite3.Row],
     *,
     now: datetime | None = None,
+    requested_channel_id: str | None = None,
 ) -> dict[str, Any]:
     def value(row: sqlite3.Row, key: str) -> Any:
         try:
@@ -1782,6 +1785,8 @@ def _termination_eligibility_from_rows(
         ],
         "invalid_observation_count": len(invalid_observations),
         "api_corroboration_required": False,
+        "minimum_separation_override_available": False,
+        "minimum_separation_override_basis": [],
         "reason_code": reason,
     }
     invalid_blockers = [
@@ -1897,6 +1902,111 @@ def _termination_eligibility_from_rows(
             base["status"] = "invalid_timestamp_evidence"
         return base
 
+    # A manual override may bypass only the 24-hour separation, never the
+    # repeated exact-provider evidence requirement. Keep this decision fully
+    # server-owned: two distinct jobs must each contain a v2 yt-dlp response
+    # that reclassifies to the exact current UCID and reason after the latest
+    # accessible/conflicting observation.
+    if (
+        qualifying_second is None
+        and requested_channel_id is not None
+        and current_state == "terminated_explicit"
+        and reason in {"channel_terminated", "channel_suspended"}
+    ):
+        override_basis: list[dict[str, Any]] = []
+        seen_jobs: set[str] = set()
+        for row in counting:
+            job_id = str(value(row, "job_id") or "").strip()
+            provider = str(value(row, "provider") or "").casefold()
+            raw_reason = str(value(row, "raw_reason") or "")
+            evidence = _decode_json(value(row, "evidence_json"), {})
+            stored_subject_id = value(row, "subject_id")
+            if (
+                not job_id
+                or job_id in seen_jobs
+                or provider not in {"yt-dlp", "yt-dlp+youtube-data-api"}
+                or not isinstance(evidence, dict)
+                or evidence.get("classifier_version") != _CLASSIFIER_VERSION
+                or stored_subject_id != requested_channel_id
+            ):
+                continue
+
+            # A version label alone is not evidence. Require the structure
+            # emitted by the v2 combiner (or a deliberately reclassified v1
+            # envelope), a failed yt-dlp probe, and no API statement that the
+            # exact channel still exists.
+            if evidence.get("api_resource_exists") is not False:
+                continue
+            if "youtube_api" not in evidence:
+                continue
+            youtube_api = evidence.get("youtube_api")
+            if provider == "yt-dlp":
+                if youtube_api is not None:
+                    continue
+            else:
+                if not isinstance(youtube_api, dict):
+                    continue
+                # A composite channel probe can support an override only when
+                # its API half has one of the exact non-accessible states that
+                # _api_probe emits. Unknown or malformed shapes fail closed.
+                if youtube_api.get("state") not in {
+                    "unavailable_unknown",
+                    "transient_failure",
+                }:
+                    continue
+            yt_dlp = evidence.get("yt_dlp")
+            if not isinstance(yt_dlp, dict):
+                continue
+            returncode = yt_dlp.get("returncode")
+            if (
+                isinstance(returncode, bool)
+                or not isinstance(returncode, int)
+                or returncode == 0
+            ):
+                continue
+            stored_ytdlp_reason = yt_dlp.get("raw_reason")
+            if isinstance(stored_ytdlp_reason, str) and stored_ytdlp_reason:
+                if _clean_reason(stored_ytdlp_reason) != _clean_reason(raw_reason):
+                    continue
+            else:
+                history = evidence.get("classification_history")
+                if not isinstance(history, list) or not any(
+                    isinstance(entry, dict)
+                    and entry.get("signal") == "exact_channel_provider_message"
+                    and isinstance(entry.get("from"), dict)
+                    and entry["from"].get("classifier_version")
+                    == "availability-v1"
+                    and isinstance(entry.get("to"), dict)
+                    and entry["to"].get("classifier_version")
+                    == _CLASSIFIER_VERSION
+                    and entry["to"].get("state") == "terminated_explicit"
+                    and entry["to"].get("reason_code") == reason
+                    for entry in history
+                ):
+                    continue
+            classified = _classify_failure(
+                "channel",
+                raw_reason,
+                requested_subject_id=requested_channel_id,
+            )
+            if (
+                classified.get("state") != "terminated_explicit"
+                or classified.get("reason_code") != reason
+            ):
+                continue
+            seen_jobs.add(job_id)
+            override_basis.append({
+                "observation_id": value(row, "observation_id"),
+                "job_id": job_id,
+                "observed_at": value(row, "observed_at"),
+                "reason_code": value(row, "reason_code"),
+            })
+            if len(override_basis) == 2:
+                break
+        if len(override_basis) == 2:
+            base["minimum_separation_override_available"] = True
+            base["minimum_separation_override_basis"] = override_basis
+
     if qualifying_second is not None:
         base["eligible"] = True
         base["status"] = "eligible"
@@ -1918,7 +2028,8 @@ def termination_eligibility(channel_id: str) -> dict[str, Any]:
         ).fetchone()
         rows = conn.execute(
             """
-            SELECT observation_id, normalized_state, reason_code, observed_at
+            SELECT observation_id, job_id, subject_id, normalized_state,
+                   reason_code, provider, raw_reason, evidence_json, observed_at
             FROM availability_observations
             WHERE subject_type = 'channel' AND subject_id = ?
             ORDER BY observed_at, observation_id
@@ -1929,6 +2040,7 @@ def termination_eligibility(channel_id: str) -> dict[str, Any]:
         identity["current_state"] if identity else None,
         identity["current_reason_code"] if identity else None,
         rows,
+        requested_channel_id=channel_id,
     )
 
 

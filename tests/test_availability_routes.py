@@ -142,7 +142,12 @@ class AvailabilityRouteTests(unittest.TestCase):
 
         self.assertEqual(planned.status_code, 200)
         self.assertEqual(planned.get_json()["plan"], plan)
-        build.assert_called_once_with(CHANNEL_ID, "terminated")
+        build.assert_called_once_with(
+            CHANNEL_ID,
+            "terminated",
+            override_minimum_separation=False,
+            actor="route-tester",
+        )
         self.assertEqual(applied.status_code, 200)
         self.assertEqual(applied.get_json()["result"], result)
         apply.assert_called_once_with(
@@ -150,8 +155,80 @@ class AvailabilityRouteTests(unittest.TestCase):
             "a" * 64,
             f"TERMINATE {CHANNEL_ID}",
             actor="route-tester",
+            override_minimum_separation=False,
         )
         self.assertEqual(extra.status_code, 400)
+
+    def test_designation_override_requires_a_literal_boolean_and_is_forwarded(self) -> None:
+        self.login()
+        plan_path = f"/api/availability/channels/{CHANNEL_ID}/designation/plan"
+        apply_path = f"/api/availability/channels/{CHANNEL_ID}/designation/apply"
+        plan = {"plan_token": "b" * 64, "safe_to_apply": True}
+        result = {"success": True, "minimum_separation_overridden": True}
+        with (
+            patch.object(
+                availability_routes.availability_designation,
+                "build_designation_plan",
+                return_value=plan,
+            ) as build,
+            patch.object(
+                availability_routes.availability_designation,
+                "apply_designation",
+                return_value=result,
+            ) as apply,
+        ):
+            planned = self.client.post(
+                plan_path,
+                json={
+                    "designation": "terminated",
+                    "override_minimum_separation": True,
+                },
+            )
+            applied = self.client.post(
+                apply_path,
+                json={
+                    "plan_token": "b" * 64,
+                    "confirmation": f"BYPASS 24H AND TERMINATE {CHANNEL_ID}",
+                    "override_minimum_separation": True,
+                },
+            )
+
+        self.assertEqual(planned.status_code, 200)
+        self.assertEqual(applied.status_code, 200)
+        build.assert_called_once_with(
+            CHANNEL_ID,
+            "terminated",
+            override_minimum_separation=True,
+            actor="route-tester",
+        )
+        apply.assert_called_once_with(
+            CHANNEL_ID,
+            "b" * 64,
+            f"BYPASS 24H AND TERMINATE {CHANNEL_ID}",
+            actor="route-tester",
+            override_minimum_separation=True,
+        )
+
+        for path, body in (
+            (
+                plan_path,
+                {
+                    "designation": "terminated",
+                    "override_minimum_separation": "true",
+                },
+            ),
+            (
+                apply_path,
+                {
+                    "plan_token": "b" * 64,
+                    "confirmation": "confirmation",
+                    "override_minimum_separation": 1,
+                },
+            ),
+        ):
+            with self.subTest(path=path):
+                response = self.client.post(path, json=body)
+                self.assertEqual(response.status_code, 400)
 
     def test_service_errors_preserve_operator_status(self) -> None:
         self.login()

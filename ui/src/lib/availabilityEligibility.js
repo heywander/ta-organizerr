@@ -156,6 +156,8 @@ export function normalizeTerminationEligibility(raw, fallbackCandidate = false) 
             source?.api_corroboration_required,
             false,
         ),
+        minimumSeparationOverrideAvailable:
+            source?.minimum_separation_override_available === true,
     };
 }
 

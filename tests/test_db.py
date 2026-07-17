@@ -107,6 +107,35 @@ class DatabaseSecurityTests(unittest.TestCase):
             )
             self.assertIsNone(legacy)
 
+    def test_designation_audit_table_is_created_for_existing_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "data" / "videos.db"
+            db_path.parent.mkdir()
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    "CREATE TABLE videos (video_id TEXT PRIMARY KEY, title TEXT, "
+                    "channel TEXT, symlink TEXT, status TEXT)"
+                )
+                conn.commit()
+            with patch.object(db, "DB_PATH", db_path):
+                db.init_db()
+                with db.get_db() as conn:
+                    table = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'availability_designation_events'"
+                    ).fetchone()
+                    indexes = {
+                        row[1]
+                        for row in conn.execute(
+                            "PRAGMA index_list(availability_designation_events)"
+                        )
+                    }
+
+            self.assertIsNotNone(table)
+            self.assertIn(
+                "idx_availability_designation_events_channel", indexes
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

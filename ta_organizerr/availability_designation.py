@@ -22,7 +22,7 @@ from .utils import extract_id_from_filename
 
 
 _ACTIVE_STATUSES = ("queued", "running", "cancelling")
-_PLAN_SCHEMA = 1
+_PLAN_SCHEMA = 2
 
 
 def _journal_dir() -> Path:
@@ -99,7 +99,8 @@ def _eligibility(conn: sqlite3.Connection, channel_id: str) -> dict[str, Any]:
     identity = _require_identity(conn, channel_id)
     observations = conn.execute(
         """
-        SELECT observation_id, normalized_state, reason_code, observed_at
+        SELECT observation_id, job_id, subject_id, normalized_state,
+               reason_code, provider, raw_reason, evidence_json, observed_at
         FROM availability_observations
         WHERE subject_type = 'channel' AND subject_id = ?
         ORDER BY observed_at, observation_id
@@ -107,7 +108,32 @@ def _eligibility(conn: sqlite3.Connection, channel_id: str) -> dict[str, Any]:
         (channel_id,),
     ).fetchall()
     return availability._termination_eligibility_from_rows(
-        identity["current_state"], identity["current_reason_code"], observations
+        identity["current_state"],
+        identity["current_reason_code"],
+        observations,
+        requested_channel_id=channel_id,
+    )
+
+
+def _minimum_separation_override_allowed(
+    row: sqlite3.Row,
+    eligibility: dict[str, Any],
+) -> bool:
+    """Allow bypassing only time separation after repeated exact evidence."""
+    basis = eligibility.get("minimum_separation_override_basis")
+    return bool(
+        row["designation"] == "none"
+        and row["current_state"] == "terminated_explicit"
+        and row["current_reason_code"]
+        in {"channel_terminated", "channel_suspended"}
+        and eligibility.get("matching_reason_code") == row["current_reason_code"]
+        and not eligibility.get("eligible")
+        and eligibility.get("status")
+        in {"waiting_for_interval", "ready_for_followup"}
+        and int(eligibility.get("matching_observations") or 0) >= 2
+        and eligibility.get("minimum_separation_override_available") is True
+        and isinstance(basis, list)
+        and len(basis) == 2
     )
 
 
@@ -300,6 +326,8 @@ def _base_blockers(
     row: sqlite3.Row,
     eligibility: dict[str, Any],
     jobs: list[dict[str, str]],
+    *,
+    override_minimum_separation: bool,
 ) -> list[dict[str, Any]]:
     blockers: list[dict[str, Any]] = []
     if row["designation"] == "terminated":
@@ -312,7 +340,17 @@ def _base_blockers(
             "code": "designation_conflict",
             "message": "This channel already has another designation",
         })
-    if not eligibility["eligible"]:
+    if override_minimum_separation and not _minimum_separation_override_allowed(
+        row, eligibility
+    ):
+        blockers.append({
+            "code": "minimum_separation_override_unavailable",
+            "message": (
+                "The 24-hour override requires two distinct, exact matching "
+                "termination responses and a currently explicit channel state"
+            ),
+        })
+    elif not override_minimum_separation and not eligibility["eligible"]:
         blockers.append({
             "code": "termination_evidence_incomplete",
             "message": "Two matching explicit termination observations at least 24 hours apart are required",
@@ -348,10 +386,22 @@ def _journal_blockers() -> list[dict[str, Any]]:
 def _build_plan_details(
     channel_id: str,
     designation: str = "terminated",
+    *,
+    override_minimum_separation: bool = False,
+    actor: str | None = None,
 ) -> dict[str, Any]:
     channel_id = availability.validate_channel_id(channel_id)
     if designation != "terminated":
         raise availability.AvailabilityError("Only terminated designation is supported")
+    if not isinstance(override_minimum_separation, bool):
+        raise availability.AvailabilityError(
+            "override_minimum_separation must be true or false"
+        )
+    override_actor = str(actor or "").strip()[:120]
+    if override_minimum_separation and not override_actor:
+        raise availability.AvailabilityError(
+            "An authenticated actor is required for the 24-hour override"
+        )
     with get_db() as conn:
         row = _require_identity(conn, channel_id)
         source_component = _component(row, conn)
@@ -363,7 +413,12 @@ def _build_plan_details(
             source_component, designation
         )
         destination_locations = _folder_locations(destination_component)
-        blockers = _base_blockers(row, eligibility, jobs)
+        blockers = _base_blockers(
+            row,
+            eligibility,
+            jobs,
+            override_minimum_separation=override_minimum_separation,
+        )
         blockers.extend(_journal_blockers())
         actual_storage_component = row["storage_component"]
 
@@ -452,9 +507,25 @@ def _build_plan_details(
         "active_jobs": jobs,
         "owned_paths": owned_paths,
         "engine_plan_token": engine_plan["plan_token"] if engine_plan else None,
+        "override_minimum_separation": override_minimum_separation,
+        "override_actor": override_actor if override_minimum_separation else None,
+        "override_basis": (
+            eligibility.get("minimum_separation_override_basis", [])
+            if override_minimum_separation
+            else []
+        ),
         "blockers": blockers,
     }
     service_token = _token(plan_payload)
+    override_warnings = (
+        [
+            "Administrator override: the 24-hour evidence separation is bypassed. "
+            "Exact-channel evidence, ownership, collision, active-job, dry-run, "
+            "plan-token, and path-safety checks still apply."
+        ]
+        if override_minimum_separation
+        else []
+    )
     if engine_plan is not None:
         public = {
             **engine_plan,
@@ -462,6 +533,10 @@ def _build_plan_details(
             "plan_token": service_token,
             "blockers": blockers,
             "safe_to_apply": not blockers,
+            "warnings": [
+                *(engine_plan.get("warnings") or []),
+                *override_warnings,
+            ],
         }
     else:
         public = {
@@ -486,7 +561,7 @@ def _build_plan_details(
                 "real_file_bytes": 0,
             },
             "conflicts": [],
-            "warnings": [],
+            "warnings": override_warnings,
             "blockers": blockers,
             "safe_to_apply": mode == "metadata_only" and not blockers,
             "source_immutable": True,
@@ -494,7 +569,12 @@ def _build_plan_details(
         }
     public.update({
         "termination_eligibility": eligibility,
-        "confirmation": f"TERMINATE {channel_id}",
+        "confirmation": (
+            f"BYPASS 24H AND TERMINATE {channel_id}"
+            if override_minimum_separation
+            else f"TERMINATE {channel_id}"
+        ),
+        "minimum_separation_overridden": override_minimum_separation,
         "metadata_only": mode in {"metadata_only", "metadata_only_existing"},
     })
     return {
@@ -507,8 +587,16 @@ def _build_plan_details(
 def build_designation_plan(
     channel_id: str,
     designation: str = "terminated",
+    *,
+    override_minimum_separation: bool = False,
+    actor: str | None = None,
 ) -> dict[str, Any]:
-    return _build_plan_details(channel_id, designation)["public"]
+    return _build_plan_details(
+        channel_id,
+        designation,
+        override_minimum_separation=override_minimum_separation,
+        actor=actor,
+    )["public"]
 
 
 def _validate_precondition_conn(
@@ -528,7 +616,19 @@ def _validate_precondition_conn(
         raise availability.AvailabilityError(
             "Channel designation state changed; review a new plan", 409
         )
-    if not _eligibility(conn, payload["channel_id"])["eligible"]:
+    current_eligibility = _eligibility(conn, payload["channel_id"])
+    if payload["override_minimum_separation"]:
+        if not _minimum_separation_override_allowed(row, current_eligibility):
+            raise availability.AvailabilityError(
+                "The 24-hour override evidence is no longer eligible", 409
+            )
+        if _canonical_json(
+            current_eligibility.get("minimum_separation_override_basis", [])
+        ) != _canonical_json(payload["override_basis"]):
+            raise availability.AvailabilityError(
+                "The 24-hour override evidence changed; review a new plan", 409
+            )
+    elif not current_eligibility["eligible"]:
         raise availability.AvailabilityError(
             "Termination evidence is no longer eligible", 409
         )
@@ -726,6 +826,10 @@ def _commit_designation(
                             "old_component": payload["source_component"],
                             "new_component": payload["destination_component"],
                             "plan_token": details["public"]["plan_token"],
+                            "minimum_separation_overridden": payload[
+                                "override_minimum_separation"
+                            ],
+                            "override_basis": payload["override_basis"],
                         }),
                     ),
                 )
@@ -751,6 +855,31 @@ def _commit_designation(
                 raise availability.AvailabilityError(
                     "Channel registry changed during designation", 409
                 )
+            plan_token_hash = hashlib.sha256(
+                details["public"]["plan_token"].encode("utf-8")
+            ).hexdigest()
+            conn.execute(
+                """
+                INSERT INTO availability_designation_events
+                    (channel_id, actor, event, details_json)
+                VALUES (?, ?, 'channel_designated_terminated', ?)
+                """,
+                (
+                    channel_id,
+                    actor,
+                    _canonical_json({
+                        "source_component": payload["source_component"],
+                        "destination_component": payload["destination_component"],
+                        "mode": payload["mode"],
+                        "registry_revision": payload["revision"],
+                        "minimum_separation_overridden": payload[
+                            "override_minimum_separation"
+                        ],
+                        "override_basis": payload["override_basis"],
+                        "plan_token_sha256": plan_token_hash,
+                    }),
+                ),
+            )
             conn.commit()
     except sqlite3.IntegrityError as exc:
         raise availability.AvailabilityError(
@@ -802,13 +931,27 @@ def apply_designation(
     confirmation: str,
     *,
     actor: str,
+    override_minimum_separation: bool = False,
 ) -> dict[str, Any]:
     channel_id = availability.validate_channel_id(channel_id)
-    if confirmation != f"TERMINATE {channel_id}":
+    if not isinstance(override_minimum_separation, bool):
         raise availability.AvailabilityError(
-            f"Type TERMINATE {channel_id} to confirm", 400
+            "override_minimum_separation must be true or false"
         )
-    details = _build_plan_details(channel_id)
+    expected_confirmation = (
+        f"BYPASS 24H AND TERMINATE {channel_id}"
+        if override_minimum_separation
+        else f"TERMINATE {channel_id}"
+    )
+    if confirmation != expected_confirmation:
+        raise availability.AvailabilityError(
+            f"Type {expected_confirmation} to confirm", 400
+        )
+    details = _build_plan_details(
+        channel_id,
+        override_minimum_separation=override_minimum_separation,
+        actor=actor,
+    )
     if not isinstance(plan_token, str) or not secrets.compare_digest(
         plan_token, details["public"]["plan_token"]
     ):
@@ -825,7 +968,11 @@ def apply_designation(
             with channel_designation.designation_mutation_guard(
                 journal_dir=_journal_dir()
             ):
-                locked_details = _build_plan_details(channel_id)
+                locked_details = _build_plan_details(
+                    channel_id,
+                    override_minimum_separation=override_minimum_separation,
+                    actor=actor,
+                )
                 if not secrets.compare_digest(
                     plan_token, locked_details["public"]["plan_token"]
                 ):
@@ -846,6 +993,11 @@ def apply_designation(
         log(
             f"🏷️ [AVAILABILITY] Confirmed future terminated component for {channel_id}: "
             f"{payload['destination_component']}"
+            + (
+                f" (administrator {actor} bypassed the 24-hour separation)"
+                if override_minimum_separation
+                else ""
+            )
         )
         return {
             "success": True,
@@ -855,6 +1007,7 @@ def apply_designation(
             "old_path": details["public"].get("source_path"),
             "new_path": details["public"].get("destination_path"),
             "storage_component": payload["destination_component"],
+            "minimum_separation_overridden": override_minimum_separation,
         }
 
     engine_plan = details["engine_plan"]
@@ -892,8 +1045,16 @@ def apply_designation(
     log(
         f"🏷️ [AVAILABILITY] Confirmed terminated channel {channel_id}: "
         f"{result['old_path']} -> {result['new_path']}"
+        + (
+            f" (administrator {actor} bypassed the 24-hour separation)"
+            if override_minimum_separation
+            else ""
+        )
     )
-    return result
+    return {
+        **result,
+        "minimum_separation_overridden": override_minimum_separation,
+    }
 
 
 def recover_pending_designations() -> list[dict[str, Any]]:

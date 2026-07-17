@@ -242,7 +242,13 @@ migration.
   overwritten. Real media bytes and symlink text remain unchanged. The action
   uses a revision-bound dry run, typed confirmation, database compare-and-swap,
   durable filesystem journals, startup recovery, and a fail-closed block while
-  any prior journal remains unresolved. `YOUTUBE_API_KEY` is optional
+  any prior journal remains unresolved. Administrators may explicitly bypass
+  only the 24-hour separation after two distinct jobs have returned exact,
+  matching availability-v2 termination responses for the current UCID. The
+  override retains every filesystem safeguard, uses a separate plan token, and
+  requires `BYPASS 24H AND TERMINATE <UCID>` as typed confirmation. Successful
+  normal and override designations are written atomically to the designation
+  audit table. `YOUTUBE_API_KEY` is optional
   corroboration and is never stored. Jobs continue when the browser leaves the
   page; a server restart records an active job as interrupted, after which the
   administrator can start a fresh check.

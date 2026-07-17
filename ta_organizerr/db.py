@@ -113,6 +113,16 @@ CREATE INDEX IF NOT EXISTS idx_availability_observation_channel_timeline
     ON availability_observations(
         subject_type, channel_id, observed_at, observation_id, normalized_state
     );
+CREATE TABLE IF NOT EXISTS availability_designation_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    event TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_availability_designation_events_channel
+    ON availability_designation_events(channel_id, event_id);
 CREATE TABLE IF NOT EXISTS recovered_channel_cases (
     case_id TEXT PRIMARY KEY,
     source_channel_id TEXT NOT NULL UNIQUE,
