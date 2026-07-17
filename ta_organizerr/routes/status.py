@@ -6,9 +6,9 @@ import threading
 from flask import Blueprint, jsonify, request
 
 from ..auth import requires_auth
+from .. import channel_designation
 from ..db import get_db
-from ..logging_util import read_logs
-from ..library_lock import LIBRARY_MUTATION_LOCK
+from ..logging_util import log, read_logs
 from ..recovered_channels import organized_recovered_video_ids
 from ..symlinks import cleanup_old_folders, process_videos, scan_is_running
 
@@ -74,8 +74,15 @@ def api_scan():
 @requires_auth
 def api_cleanup():
     def run_cleanup():
-        with LIBRARY_MUTATION_LOCK:
-            cleanup_old_folders()
+        try:
+            # Cleanup removes empty directory inodes, including the temporary
+            # source skeleton retained by an in-flight consolidation.  It must
+            # therefore share the same cross-process exclusion as designation
+            # and the normal scanner, not merely the in-process library lock.
+            with channel_designation.designation_mutation_guard():
+                cleanup_old_folders()
+        except channel_designation.ChannelDesignationError as exc:
+            log(f"Cleanup blocked by channel-designation recovery: {exc}")
 
     threading.Thread(target=run_cleanup, daemon=True).start()
     return jsonify({"status": "started"})

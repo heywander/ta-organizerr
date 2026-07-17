@@ -1,6 +1,8 @@
 """TubeArchivist API client."""
 from __future__ import annotations
 
+import re
+
 import requests
 
 from .config import API_URL, HEADERS, MAX_METADATA_PAGES
@@ -9,6 +11,9 @@ from .logging_util import log
 
 class MetadataFetchError(RuntimeError):
     """Raised when TubeArchivist metadata could not be fetched completely."""
+
+
+_CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 
 
 def fetch_all_metadata() -> dict[str, dict]:
@@ -99,11 +104,15 @@ def fetch_all_metadata() -> dict[str, dict]:
                 or "Unknown Channel"
             )
             channel_name = str(channel_name)
+            channel_id = channel_info.get("channel_id") or video.get("channel_id")
+            if not isinstance(channel_id, str) or _CHANNEL_ID_RE.fullmatch(channel_id) is None:
+                channel_id = None
             raw_date = str(video.get("published") or "unknown_date")
             published = raw_date[:10] if len(raw_date) >= 10 else raw_date.replace("/", "-")
             video_map[vid_id] = {
                 "title": title,
                 "channel_name": channel_name,
+                "channel_id": channel_id,
                 "published": published,
                 "is_live": video.get("vid_type") == "streams",
                 "filesystem_path": video.get("path") or video.get("filesystem_path"),

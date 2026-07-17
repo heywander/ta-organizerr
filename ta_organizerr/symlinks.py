@@ -8,6 +8,7 @@ import threading
 import traceback
 from pathlib import Path
 
+from . import availability, channel_designation, db as db_module
 from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
 from .db import get_db
 from .logging_util import log
@@ -255,6 +256,67 @@ def _channel_component_map(channel_names: set[str]) -> dict[str, str]:
     return {name: channel_component(name) for name in channel_names}
 
 
+def _registered_channel_components(
+    video_map: dict[str, dict],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve confirmed per-UCID storage overrides for the current scan.
+
+    Availability observations alone never affect layout.  Only a persisted
+    designation with confirmation metadata may add the Terminated marker.
+    The name map exists only for legacy hidden-channel enforcement; actual
+    video placement uses the exact-ID map below.
+    """
+    channel_ids = sorted({
+        metadata.get("channel_id")
+        for metadata in video_map.values()
+        if isinstance(metadata, dict)
+        and isinstance(metadata.get("channel_id"), str)
+    })
+    if not channel_ids:
+        return {}, {}
+    placeholders = ",".join("?" for _ in channel_ids)
+    with get_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT channel_id, display_name, provenance, storage_component,
+                   designation, designation_confirmed_at
+            FROM channel_identities
+            WHERE channel_id IN ({placeholders})
+            """,
+            channel_ids,
+        ).fetchall()
+    registry = {row["channel_id"]: row for row in rows}
+    by_id: dict[str, str] = {}
+    by_name: dict[str, str] = {}
+    for metadata in video_map.values():
+        if not isinstance(metadata, dict):
+            continue
+        channel_id = metadata.get("channel_id")
+        row = registry.get(channel_id)
+        if row is None:
+            continue
+        display_name = str(metadata.get("channel_name") or row["display_name"] or channel_id)
+        designation = (
+            row["designation"] if row["designation_confirmed_at"] else None
+        )
+        try:
+            component = channel_designation.resolve_channel_component(
+                display_name,
+                provenance=row["provenance"],
+                designation=designation,
+                persisted_component=row["storage_component"],
+            )
+        except channel_designation.ChannelDesignationError as exc:
+            log(
+                f"   ⛔ Ignoring unsafe channel storage override for "
+                f"{channel_id}: {exc}"
+            )
+            continue
+        by_id[channel_id] = component
+        by_name[display_name] = component
+    return by_id, by_name
+
+
 def _enforce_hidden_locations(
     hidden_channels: set[str],
     component_map: dict[str, str] | None = None,
@@ -473,10 +535,19 @@ def process_videos() -> str | None:
         log(f"⏳ {msg}; skipping duplicate request.")
         return msg
     try:
-        # Lock ordering is always scan lock, then the shared filesystem lock.
-        # Reconciliation never acquires the scan lock, preventing inversion.
-        with LIBRARY_MUTATION_LOCK:
-            return _process_videos_unlocked()
+        # Lock ordering is scan lock, cross-process designation lock, then the
+        # shared filesystem lock. This prevents a scheduler in another process
+        # from rebuilding the old component during an incomplete designation.
+        try:
+            with channel_designation.designation_mutation_guard(
+                journal_dir=db_module.DB_PATH.parent
+                / "channel-designation-journals"
+            ):
+                return _process_videos_unlocked()
+        except channel_designation.ChannelDesignationError as exc:
+            msg = f"Scan blocked by channel-designation recovery: {exc}"
+            log(f"⛔ {msg}")
+            return msg
     finally:
         _SCAN_LOCK.release()
 
@@ -509,6 +580,8 @@ def _process_videos_unlocked() -> str | None:
         if isinstance(meta, dict) and meta.get("channel_name") is not None
     } | hidden_channels
     component_map = _channel_component_map(all_channel_names)
+    registered_by_id, registered_by_name = _registered_channel_components(video_map)
+    component_map.update(registered_by_name)
 
     HIDDEN_DIR.mkdir(parents=True, exist_ok=True)
     cleanup_old_folders()
@@ -576,9 +649,9 @@ def _process_videos_unlocked() -> str | None:
                 continue
 
             channel_name = str(meta["channel_name"])
-            sanitized_channel = component_map.get(
-                channel_name,
-                channel_component(channel_name),
+            sanitized_channel = registered_by_id.get(
+                meta.get("channel_id"),
+                component_map.get(channel_name, channel_component(channel_name)),
             )
             is_hidden = meta["channel_name"] in hidden_channels
             target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
@@ -640,6 +713,7 @@ def _process_videos_unlocked() -> str | None:
                 video_id,
                 meta["title"],
                 meta["channel_name"],
+                meta.get("channel_id"),
                 meta["published"],
                 str(dest_file),
                 1 if meta.get("is_live") else 0,
@@ -663,11 +737,13 @@ def _process_videos_unlocked() -> str | None:
     try:
         with get_db() as conn:
             conn.execute("DELETE FROM videos WHERE status IN ('linked', 'error')")
+            availability.upsert_metadata_identities(conn, video_map)
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO videos
-                (video_id, title, channel, published, symlink, is_live, status, adopted_real)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (video_id, title, channel, channel_id, published, symlink,
+                 is_live, status, adopted_real)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 db_rows,
             )

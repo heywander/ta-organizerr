@@ -298,6 +298,27 @@ class RecoveredChannelInventoryTests(RecoveredChannelTestCase):
         self.assertEqual(case["target_component"], "The Oversphere [Recovered]")
         self.assertNotIn("[Recovered] [Recovered]", case["target_component"])
 
+    def test_confirmed_termination_is_preserved_on_new_recovered_case(self) -> None:
+        self.make_media()
+        with db.get_db() as connection:
+            connection.execute(
+                """
+                INSERT INTO channel_identities
+                    (channel_id, display_name, provenance, designation,
+                     designation_confirmed_at, designation_confirmed_by)
+                VALUES (?, 'Recovered channel', 'source', 'terminated',
+                        CURRENT_TIMESTAMP, 'tester')
+                """,
+                (SOURCE_CHANNEL_ID,),
+            )
+            connection.commit()
+
+        case = self.create_case()
+        self.assertEqual(
+            case["target_component"],
+            "The Oversphere [Recovered] [Terminated]",
+        )
+
     def test_case_claim_refuses_media_already_reserved_by_a_mutating_worker(self) -> None:
         source = self.make_media(payload=b"about to be transcoded")
         before = self.source_signature(source)

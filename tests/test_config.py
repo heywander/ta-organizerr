@@ -21,6 +21,13 @@ class HostSourceConfigurationTests(unittest.TestCase):
         self.assertFalse(configured)
         self.assertEqual(value, Path("/mnt/user/tubearchives/bp"))
 
+    def test_nonnegative_float_rejects_nonfinite_values(self) -> None:
+        for value in ("nan", "inf", "-inf"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"TEST_DELAY": value}
+            ), self.assertRaisesRegex(ValueError, "finite nonnegative"):
+                config._nonnegative_float("TEST_DELAY", 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

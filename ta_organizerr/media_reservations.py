@@ -6,10 +6,11 @@ for its entire FFmpeg run, though, so it registers the inode and user-visible
 path entries it depends on here.  Writers briefly take the library lock,
 check this registry, perform their mutation, and release the lock again.
 
-This registry is deliberately process-local, matching the existing library
-mutation lock.  It protects application workers in this process; filesystem
-permissions and descriptor/path revalidation remain the boundary against
-uncoordinated external writers.
+This lease registry is deliberately process-local. The library writer lock is
+also backed by a cross-process file lock, so writers cannot overlap each other;
+long-lived reader leases still require the supported single application worker.
+Filesystem permissions and descriptor/path revalidation remain the boundary
+against uncoordinated external writers.
 """
 from __future__ import annotations
 

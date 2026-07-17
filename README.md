@@ -15,6 +15,11 @@ management, and optional FFmpeg transcoding.
 - Keeps hidden channels in `/app/hidden`.
 - Separates livestreams under a `#streams` folder.
 - Fetches metadata from the TubeArchivist API.
+- Records evidence-first public availability checks for exact channel and
+  locally archived video IDs without treating a generic missing response as
+  proof of termination or removal.
+- Lets an administrator confirm a terminated-channel designation only after a
+  guarded dry run; mixed real files and symlinks keep their bytes and link text.
 - Tracks linked, missing, and error rows in SQLite.
 - Provides dashboard stats, logs, scan controls, and channel filters.
 - Checks and repairs broken symlinks and empty folders.
@@ -90,6 +95,15 @@ SALVAGE_JOB_TIMEOUT_SECONDS=86400
 SALVAGE_MAX_OUTPUT_BYTES=107374182400
 RECONCILIATION_PROBE_WORKERS=2
 RECONCILIATION_PROBE_CACHE_MAX=4096
+
+# Optional corroboration for public availability checks. yt-dlp remains the
+# primary public probe and no account cookies are used.
+YOUTUBE_API_KEY=
+AVAILABILITY_PROBE_TIMEOUT_SECONDS=45
+AVAILABILITY_MAX_CONCURRENT_JOBS=1
+AVAILABILITY_PROBE_RETRIES=2
+AVAILABILITY_PROBE_DELAY_SECONDS=6
+AVAILABILITY_RETRY_BACKOFF_SECONDS=1
 ```
 
 Compose reads these values from `.env`; values in the shell can override them.
@@ -187,11 +201,42 @@ migration.
 ## Operations
 
 - The scheduler runs a full scan every `SCAN_INTERVAL` minutes.
+- Run one application worker, as configured by the supplied Dockerfile. Job
+  threads and long-lived media reader leases are intentionally process-local;
+  the shared writer lock prevents cross-process tree mutations but does not
+  make a multi-worker deployment supported.
 - The dashboard can trigger an immediate scan.
 - Duplicate scans are skipped while one is already running.
 - Maintenance can remove empty folders and zero-byte invalid `video.*` files.
 - Orphan checks scan both target and hidden folders recursively.
 - Recovery can stage files plus `.info.json` metadata for TubeArchivist import.
+- Availability checks run as durable, manually started server jobs. Channel
+  checks use canonical `UC...` IDs; video checks are limited to exact IDs
+  derived by the server from tracked records, recovered cases, and the selected
+  source-channel directory. The server persists and returns the job before a
+  potentially slow source inventory walk; inventory and probing are visible as
+  separate phases. **Check shown IDs** submits the current filtered page as an
+  explicit batch when a channel is too large for the 10,000-ID check-all cap.
+  A returned channel/video is recorded as available.
+  Explicit private, policy-removal, uploader-removal, or account-termination
+  messages are kept separately from generic unavailable responses. Network,
+  quota, authentication, region, bot-challenge, and rate-limit failures never
+  establish termination. A channel becomes eligible for administrator review
+  only after two matching explicit termination observations at least 24 hours
+  apart with no successful or conflicting observation between them. Checks do
+  not rename folders or alter media; folder designation is a separate guarded
+  action. A confirmed designation appends `[Terminated]` to the persisted
+  channel component (for example, `Name [Recovered] [Terminated]`). The whole
+  folder is atomically renamed when the destination is absent. An existing
+  destination is consolidated only when its exact canonical channel ID is
+  proven to match and every relative path is collision-free; nothing is
+  overwritten. Real media bytes and symlink text remain unchanged. The action
+  uses a revision-bound dry run, typed confirmation, database compare-and-swap,
+  durable filesystem journals, startup recovery, and a fail-closed block while
+  any prior journal remains unresolved. `YOUTUBE_API_KEY` is optional
+  corroboration and is never stored. Jobs continue when the browser leaves the
+  page; a server restart records an active job as interrupted, after which the
+  administrator can start a fresh check.
 - Advanced Recovery can preview an allowed archive file without changing it.
   Preview requests are authenticated, confined to configured media roots, and
   streamed with byte-range support. Watching the original still depends on the

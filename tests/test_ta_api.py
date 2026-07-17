@@ -75,6 +75,28 @@ class MetadataFetchTests(unittest.TestCase):
         self.assertEqual(result["AAAAAAAAAAA"]["title"], "unknown_title")
         self.assertEqual(result["AAAAAAAAAAA"]["channel_name"], "Unknown Channel")
         self.assertEqual(result["AAAAAAAAAAA"]["published"], "20260715")
+        self.assertIsNone(result["AAAAAAAAAAA"]["channel_id"])
+
+    def test_channel_id_is_preserved_when_canonical(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "data": [{
+                "youtube_id": "AAAAAAAAAAA",
+                "title": "Example",
+                "channel": {
+                    "channel_name": "Example channel",
+                    "channel_id": "UCtbyZ5js_2m1LLi4nrrnFfw",
+                },
+            }],
+            "paginate": {"current_page": 1, "last_page": 1},
+        }
+        with patch("ta_organizerr.ta_api.requests.get", return_value=response):
+            result = fetch_all_metadata()
+        self.assertEqual(
+            result["AAAAAAAAAAA"]["channel_id"],
+            "UCtbyZ5js_2m1LLi4nrrnFfw",
+        )
 
 
 if __name__ == "__main__":

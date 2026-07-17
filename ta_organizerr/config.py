@@ -1,6 +1,7 @@
 """Runtime configuration loaded from environment variables."""
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -17,6 +18,17 @@ def _positive_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
     if value < 1:
         raise ValueError(f"{name} must be at least 1, got {value}")
+    return value
+
+
+def _nonnegative_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw_value!r}") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite nonnegative number, got {value}")
     return value
 
 
@@ -68,6 +80,25 @@ SALVAGE_JOB_TIMEOUT_SECONDS = _positive_int(
 )
 SALVAGE_MAX_OUTPUT_BYTES = _positive_int(
     "SALVAGE_MAX_OUTPUT_BYTES", 100 * 1024 * 1024 * 1024
+)
+
+# Public-resource probes without account cookies. The application endpoints
+# remain administrator-authenticated. The API key is optional corroboration;
+# it is never passed to yt-dlp or stored.
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+YTDLP_BINARY = os.getenv("YTDLP_BINARY", "yt-dlp").strip() or "yt-dlp"
+AVAILABILITY_PROBE_TIMEOUT_SECONDS = _positive_int(
+    "AVAILABILITY_PROBE_TIMEOUT_SECONDS", 45
+)
+AVAILABILITY_MAX_CONCURRENT_JOBS = _positive_int(
+    "AVAILABILITY_MAX_CONCURRENT_JOBS", 1
+)
+AVAILABILITY_PROBE_RETRIES = _positive_int("AVAILABILITY_PROBE_RETRIES", 2)
+AVAILABILITY_PROBE_DELAY_SECONDS = _nonnegative_float(
+    "AVAILABILITY_PROBE_DELAY_SECONDS", 6.0
+)
+AVAILABILITY_RETRY_BACKOFF_SECONDS = _nonnegative_float(
+    "AVAILABILITY_RETRY_BACKOFF_SECONDS", 1.0
 )
 
 HEADERS = {"Authorization": f"Token {API_TOKEN}"} if API_TOKEN else {}

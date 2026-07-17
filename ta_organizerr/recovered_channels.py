@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import availability, channel_designation
 from . import db as db_module
 from . import salvage
 from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
@@ -185,6 +186,31 @@ def _validated_target_name(value: object) -> tuple[str, str]:
     if sanitize(component) != component:
         raise RecoveredChannelError("The recovered channel folder name is unsafe")
     return name, component
+
+
+def _confirmed_recovered_component(
+    conn: sqlite3.Connection,
+    channel_id: str,
+    component: str,
+) -> str:
+    """Apply only an administrator-confirmed designation to a case folder."""
+    row = conn.execute(
+        """
+        SELECT designation, designation_confirmed_at
+        FROM channel_identities WHERE channel_id = ?
+        """,
+        (channel_id,),
+    ).fetchone()
+    if row is None or not row["designation_confirmed_at"]:
+        return component
+    try:
+        return channel_designation.component_for_designation(
+            component, row["designation"]
+        )
+    except channel_designation.ChannelDesignationError as exc:
+        raise RecoveredChannelError(
+            f"The confirmed channel designation is invalid: {exc}", 409
+        ) from exc
 
 
 def _channel_root(channel_id: str) -> Path:
@@ -726,6 +752,8 @@ def _create_case_locked(
     channel_id = _validated_channel_id(source_channel_id)
     name, component = _validated_target_name(target_channel_name)
     component = target_component or component
+    with get_db() as conn:
+        component = _confirmed_recovered_component(conn, channel_id, component)
     discovered = list(discovered) if discovered is not None else _discover_channel(channel_id)
     if not discovered:
         raise RecoveredChannelError(
@@ -814,6 +842,13 @@ def _create_case_locked(
                 """,
                 (case_id, channel_id, name, component, actor),
             )
+            availability.upsert_channel_identity(
+                conn,
+                channel_id,
+                display_name=name,
+                provenance="recovered",
+                storage_component=component,
+            )
             _insert_discovered(conn, case_id, discovered)
             _event(
                 conn,
@@ -901,7 +936,10 @@ def update_case(
     name, component = _validated_target_name(data.get("target_channel_name"))
     with get_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        _require_case(conn, case_id)
+        current_case = _require_case(conn, case_id)
+        component = _confirmed_recovered_component(
+            conn, current_case["source_channel_id"], component
+        )
         if _active_job(conn, case_id):
             raise RecoveredChannelError("Wait for the active job before renaming", 409)
         if conn.execute(
@@ -944,6 +982,13 @@ def update_case(
                 WHERE case_id = ?
                 """,
                 (name, component, case_id),
+            )
+            availability.upsert_channel_identity(
+                conn,
+                current_case["source_channel_id"],
+                display_name=name,
+                provenance="recovered",
+                storage_component=component,
             )
         except sqlite3.IntegrityError as exc:
             raise RecoveredChannelError(
@@ -2781,14 +2826,15 @@ def _organize_one(
                     conn.execute(
                         """
                         INSERT INTO videos
-                            (video_id, title, channel, published, symlink,
+                            (video_id, title, channel, channel_id, published, symlink,
                              status, is_live, adopted_real)
-                        VALUES (?, ?, ?, NULL, ?, 'recovered', 0, 0)
+                        VALUES (?, ?, ?, ?, NULL, ?, 'recovered', 0, 0)
                         """,
                         (
                             current_item["video_id"],
                             current_item["video_id"],
                             current_case["target_component"],
+                            current_case["source_channel_id"],
                             str(destination),
                         ),
                     )

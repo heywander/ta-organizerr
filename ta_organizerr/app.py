@@ -79,6 +79,11 @@ def create_app(initialize_db: bool = True) -> Flask:
         )
     if initialize_db:
         init_db_with_retry()
+        # Resolve any crash-left channel-folder transaction before the
+        # scheduler can recreate paths from a stale registry component.
+        from .availability_designation import recover_pending_designations
+
+        recover_pending_designations()
 
     app.secret_key = get_or_create_secret_key(FLASK_SECRET_KEY_ENV)
     app.config.update(
@@ -96,6 +101,7 @@ def create_app(initialize_db: bool = True) -> Flask:
     # Register blueprints. Imported lazily to avoid circular imports during
     # startup (pages.py reads admin_exists which touches the DB).
     from .routes.auth import bp as auth_bp
+    from .routes.availability import bp as availability_bp
     from .routes.channels import bp as channels_bp
     from .routes.hidden import bp as hidden_bp
     from .routes.maintenance import bp as maintenance_bp
@@ -108,6 +114,7 @@ def create_app(initialize_db: bool = True) -> Flask:
     from .routes.transcode import bp as transcode_bp
 
     app.register_blueprint(auth_bp)
+    app.register_blueprint(availability_bp)
     app.register_blueprint(status_bp)
     app.register_blueprint(maintenance_bp)
     app.register_blueprint(transcode_bp)

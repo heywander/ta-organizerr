@@ -73,6 +73,12 @@ def salvage_page():
     return _send("salvage/index.html")
 
 
+@bp.route("/availability")
+@requires_auth
+def availability_page():
+    return _send("availability/index.html")
+
+
 @bp.route("/<path:path>")
 def static_assets(path):
     """Catch-all for built static files. Whitelist by extension."""

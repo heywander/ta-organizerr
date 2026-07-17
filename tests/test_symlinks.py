@@ -31,6 +31,51 @@ class DestinationCollisionTests(unittest.TestCase):
         collision_map = symlinks._channel_component_map({"Foo: Bar", "Foo? Bar"})
         self.assertNotEqual(collision_map["Foo: Bar"], collision_map["Foo? Bar"])
 
+    def test_confirmed_storage_component_is_resolved_by_exact_channel_id(self) -> None:
+        channel_id = "UCtbyZ5js_2m1LLi4nrrnFfw"
+        result = Mock()
+        result.fetchall.return_value = [{
+            "channel_id": channel_id,
+            "display_name": "The Oversphere",
+            "provenance": "recovered",
+            "storage_component": "The Oversphere [Recovered]",
+            "designation": "terminated",
+            "designation_confirmed_at": "2026-07-17T00:00:00+00:00",
+        }]
+        connection = Mock()
+        connection.execute.return_value = result
+        video_map = {
+            "AAAAAAAAAAA": {
+                "channel_id": channel_id,
+                "channel_name": "The Oversphere",
+            }
+        }
+        with patch.object(
+            symlinks, "get_db", return_value=nullcontext(connection)
+        ):
+            by_id, by_name = symlinks._registered_channel_components(video_map)
+
+        expected = "The Oversphere [Recovered] [Terminated]"
+        self.assertEqual(by_id[channel_id], expected)
+        self.assertEqual(by_name["The Oversphere"], expected)
+
+    def test_normal_scan_refuses_to_run_with_unresolved_designation_state(self) -> None:
+        error = symlinks.channel_designation.ChannelDesignationError(
+            "journal requires recovery", 409, code="unresolved_journal"
+        )
+        with (
+            patch.object(
+                symlinks.channel_designation,
+                "designation_mutation_guard",
+                side_effect=error,
+            ),
+            patch.object(symlinks, "_process_videos_unlocked") as process,
+        ):
+            result = symlinks.process_videos()
+
+        self.assertIn("Scan blocked by channel-designation recovery", result)
+        process.assert_not_called()
+
     def test_superseded_generated_link_is_retired_by_video_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

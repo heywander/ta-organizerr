@@ -99,6 +99,14 @@ const isAuthPage = path === "/login" || path === "/setup";
                                     <i class="bi bi-life-preserver"></i>
                                     <span class="nav-label">Salvage</span>
                                 </a>
+                                <a
+                                    href="/availability"
+                                    aria-label="Channel and video availability"
+                                    aria-current={path === "/availability" ? "page" : undefined}
+                                >
+                                    <i class="bi bi-broadcast-pin"></i>
+                                    <span class="nav-label">Availability</span>
+                                </a>
                                 <button id="logout-btn" type="button" aria-label="Sign out">
                                     <i class="bi bi-box-arrow-right"></i>
                                     <span class="nav-label">Sign out</span>
