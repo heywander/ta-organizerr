@@ -6,6 +6,10 @@
         preservedObservationCount,
         structuredEvidenceSignals,
     } from "../lib/availabilityEvidence.js";
+    import {
+        normalizeTerminationEligibility,
+        terminationEligibilityMessage,
+    } from "../lib/availabilityEligibility.js";
 
     type EvidenceSignal = { key: string; value: string };
 
@@ -24,6 +28,36 @@
         structured: Record<string, unknown>;
     };
 
+    type CountingObservation = {
+        id: string;
+        observedAt: string;
+        reasonCode: string;
+    };
+
+    type TerminationEligibility = {
+        diagnosticsAvailable: boolean;
+        eligible: boolean;
+        status: string;
+        requiredObservations: number;
+        thresholdProgress: number;
+        matchingObservations: number;
+        qualifyingObservationsNeeded: number;
+        minimumSeparationHours: number;
+        matchingReasonCode: string;
+        firstObservedAt: string;
+        latestObservedAt: string;
+        nextQualifyingAt: string;
+        qualifiedAt: string;
+        countingObservations: CountingObservation[];
+        countingObservationIds: string[];
+        lastBlockingObservation: {
+            id: string;
+            state: string;
+            observedAt: string;
+        } | null;
+        apiCorroborationRequired: boolean;
+    };
+
     type ChannelRecord = {
         channelId: string;
         displayName: string;
@@ -35,6 +69,7 @@
         lastAccessibleAt: string;
         reasonCode: string;
         terminationCandidate: boolean;
+        terminationEligibility: TerminationEligibility;
         terminationConfirmed: boolean;
         observationCount: number;
         localVideoCount: number;
@@ -155,6 +190,9 @@
 
     $: selectedChannel =
         channels.find((channel) => channel.channelId === selectedChannelId) || null;
+    $: selectedEligibilityCopy = selectedChannel
+        ? terminationEligibilityMessage(selectedChannel.terminationEligibility)
+        : null;
 
     $: filteredChannels = channels.filter((channel) => {
         const query = normalize(channelQuery);
@@ -254,6 +292,12 @@
             aggregate?.termination_candidate,
             raw?.can_confirm_termination,
         );
+        const terminationEligibility = normalizeTerminationEligibility(
+            raw?.termination_eligibility ??
+                aggregate?.termination_eligibility ??
+                raw?.eligibility,
+            candidate,
+        ) as TerminationEligibility;
         const reasonCode = textValue(
             aggregate?.reason_code,
             raw?.current_reason_code,
@@ -319,6 +363,7 @@
             ),
             reasonCode,
             terminationCandidate: candidate,
+            terminationEligibility,
             terminationConfirmed: boolValue(
                 raw?.termination_confirmed,
                 aggregate?.termination_confirmed,
@@ -944,6 +989,43 @@
         return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
     }
 
+    function thresholdPercent(eligibility: TerminationEligibility): number {
+        if (!eligibility.requiredObservations) return 0;
+        return Math.max(
+            0,
+            Math.min(
+                100,
+                Math.round(
+                    (eligibility.thresholdProgress /
+                        eligibility.requiredObservations) *
+                        100,
+                ),
+            ),
+        );
+    }
+
+    function evidenceCountsTowardThreshold(evidence: Evidence): boolean {
+        return Boolean(
+            selectedChannel?.terminationEligibility.countingObservationIds.includes(
+                evidence.id,
+            ),
+        );
+    }
+
+    function nextQualifyingLabel(eligibility: TerminationEligibility): string {
+        if (!eligibility.nextQualifyingAt) {
+            if (eligibility.eligible) return "Evidence threshold satisfied";
+            return eligibility.thresholdProgress > 0
+                ? "A later matching explicit result is still required"
+                : "Requires a first matching explicit response";
+        }
+        const nextTimestamp = Date.parse(eligibility.nextQualifyingAt);
+        if (Number.isFinite(nextTimestamp) && nextTimestamp <= Date.now()) {
+            return `Check now · threshold time passed ${formatTime(eligibility.nextQualifyingAt)}`;
+        }
+        return formatTime(eligibility.nextQualifyingAt);
+    }
+
     function basename(path: string): string {
         return path.replace(/\\/g, "/").split("/").pop() || path;
     }
@@ -1088,7 +1170,10 @@
                         <div><dt>Last checked</dt><dd>{formatTime(selectedChannel.lastCheckedAt)}</dd></div>
                         <div><dt>Last accessible</dt><dd>{formatTime(selectedChannel.lastAccessibleAt)}</dd></div>
                         <div><dt>Designation</dt><dd>{selectedChannel.designation ? stateLabel(selectedChannel.designation) : "None"}</dd></div>
-                        <div><dt>API corroboration</dt><dd>{apiCorroborationEnabled ? "Configured" : "Not configured"}</dd></div>
+                        <div>
+                            <dt>API corroboration (optional)</dt>
+                            <dd>{apiCorroborationEnabled ? "Configured — not required" : "Not configured — checks still work"}</dd>
+                        </div>
                         <div><dt>Current reason</dt><dd><code>{selectedChannel.reasonCode || "No reason recorded"}</code></dd></div>
                         <div class="identity-facts__path"><dt>Current folder</dt><dd><code title={selectedChannel.folderPath}>{selectedChannel.folderPath || "Not published in Target"}</code></dd></div>
                     </dl>
@@ -1173,7 +1258,12 @@
                                                 {evidence.provider}
                                                 {#if evidence.toolVersion}<small> · {evidence.toolVersion}</small>{/if}
                                             </strong>
-                                            {#if evidence.explicit}<span><i class="bi bi-check2-circle"></i> Explicit response</span>{/if}
+                                            <div class="evidence-row__flags">
+                                                {#if evidenceCountsTowardThreshold(evidence)}
+                                                    <span class="threshold-counting"><i class="bi bi-shield-check"></i> Counts toward threshold</span>
+                                                {/if}
+                                                {#if evidence.explicit}<span><i class="bi bi-check2-circle"></i> Explicit response</span>{/if}
+                                            </div>
                                         </div>
                                         <div class="evidence-identifiers">
                                             <span>Observation <code>#{evidence.id}</code></span>
@@ -1216,6 +1306,79 @@
                             </div>
                         </div>
                         <div class="designation-body">
+                            <div
+                                class="eligibility-threshold eligibility-threshold--{selectedEligibilityCopy?.tone || 'muted'}"
+                                role="status"
+                                aria-live="polite"
+                            >
+                                {#if selectedChannel.terminationEligibility.diagnosticsAvailable}
+                                <div class="eligibility-threshold__heading">
+                                    <div>
+                                        <span class="eyebrow">Evidence threshold</span>
+                                        <strong>
+                                            {selectedChannel.terminationEligibility.thresholdProgress}
+                                            of {selectedChannel.terminationEligibility.requiredObservations}
+                                            qualifying observations
+                                        </strong>
+                                    </div>
+                                    <span>{selectedChannel.terminationEligibility.minimumSeparationHours}h minimum</span>
+                                </div>
+                                <div
+                                    class="eligibility-threshold__bar"
+                                    role="progressbar"
+                                    aria-label="Termination evidence threshold"
+                                    aria-valuemin="0"
+                                    aria-valuemax={selectedChannel.terminationEligibility.requiredObservations}
+                                    aria-valuenow={selectedChannel.terminationEligibility.thresholdProgress}
+                                >
+                                    <span style={`width: ${thresholdPercent(selectedChannel.terminationEligibility)}%`}></span>
+                                </div>
+                                <div class="eligibility-threshold__status">
+                                    <i class="bi bi-info-circle" aria-hidden="true"></i>
+                                    <span>
+                                        <strong>{selectedEligibilityCopy?.title}</strong>
+                                        {selectedEligibilityCopy?.detail}
+                                    </span>
+                                </div>
+                                <dl class="eligibility-threshold__facts">
+                                    <div>
+                                        <dt>Matching explicit reason</dt>
+                                        <dd><code>{selectedChannel.terminationEligibility.matchingReasonCode || "None recorded"}</code></dd>
+                                    </div>
+                                    <div>
+                                        <dt>Matching responses</dt>
+                                        <dd>{selectedChannel.terminationEligibility.matchingObservations} observed · {selectedChannel.terminationEligibility.qualifyingObservationsNeeded} still needed</dd>
+                                    </div>
+                                    <div>
+                                        <dt>First matching response</dt>
+                                        <dd>{formatTime(selectedChannel.terminationEligibility.firstObservedAt)}</dd>
+                                    </div>
+                                    <div>
+                                        <dt>Next useful follow-up</dt>
+                                        <dd>{nextQualifyingLabel(selectedChannel.terminationEligibility)}</dd>
+                                    </div>
+                                </dl>
+                                {#if selectedChannel.terminationEligibility.status === "evidence_reset" && selectedChannel.terminationEligibility.lastBlockingObservation}
+                                    <p class="eligibility-threshold__blocker">
+                                        <i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i>
+                                        Evidence reset by {stateLabel(selectedChannel.terminationEligibility.lastBlockingObservation.state)} at {formatTime(selectedChannel.terminationEligibility.lastBlockingObservation.observedAt)}.
+                                    </p>
+                                {/if}
+                                {:else}
+                                    <div class="eligibility-threshold__status">
+                                        <i class="bi bi-info-circle" aria-hidden="true"></i>
+                                        <span>
+                                            <strong>Detailed threshold unavailable</strong>
+                                            This server returned only its legacy candidate decision. No observation counts or timing details are inferred in the browser.
+                                        </span>
+                                    </div>
+                                {/if}
+                                <p class="eligibility-threshold__api">
+                                    <i class="bi bi-key" aria-hidden="true"></i>
+                                    YouTube API corroboration is optional{apiCorroborationEnabled ? " and configured" : " and not configured"}. It is not required and never substitutes for explicit matching evidence.
+                                </p>
+                            </div>
+
                             {#if selectedChannel.terminationConfirmed || selectedChannel.designation === "terminated"}
                                 <div class="designation-state designation-state--confirmed">
                                     <i class="bi bi-check-circle"></i>
@@ -1455,6 +1618,9 @@
     .evidence-row__source { color: var(--text-soft); font-size: 10px; }
     .evidence-row__source span { color: var(--warning); }
     .evidence-row__source small { color: var(--text-muted); font-size: 9px; font-weight: 400; }
+    .evidence-row__flags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px 9px; text-align: right; }
+    .evidence-row__flags span { display: inline-flex; align-items: center; gap: 4px; }
+    .evidence-row__flags .threshold-counting { color: var(--success); font-weight: 700; }
     .evidence-identifiers { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--text-muted); font-size: 9px; }
     .evidence-identifiers code { color: var(--accent-strong); overflow-wrap: anywhere; }
     .evidence-row pre { max-width: 100%; margin: 0; padding: 7px; overflow: auto; border: 1px solid var(--line-soft); background: var(--page-deep); color: var(--text-soft); font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -1474,6 +1640,31 @@
     .evidence-loading, .evidence-fallback { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-bottom: 1px solid var(--line-soft); background: var(--page-deep); color: var(--text-muted); font-size: 10px; }
     .evidence-loading i { color: var(--accent); }
     .designation-body { display: grid; gap: 10px; padding: 10px; }
+    .eligibility-threshold { display: grid; min-width: 0; gap: 8px; padding: 9px; border: 1px solid var(--line-soft); background: var(--page-deep); }
+    .eligibility-threshold--good { border-color: var(--success); }
+    .eligibility-threshold--warning { border-color: var(--warning); }
+    .eligibility-threshold__heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .eligibility-threshold__heading > div { min-width: 0; }
+    .eligibility-threshold__heading strong { display: block; font-size: 11px; }
+    .eligibility-threshold__heading > span { flex: none; color: var(--text-muted); font-size: 9px; font-weight: 700; text-transform: uppercase; }
+    .eligibility-threshold__bar { height: 7px; overflow: hidden; border: 1px solid var(--line-soft); background: var(--surface); }
+    .eligibility-threshold__bar span { display: block; height: 100%; background: var(--accent); transition: width 180ms ease-out; }
+    .eligibility-threshold--good .eligibility-threshold__bar span { background: var(--success); }
+    .eligibility-threshold--warning .eligibility-threshold__bar span { background: var(--warning); }
+    .eligibility-threshold__status { display: flex; align-items: flex-start; gap: 7px; padding: 7px; border: 1px solid var(--line-soft); background: var(--surface); color: var(--text-muted); font-size: 9px; }
+    .eligibility-threshold__status > i { margin-top: 1px; color: var(--accent); }
+    .eligibility-threshold__status span { display: grid; gap: 2px; }
+    .eligibility-threshold__status strong { color: var(--text); font-size: 10px; }
+    .eligibility-threshold__facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin: 0; border: 1px solid var(--line-soft); }
+    .eligibility-threshold__facts > div { min-width: 0; padding: 6px 7px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
+    .eligibility-threshold__facts > div:nth-child(2n) { border-right: 0; }
+    .eligibility-threshold__facts > div:nth-last-child(-n + 2) { border-bottom: 0; }
+    .eligibility-threshold__facts dt { color: var(--text-muted); font-size: 8px; font-weight: 700; text-transform: uppercase; }
+    .eligibility-threshold__facts dd { margin: 2px 0 0; color: var(--text-soft); font-size: 9px; overflow-wrap: anywhere; }
+    .eligibility-threshold__facts code { color: var(--accent-strong); font-size: 9px; }
+    .eligibility-threshold__blocker, .eligibility-threshold__api { display: flex; align-items: flex-start; gap: 6px; margin: 0; color: var(--text-muted); font-size: 9px; line-height: 1.4; }
+    .eligibility-threshold__blocker { color: var(--warning); }
+    .eligibility-threshold__api i { color: var(--accent); }
     .designation-state { display: flex; align-items: flex-start; gap: 8px; padding: 9px; border: 1px solid var(--line-soft); background: var(--page-deep); }
     .designation-state > i { margin-top: 2px; color: var(--text-muted); }
     .designation-state--candidate { border-color: var(--warning); }
@@ -1557,6 +1748,10 @@
         .identity-facts { grid-template-columns: minmax(0, 1fr); }
         .identity-facts > div, .identity-facts > div:nth-child(3), .identity-facts > div:nth-child(6) { border-right: 0; }
         .identity-facts__path { grid-column: auto; }
+        .eligibility-threshold__heading { align-items: flex-start; flex-direction: column; gap: 4px; }
+        .eligibility-threshold__facts { grid-template-columns: minmax(0, 1fr); }
+        .eligibility-threshold__facts > div, .eligibility-threshold__facts > div:nth-child(2n), .eligibility-threshold__facts > div:nth-last-child(-n + 2) { border-right: 0; border-bottom: 1px solid var(--line-soft); }
+        .eligibility-threshold__facts > div:last-child { border-bottom: 0; }
         .job-panel { grid-template-columns: minmax(0, 1fr); }
         .job-panel__numbers { grid-column: auto; }
         .job-panel__numbers button { margin-left: auto; }

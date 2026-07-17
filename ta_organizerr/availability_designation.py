@@ -99,7 +99,7 @@ def _eligibility(conn: sqlite3.Connection, channel_id: str) -> dict[str, Any]:
     identity = _require_identity(conn, channel_id)
     observations = conn.execute(
         """
-        SELECT normalized_state, reason_code, observed_at
+        SELECT observation_id, normalized_state, reason_code, observed_at
         FROM availability_observations
         WHERE subject_type = 'channel' AND subject_id = ?
         ORDER BY observed_at, observation_id

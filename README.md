@@ -221,9 +221,18 @@ migration.
   Explicit private, policy-removal, uploader-removal, or account-termination
   messages are kept separately from generic unavailable responses. Network,
   quota, authentication, region, bot-challenge, and rate-limit failures never
-  establish termination. A channel becomes eligible for administrator review
-  only after two matching explicit termination observations at least 24 hours
-  apart with no successful or conflicting observation between them. Checks do
+  establish termination. Channel enforcement evidence is accepted only from an
+  anchored yt-dlp `youtube:tab` response for the exact, case-sensitive requested
+  UCID. This includes YouTube's explicit "channel was removed because it violated
+  our Community Guidelines" response; generic unavailable or nonexistent text
+  remains unknown. On upgrade, stored availability-v1 channel observations are
+  transactionally revalidated from their preserved raw provider response and
+  retain a classification-history audit entry. A channel becomes eligible for
+  administrator review only after two matching explicit termination observations
+  at least 24 hours apart with no successful or conflicting observation between
+  them. Malformed and future-dated timestamps cannot qualify. The Availability
+  page shows the exact observations that count and the earliest useful follow-up
+  time; YouTube Data API corroboration remains optional. Checks do
   not rename folders or alter media; folder designation is a separate guarded
   action. A confirmed designation appends `[Terminated]` to the persisted
   channel component (for example, `Name [Recovered] [Terminated]`). The whole

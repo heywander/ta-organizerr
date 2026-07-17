@@ -84,6 +84,12 @@ def create_app(initialize_db: bool = True) -> Flask:
         from .availability_designation import recover_pending_designations
 
         recover_pending_designations()
+        # Correct derived availability-v1 states only after any crash-left
+        # folder transaction has resolved. A repair revision must never make a
+        # pending designation journal appear mixed during recovery.
+        from .availability import reclassify_legacy_channel_observations
+
+        reclassify_legacy_channel_observations()
 
     app.secret_key = get_or_create_secret_key(FLASK_SECRET_KEY_ENV)
     app.config.update(

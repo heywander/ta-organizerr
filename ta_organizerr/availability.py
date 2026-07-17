@@ -7,6 +7,7 @@ video was removed for a particular reason.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -76,9 +77,24 @@ _MAX_RAW_REASON = 4000
 _MAX_EVIDENCE_JSON = 16_000
 _MAX_VIDEO_JOB_SUBJECTS = 10_000
 _TERMINATION_CONFIRMATION_INTERVAL = timedelta(hours=24)
-_CLASSIFIER_VERSION = "availability-v1"
+_CLASSIFIER_VERSION = "availability-v2"
 _SOURCE_INVENTORY_CACHE_SECONDS = 30.0
 _LOCAL_INVENTORY_CACHE_SECONDS = 30.0
+_MAX_ELIGIBILITY_DIAGNOSTIC_OBSERVATIONS = 10
+
+_COMMUNITY_GUIDELINES_CHANNEL_REMOVAL_RE = re.compile(
+    r"^(?:this|the|your)\s+(?:channel|account)\s+"
+    r"(?:was|has\s+been)\s+removed\s+(?:because\s+it\s+|for\s+)?"
+    r"violat(?:ed|ing)\s+(?:our|youtube(?:['\N{RIGHT SINGLE QUOTATION MARK}]s)?)\s+"
+    r"community\s+guidelines[.!]?$",
+    re.IGNORECASE,
+)
+_EXPLICIT_CHANNEL_ENFORCEMENT_RE = re.compile(
+    r"^(?:this|the|your)\s+(?:youtube\s+)?(?:channel|account)\s+"
+    r"(?:(?:has|had)\s+been|was|is)\s+"
+    r"(?P<action>terminated|suspended)\b(?:\s+.*)?[.!]?$",
+    re.IGNORECASE,
+)
 
 _runtime_lock = threading.RLock()
 _threads: dict[str, threading.Thread] = {}
@@ -307,7 +323,8 @@ def list_channels() -> list[dict[str, Any]]:
         channel_observations: dict[str, list[sqlite3.Row]] = {}
         for observation in conn.execute(
             """
-            SELECT channel_id, normalized_state, reason_code, observed_at
+            SELECT observation_id, channel_id, normalized_state, reason_code,
+                   observed_at
             FROM availability_observations
             WHERE subject_type = 'channel'
               AND normalized_state IN (
@@ -834,7 +851,37 @@ def _clean_reason(value: object) -> str:
     return text[-_MAX_RAW_REASON:]
 
 
-def _classify_failure(subject_type: str, reason: str) -> dict[str, Any]:
+def _yt_dlp_channel_message(reason: str, requested_channel_id: str | None) -> str | None:
+    """Extract one exact-ID, line-anchored ``youtube:tab`` provider message."""
+    if (
+        not isinstance(requested_channel_id, str)
+        or _CHANNEL_ID_RE.fullmatch(requested_channel_id) is None
+    ):
+        return None
+    pattern = re.compile(
+        r"^ERROR:\s*\[youtube:tab\]\s+"
+        r"(?P<channel_id>UC[A-Za-z0-9_-]{22}):"
+        r"\s*YouTube said:\s*(?P<message>[^\r\n]+?)\s*$",
+        re.MULTILINE | re.IGNORECASE,
+    )
+    # UCIDs are case-sensitive even though the fixed yt-dlp diagnostic text is
+    # not. Compare the captured identifier outside the case-insensitive regex.
+    matches = [
+        match
+        for match in pattern.finditer(reason)
+        if match.group("channel_id") == requested_channel_id
+    ]
+    if not matches:
+        return None
+    return matches[-1].group("message").strip()
+
+
+def _classify_failure(
+    subject_type: str,
+    reason: str,
+    *,
+    requested_subject_id: str | None = None,
+) -> dict[str, Any]:
     lowered = reason.casefold()
     transient_markers = (
         "timed out", "temporary failure", "connection reset", "network is unreachable",
@@ -858,11 +905,27 @@ def _classify_failure(subject_type: str, reason: str) -> dict[str, Any]:
         return {"state": "restricted", "reason_code": "access_restricted"}
 
     if subject_type == "channel":
-        if re.search(r"(?:account|channel).{0,80}(?:terminated|suspended)", lowered) or re.search(
-            r"(?:terminated|suspended).{0,80}(?:account|channel)", lowered
+        provider_message = _yt_dlp_channel_message(reason, requested_subject_id)
+        enforcement = (
+            _EXPLICIT_CHANNEL_ENFORCEMENT_RE.fullmatch(provider_message)
+            if provider_message
+            else None
+        )
+        if provider_message and (
+            enforcement
+            or _COMMUNITY_GUIDELINES_CHANNEL_REMOVAL_RE.fullmatch(provider_message)
         ):
-            reason_code = "channel_suspended" if "suspend" in lowered else "channel_terminated"
-            return {"state": "terminated_explicit", "reason_code": reason_code}
+            # The raw provider message retains the specific termination cause.
+            # A stable reason family lets equivalent explicit wording satisfy
+            # the repeated-evidence threshold without title-text heuristics.
+            return {
+                "state": "terminated_explicit",
+                "reason_code": (
+                    "channel_suspended"
+                    if enforcement and enforcement.group("action").casefold() == "suspended"
+                    else "channel_terminated"
+                ),
+            }
         return {"state": "unavailable_unknown", "reason_code": "channel_unavailable_unknown"}
 
     if "private video" in lowered or "video is private" in lowered:
@@ -1058,7 +1121,11 @@ def _yt_dlp_probe(
             expected_channel_id,
         )
     reason = _clean_reason(completed.stderr or completed.stdout or "yt-dlp returned no public metadata")
-    classified = _classify_failure(subject_type, reason)
+    classified = _classify_failure(
+        subject_type,
+        reason,
+        requested_subject_id=subject_id,
+    )
     classified.update({"raw_reason": reason, "evidence": {"returncode": completed.returncode}})
     return classified
 
@@ -1169,13 +1236,17 @@ def _api_probe(subject_type: str, subject_id: str) -> dict[str, Any] | None:
 def _combine_probe(subject_type: str, ytdlp: dict[str, Any], api: dict[str, Any] | None) -> dict[str, Any]:
     result = dict(ytdlp)
     provider = "yt-dlp"
+    raw_ytdlp_reason = _clean_reason(ytdlp.get("raw_reason"))
     if api is not None:
         provider = "yt-dlp+youtube-data-api"
         if subject_type == "channel" and ytdlp["state"] == "terminated_explicit" and api["state"] == "accessible":
             result.update({
                 "state": "conflicting_evidence",
                 "reason_code": "api_reports_accessible",
-                "raw_reason": "yt-dlp reported explicit termination, but the Data API returned the channel",
+                "raw_reason": (
+                    f"{raw_ytdlp_reason}\n\n"
+                    "Corroboration conflict: the Data API returned the exact channel."
+                ).strip(),
             })
         if api.get("pause"):
             result["pause"] = True
@@ -1183,9 +1254,12 @@ def _combine_probe(subject_type: str, ytdlp: dict[str, Any], api: dict[str, Any]
             result["disable_api"] = True
     result["provider"] = provider
     result["tool_version"] = _tool_version()
+    ytdlp_evidence = dict(ytdlp.get("evidence") or {})
+    if raw_ytdlp_reason:
+        ytdlp_evidence["raw_reason"] = raw_ytdlp_reason
     result["evidence"] = {
         "classifier_version": _CLASSIFIER_VERSION,
-        "yt_dlp": ytdlp.get("evidence", {}),
+        "yt_dlp": ytdlp_evidence,
         "youtube_api": api,
         "api_resource_exists": bool(
             api and api.get("state") in {"accessible", "available"}
@@ -1292,43 +1366,545 @@ def record_observation(
     return observation_id
 
 
+def _legacy_channel_reclassification(
+    row: sqlite3.Row,
+) -> tuple[str, str, str] | None:
+    """Return a versioned, auditable correction for one historical row."""
+    original_state = str(row["normalized_state"] or "")
+    original_reason = str(row["reason_code"] or "")
+    provider = str(row["provider"] or "").casefold()
+    if provider not in {"yt-dlp", "yt-dlp+youtube-data-api"}:
+        return None
+
+    raw_evidence = str(row["evidence_json"] or "")
+    try:
+        evidence = json.loads(raw_evidence or "{}")
+    except (TypeError, ValueError):
+        evidence = None
+    if not isinstance(evidence, dict):
+        evidence = None
+    classifier_version = evidence.get("classifier_version") if evidence else None
+    previous_classifier_version = (
+        classifier_version
+        if isinstance(classifier_version, str) and len(classifier_version) <= 120
+        else "unknown"
+    )
+
+    # Unknown v2 results already passed the current classifier. Historical
+    # explicit rows are always revalidated because v1 used a loose text search
+    # that did not bind evidence to the exact requested UCID.
+    if original_state != "terminated_explicit" and classifier_version != "availability-v1":
+        return None
+
+    classified = _classify_failure(
+        "channel",
+        str(row["raw_reason"] or ""),
+        requested_subject_id=row["subject_id"],
+    )
+    state = str(classified.get("state") or "unavailable_unknown")
+    reason_code = str(
+        classified.get("reason_code") or "channel_unavailable_unknown"
+    )
+
+    if state == "terminated_explicit" and provider == "yt-dlp+youtube-data-api":
+        # Missing API structure cannot corroborate or contradict the provider;
+        # fail closed instead of allowing an old explicit row to unlock action.
+        if evidence is None or "api_resource_exists" not in evidence:
+            state, reason_code = (
+                "unavailable_unknown",
+                "channel_unavailable_unknown",
+            )
+        else:
+            api = evidence.get("youtube_api")
+            api_reports_accessible = evidence.get("api_resource_exists") is True or (
+                isinstance(api, dict) and api.get("state") == "accessible"
+            )
+            if api_reports_accessible:
+                state, reason_code = (
+                    "conflicting_evidence",
+                    "api_reports_accessible",
+                )
+
+    if (
+        classifier_version == _CLASSIFIER_VERSION
+        and original_state == state
+        and original_reason == reason_code
+    ):
+        return None
+
+    audit_entry = {
+        "reclassified_at": _now(),
+        "from": {
+            "classifier_version": previous_classifier_version,
+            "state": original_state,
+            "reason_code": original_reason[:240],
+        },
+        "to": {
+            "classifier_version": _CLASSIFIER_VERSION,
+            "state": state,
+            "reason_code": reason_code,
+        },
+        "signal": (
+            "exact_channel_provider_message"
+            if state in {"terminated_explicit", "conflicting_evidence"}
+            else "provider_message_not_explicit"
+        ),
+    }
+    raw_evidence_bytes = raw_evidence.encode("utf-8")
+    prior_evidence = {
+        "sha256": hashlib.sha256(raw_evidence_bytes).hexdigest(),
+        "size_bytes": len(raw_evidence_bytes),
+        "preserved_inline": len(raw_evidence_bytes) <= 2_048,
+    }
+    if prior_evidence["preserved_inline"]:
+        prior_evidence["raw_text"] = raw_evidence
+
+    prior_history: list[object] = []
+    if evidence is not None and isinstance(
+        evidence.get("classification_history"), list
+    ):
+        prior_history = evidence["classification_history"]
+    history = prior_history[-4:] + [audit_entry]
+
+    # Start by preserving a valid evidence object in full. Malformed legacy
+    # evidence gets a new parseable envelope so even a state-preserving repair
+    # is durably marked as having passed the v2 classifier.
+    if evidence is not None:
+        evidence["classification_history"] = history
+        evidence["classifier_version"] = _CLASSIFIER_VERSION
+        candidate_json = _json(evidence)
+    else:
+        candidate_json = _json({
+            "classifier_version": _CLASSIFIER_VERSION,
+            "classification_history": [audit_entry],
+            "prior_evidence": prior_evidence,
+        })
+
+    if len(candidate_json) > _MAX_EVIDENCE_JSON:
+        youtube_api = evidence.get("youtube_api") if evidence is not None else None
+        yt_dlp = evidence.get("yt_dlp") if evidence is not None else None
+        compact_evidence: dict[str, object] = {
+            "classifier_version": _CLASSIFIER_VERSION,
+            # Do not copy inherited history entries into a fallback envelope:
+            # any one legacy entry may itself consume the storage bound.
+            "classification_history": [audit_entry],
+            "prior_evidence": prior_evidence,
+            "api_resource_exists": (
+                evidence.get("api_resource_exists")
+                if evidence is not None
+                and isinstance(evidence.get("api_resource_exists"), bool)
+                else None
+            ),
+            "youtube_api": (
+                {
+                    key: youtube_api.get(key)
+                    for key in (
+                        "state",
+                        "reason_code",
+                        "status_code",
+                        "raw_reason",
+                    )
+                    if key in youtube_api
+                }
+                if isinstance(youtube_api, dict)
+                else None
+            ),
+            "yt_dlp": (
+                {
+                    key: yt_dlp.get(key)
+                    for key in (
+                        "returncode",
+                        "reported_id",
+                        "extractor",
+                        "availability",
+                        "raw_reason",
+                    )
+                    if key in yt_dlp
+                }
+                if isinstance(yt_dlp, dict)
+                else {}
+            ),
+        }
+        if prior_history:
+            encoded_history = _json(prior_history).encode("utf-8")
+            compact_evidence["prior_classification_history"] = {
+                "entry_count": len(prior_history),
+                "sha256": hashlib.sha256(encoded_history).hexdigest(),
+                "size_bytes": len(encoded_history),
+            }
+        candidate_json = _json(compact_evidence)
+
+    if len(candidate_json) > _MAX_EVIDENCE_JSON:
+        # Fixed-shape last resort: all variable legacy content is represented
+        # only by hashes and sizes, guaranteeing a bounded v2 audit record.
+        candidate_json = _json({
+            "classifier_version": _CLASSIFIER_VERSION,
+            "classification_history": [audit_entry],
+            "prior_evidence": {
+                "sha256": prior_evidence["sha256"],
+                "size_bytes": prior_evidence["size_bytes"],
+                "preserved_inline": False,
+            },
+            "api_resource_exists": (
+                evidence.get("api_resource_exists")
+                if evidence is not None
+                and isinstance(evidence.get("api_resource_exists"), bool)
+                else None
+            ),
+        })
+
+    return state, reason_code, candidate_json
+
+
+def reclassify_legacy_channel_observations() -> dict[str, int]:
+    """Repair availability-v1 channel-removal rows once, transactionally.
+
+    Derived state and the versioned classification audit are updated from the
+    preserved provider output. The aggregate is rebuilt from the newest exact-
+    channel observation, and one registry revision bump invalidates any
+    pre-repair dry-run token.
+    """
+    reclassified = 0
+    conflicting = 0
+    skipped_ambiguous_api = 0
+    affected_channels: set[str] = set()
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT observation_id, subject_id, channel_id, normalized_state,
+                   reason_code, provider, raw_reason, evidence_json
+            FROM availability_observations
+            WHERE subject_type = 'channel'
+              AND subject_id = channel_id
+              AND normalized_state IN (
+                  'unavailable_unknown', 'terminated_explicit'
+              )
+              AND provider IN ('yt-dlp', 'yt-dlp+youtube-data-api')
+            ORDER BY observation_id
+            """
+        ).fetchall()
+        for row in rows:
+            replacement = _legacy_channel_reclassification(row)
+            if replacement is None:
+                continue
+            state, reason_code, evidence_json = replacement
+            cursor = conn.execute(
+                """
+                UPDATE availability_observations
+                SET normalized_state = ?, reason_code = ?, evidence_json = ?
+                WHERE observation_id = ?
+                  AND normalized_state = ?
+                  AND reason_code IS ?
+                  AND (
+                      normalized_state != ? OR reason_code IS NOT ?
+                      OR COALESCE(evidence_json, '') != ?
+                  )
+                """,
+                (
+                    state,
+                    reason_code,
+                    evidence_json,
+                    row["observation_id"],
+                    row["normalized_state"],
+                    row["reason_code"],
+                    state,
+                    reason_code,
+                    evidence_json,
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            reclassified += 1
+            conflicting += state == "conflicting_evidence"
+            affected_channels.add(row["channel_id"])
+
+        for channel_id in sorted(affected_channels):
+            candidates = conn.execute(
+                """
+                SELECT observation_id, normalized_state, reason_code, observed_at
+                FROM availability_observations
+                WHERE subject_type = 'channel'
+                  AND subject_id = ? AND channel_id = ?
+                """,
+                (channel_id, channel_id),
+            ).fetchall()
+            if not candidates:
+                continue
+            def aggregate_order(item: sqlite3.Row) -> tuple[datetime, int]:
+                try:
+                    observed = _parse_time(str(item["observed_at"] or ""))
+                except (TypeError, ValueError):
+                    observed = datetime.min.replace(tzinfo=timezone.utc)
+                return observed, int(item["observation_id"])
+
+            latest = max(candidates, key=aggregate_order)
+            conn.execute(
+                """
+                UPDATE channel_identities
+                SET current_state = ?, current_reason_code = ?,
+                    current_state_at = ?, revision = revision + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE channel_id = ?
+                """,
+                (
+                    latest["normalized_state"],
+                    latest["reason_code"],
+                    latest["observed_at"],
+                    channel_id,
+                ),
+            )
+        conn.commit()
+
+    if reclassified:
+        log(
+            "🧰 [AVAILABILITY] Reclassified "
+            f"{reclassified} legacy channel observations across "
+            f"{len(affected_channels)} channels ({conflicting} conflicting)"
+        )
+    if skipped_ambiguous_api:
+        log(
+            "⚠️ [AVAILABILITY] Left "
+            f"{skipped_ambiguous_api} legacy channel observations unknown "
+            "because API corroboration evidence was incomplete"
+        )
+    return {
+        "reclassified_observations": reclassified,
+        "affected_channels": len(affected_channels),
+        "conflicting_observations": conflicting,
+        "skipped_ambiguous_api": skipped_ambiguous_api,
+    }
+
+
 def _termination_eligibility_from_rows(
     current_state: str | None,
     current_reason_code: str | None,
     rows: list[sqlite3.Row],
+    *,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
+    def value(row: sqlite3.Row, key: str) -> Any:
+        try:
+            return row[key]
+        except (IndexError, KeyError):
+            return None
+
+    def diagnostic(row: sqlite3.Row, **extra: Any) -> dict[str, Any]:
+        return {
+            "observation_id": value(row, "observation_id"),
+            "observed_at": value(row, "observed_at"),
+            "reason_code": value(row, "reason_code"),
+            **extra,
+        }
+
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    valid_records: list[dict[str, Any]] = []
+    invalid_observations: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        raw_time = value(row, "observed_at")
+        try:
+            observed_time = _parse_time(str(raw_time or ""))
+        except (TypeError, ValueError):
+            invalid_observations.append(
+                diagnostic(
+                    row,
+                    state=value(row, "normalized_state"),
+                    issue="malformed_timestamp",
+                )
+            )
+            continue
+        if observed_time > now:
+            invalid_observations.append(
+                diagnostic(
+                    row,
+                    state=value(row, "normalized_state"),
+                    issue="future_timestamp",
+                )
+            )
+            continue
+        observation_id = value(row, "observation_id")
+        try:
+            stable_order = int(observation_id)
+        except (TypeError, ValueError):
+            stable_order = index
+        valid_records.append({
+            "row": row,
+            "time": observed_time,
+            "order": stable_order,
+            "index": index,
+        })
+    # SQLite text ordering is not chronological when ISO timestamps use mixed
+    # offsets. Eligibility always operates on normalized UTC instants.
+    valid_records.sort(
+        key=lambda record: (
+            record["time"],
+            record["order"],
+            record["index"],
+        )
+    )
+    ordered_rows = [record["row"] for record in valid_records]
+    times = {id(record["row"]): record["time"] for record in valid_records}
+    explicit_rows = [
+        row
+        for row in ordered_rows
+        if value(row, "normalized_state") == "terminated_explicit"
+    ]
+    reason = (
+        (
+            current_reason_code
+            if current_state == "terminated_explicit"
+            else value(explicit_rows[-1], "reason_code")
+        )
+        if explicit_rows
+        else None
+    )
     base = {
         "eligible": False,
+        "status": "no_matching_evidence",
         "required_observations": 2,
         "minimum_separation_hours": 24,
         "matching_observations": 0,
+        "historical_matching_observations": 0,
+        "qualifying_observations": 0,
+        "qualifying_observations_needed": 2,
+        "remaining_observations": 2,
+        "threshold_progress": 0,
+        "matching_reason_code": reason,
         "first_observed_at": None,
         "latest_observed_at": None,
-        "reason_code": current_reason_code,
+        "next_qualifying_observation_at": None,
+        "next_qualifying_check_at": None,
+        "qualified_at": None,
+        "counting_observations": [],
+        "last_blocking_observation": None,
+        "invalid_observations": invalid_observations[
+            -_MAX_ELIGIBILITY_DIAGNOSTIC_OBSERVATIONS:
+        ],
+        "invalid_observation_count": len(invalid_observations),
+        "api_corroboration_required": False,
+        "reason_code": reason,
     }
-    if current_state != "terminated_explicit":
+    invalid_blockers = [
+        item
+        for item in invalid_observations
+        if item.get("state") in {"accessible", "conflicting_evidence"}
+    ]
+    if invalid_blockers:
+        # An accessible/conflicting row with an unusable timestamp cannot be
+        # placed safely before or after the explicit sequence. It must fail
+        # closed instead of being discarded and accidentally allowing action.
+        base["status"] = "invalid_timestamp_evidence"
+        base["last_blocking_observation"] = invalid_blockers[-1]
         return base
-    reason = current_reason_code
-    matching = [row for row in rows if row["normalized_state"] == "terminated_explicit" and row["reason_code"] == reason]
-    base["matching_observations"] = len(matching)
-    if not matching:
-        return base
-    latest = matching[-1]
-    latest_time = _parse_time(latest["observed_at"])
-    base["latest_observed_at"] = latest["observed_at"]
-    for prior in matching[:-1]:
-        prior_time = _parse_time(prior["observed_at"])
-        if latest_time - prior_time < _TERMINATION_CONFIRMATION_INTERVAL:
-            continue
-        successful_between = any(
-            row["normalized_state"] in {"accessible", "conflicting_evidence"}
-            and prior_time < _parse_time(row["observed_at"]) <= latest_time
-            for row in rows
+    matching = [
+        row
+        for row in ordered_rows
+        if value(row, "normalized_state") == "terminated_explicit"
+        and value(row, "reason_code") == reason
+    ]
+    base["historical_matching_observations"] = len(matching)
+
+    blocking_indexes = [
+        index
+        for index, row in enumerate(ordered_rows)
+        if value(row, "normalized_state")
+        in {"accessible", "conflicting_evidence"}
+    ]
+    last_blocking_index = blocking_indexes[-1] if blocking_indexes else -1
+    if last_blocking_index >= 0:
+        blocking_row = ordered_rows[last_blocking_index]
+        base["last_blocking_observation"] = {
+            **diagnostic(blocking_row),
+            "state": value(blocking_row, "normalized_state"),
+        }
+
+    counting = [
+        row
+        for index, row in enumerate(ordered_rows)
+        if index > last_blocking_index
+        and value(row, "normalized_state") == "terminated_explicit"
+        and value(row, "reason_code") == reason
+    ]
+    base["matching_observations"] = len(counting)
+    baseline = counting[0] if counting else None
+    qualifying_second = None
+    if baseline is not None:
+        baseline_time = times[id(baseline)]
+        qualifying_second = next(
+            (
+                row
+                for row in counting[1:]
+                if times[id(row)] - baseline_time
+                >= _TERMINATION_CONFIRMATION_INTERVAL
+            ),
+            None,
         )
-        if successful_between:
-            continue
-        base.update({"eligible": True, "first_observed_at": prior["observed_at"]})
+    if counting:
+        base["first_observed_at"] = value(counting[0], "observed_at")
+        base["latest_observed_at"] = value(counting[-1], "observed_at")
+        base["counting_observations"] = [diagnostic(baseline)]
+        if qualifying_second is None:
+            base["threshold_progress"] = 1
+            base["qualifying_observations"] = 1
+            base["qualifying_observations_needed"] = 1
+            base["remaining_observations"] = 1
+            next_qualifying = (
+                times[id(baseline)] + _TERMINATION_CONFIRMATION_INTERVAL
+            )
+            next_qualifying_text = next_qualifying.isoformat()
+            base["next_qualifying_observation_at"] = next_qualifying_text
+            base["next_qualifying_check_at"] = next_qualifying_text
+        else:
+            base["threshold_progress"] = 2
+            base["qualifying_observations"] = 2
+            base["qualifying_observations_needed"] = 0
+            base["remaining_observations"] = 0
+            base["qualified_at"] = value(qualifying_second, "observed_at")
+            base["counting_observations"] = [
+                diagnostic(baseline),
+                diagnostic(qualifying_second),
+            ]
+
+    if current_state != "terminated_explicit":
+        last_matching_index = max(
+            (
+                index
+                for index, row in enumerate(ordered_rows)
+                if value(row, "normalized_state") == "terminated_explicit"
+                and value(row, "reason_code") == reason
+            ),
+            default=-1,
+        )
+        if last_matching_index >= 0 and last_blocking_index > last_matching_index:
+            base["status"] = "evidence_reset"
+            base["threshold_progress"] = 0
+            base["qualifying_observations"] = 0
+            base["qualifying_observations_needed"] = 2
+            base["remaining_observations"] = 2
+            base["counting_observations"] = []
+            base["first_observed_at"] = None
+            base["latest_observed_at"] = None
+            base["next_qualifying_observation_at"] = None
+            base["next_qualifying_check_at"] = None
+        elif matching:
+            base["status"] = "latest_not_explicit"
+        elif invalid_observations:
+            base["status"] = "invalid_timestamp_evidence"
         return base
+
+    if not counting:
+        if invalid_observations:
+            base["status"] = "invalid_timestamp_evidence"
+        return base
+
+    if qualifying_second is not None:
+        base["eligible"] = True
+        base["status"] = "eligible"
+        return base
+    next_qualifying = times[id(baseline)] + _TERMINATION_CONFIRMATION_INTERVAL
+    base["status"] = (
+        "ready_for_followup" if now >= next_qualifying else "waiting_for_interval"
+    )
     return base
 
 
@@ -1342,7 +1918,7 @@ def termination_eligibility(channel_id: str) -> dict[str, Any]:
         ).fetchone()
         rows = conn.execute(
             """
-            SELECT normalized_state, reason_code, observed_at
+            SELECT observation_id, normalized_state, reason_code, observed_at
             FROM availability_observations
             WHERE subject_type = 'channel' AND subject_id = ?
             ORDER BY observed_at, observation_id
