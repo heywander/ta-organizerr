@@ -238,6 +238,184 @@ class RecoveredChannelTestCase(unittest.TestCase):
 
 
 class RecoveredChannelInventoryTests(RecoveredChannelTestCase):
+    def test_existing_target_attach_accounts_for_nested_links_and_source_only_media(self) -> None:
+        linked_source = self.make_media(VIDEO_ID, payload=b"legacy-linked")
+        source_only = self.make_media(SECOND_VIDEO_ID, payload=b"not-yet-linked")
+        target = self.target_dir / "Western Decline"
+        video_folder = target / "2024-08-07_-_A_human_title"
+        video_folder.mkdir(parents=True)
+        legacy_link = video_folder / "video.mp4"
+        legacy_link.symlink_to(
+            self.host_source_dir / SOURCE_CHANNEL_ID / linked_source.name
+        )
+        backup = target / "WD.tar.gz"
+        backup.write_bytes(b"backup-is-not-media")
+        before = {
+            path.relative_to(target): (
+                os.lstat(path).st_mode,
+                os.readlink(path) if path.is_symlink() else path.read_bytes()
+                if path.is_file() else None,
+            )
+            for path in target.rglob("*")
+        }
+
+        plan = recovered_channels.build_attach_plan(
+            SOURCE_CHANNEL_ID, "Western Decline", actor="tester"
+        )
+
+        self.assertEqual(plan["status"], "ready")
+        self.assertEqual(plan["counts"]["source_total"], 2)
+        self.assertEqual(plan["counts"]["exact_unique_links"], 1)
+        self.assertEqual(plan["counts"]["source_only"], 1)
+        self.assertEqual(plan["counts"]["unrelated_files"], 1)
+        self.assertEqual(plan["source_only"][0]["video_id"], SECOND_VIDEO_ID)
+
+        result = recovered_channels.apply_attach_plan(
+            plan["plan_token"], plan["confirmation"], actor="tester"
+        )
+
+        self.assertEqual(result["adopted_links"], 1)
+        self.assertEqual(result["source_only"], 1)
+        self.assertEqual(result["filesystem_changes"], 0)
+        case = result["case"]
+        self.assertEqual(case["target_component"], "Western Decline")
+        items = {item["video_id"]: item for item in self.items(self.case_id(case))}
+        self.assertEqual(items[VIDEO_ID]["organized_path"], str(legacy_link))
+        self.assertEqual(items[VIDEO_ID]["link_status"], "healthy")
+        self.assertIsNone(items[SECOND_VIDEO_ID]["organized_path"])
+        self.assertEqual(
+            {
+                path.relative_to(target): (
+                    os.lstat(path).st_mode,
+                    os.readlink(path) if path.is_symlink() else path.read_bytes()
+                    if path.is_file() else None,
+                )
+                for path in target.rglob("*")
+            },
+            before,
+        )
+        self.assertEqual(source_only.read_bytes(), b"not-yet-linked")
+        with self.assertRaises(recovered_channels.RecoveredChannelError) as reused:
+            recovered_channels.apply_attach_plan(
+                plan["plan_token"], plan["confirmation"], actor="tester"
+            )
+        self.assertEqual(reused.exception.status, 409)
+
+    def test_duplicate_exact_legacy_links_remain_unowned_for_manual_review(self) -> None:
+        unique_source = self.make_media(VIDEO_ID)
+        duplicate_source = self.make_media(SECOND_VIDEO_ID)
+        target = self.target_dir / "Western Decline"
+        target.mkdir()
+        (target / "unique.mp4").symlink_to(
+            self.host_source_dir / SOURCE_CHANNEL_ID / unique_source.name
+        )
+        for folder_name in ("first title", "second title"):
+            folder = target / folder_name
+            folder.mkdir()
+            (folder / "video.mp4").symlink_to(
+                self.host_source_dir / SOURCE_CHANNEL_ID / duplicate_source.name
+            )
+
+        plan = recovered_channels.build_attach_plan(
+            SOURCE_CHANNEL_ID, "Western Decline", actor="tester"
+        )
+        self.assertEqual(plan["counts"]["exact_unique_links"], 1)
+        self.assertEqual(plan["counts"]["ambiguous"], 1)
+        result = recovered_channels.apply_attach_plan(
+            plan["plan_token"], plan["confirmation"], actor="tester"
+        )
+        items = {item["video_id"]: item for item in self.items(self.case_id(result["case"]))}
+        self.assertIsNotNone(items[VIDEO_ID]["organized_path"])
+        self.assertIsNone(items[SECOND_VIDEO_ID]["organized_path"])
+        with db.get_db() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT video_id FROM videos WHERE video_id = ?", (SECOND_VIDEO_ID,)
+                ).fetchone()
+            )
+
+    def test_existing_target_auto_detection_requires_one_exact_folder(self) -> None:
+        source = self.make_media()
+        target = self.target_dir / "Western Decline"
+        target.mkdir()
+        (target / "video.mp4").symlink_to(
+            self.host_source_dir / SOURCE_CHANNEL_ID / source.name
+        )
+
+        plan = recovered_channels.build_attach_plan(
+            SOURCE_CHANNEL_ID, actor="tester"
+        )
+        self.assertEqual(plan["status"], "ready")
+        self.assertTrue(plan["auto_selected"])
+        self.assertEqual(plan["target_component"], "Western Decline")
+
+        other = self.target_dir / "Duplicate presentation"
+        other.mkdir()
+        (other / "same.mp4").symlink_to(
+            self.host_source_dir / SOURCE_CHANNEL_ID / source.name
+        )
+        selection = recovered_channels.build_attach_plan(
+            SOURCE_CHANNEL_ID, actor="tester"
+        )
+        self.assertEqual(selection["status"], "selection_required")
+        self.assertEqual(len(selection["candidates"]), 2)
+
+    def test_tracked_exact_links_can_anchor_one_missing_metadata_source(self) -> None:
+        tracked_source = self.make_media(VIDEO_ID)
+        missing_metadata_source = self.make_media(SECOND_VIDEO_ID)
+        target = self.target_dir / "Western Decline"
+        target.mkdir()
+        link = target / "video.mp4"
+        link.symlink_to(
+            self.host_source_dir / SOURCE_CHANNEL_ID / tracked_source.name
+        )
+        with db.get_db() as connection:
+            connection.execute(
+                "INSERT INTO videos "
+                "(video_id, title, channel, channel_id, symlink, status) "
+                "VALUES (?, 'Known title', 'Western Decline', ?, ?, 'linked')",
+                (VIDEO_ID, SOURCE_CHANNEL_ID, str(link)),
+            )
+            connection.commit()
+
+        plan = recovered_channels.build_attach_plan(
+            SOURCE_CHANNEL_ID, "Western Decline", actor="tester"
+        )
+        self.assertEqual(plan["counts"]["exact_unique_links"], 0)
+        self.assertEqual(plan["counts"]["tracked_exact_links"], 1)
+        self.assertEqual(plan["counts"]["source_only"], 1)
+        result = recovered_channels.apply_attach_plan(
+            plan["plan_token"], plan["confirmation"], actor="tester"
+        )
+        self.assertEqual(result["adopted_links"], 0)
+        items = self.items(self.case_id(result["case"]))
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["source_path"], str(missing_metadata_source))
+        self.assertIsNone(items[0]["organized_path"])
+
+    def test_attach_plan_is_single_use_and_revalidates_target_inventory(self) -> None:
+        source = self.make_media()
+        target = self.target_dir / "Western Decline"
+        target.mkdir()
+        link = target / "video.mp4"
+        link.symlink_to(self.host_source_dir / SOURCE_CHANNEL_ID / source.name)
+        plan = recovered_channels.build_attach_plan(
+            SOURCE_CHANNEL_ID, "Western Decline", actor="tester"
+        )
+        link.unlink()
+        link.symlink_to(self.host_source_dir / OTHER_CHANNEL_ID / source.name)
+
+        with self.assertRaises(recovered_channels.RecoveredChannelError) as changed:
+            recovered_channels.apply_attach_plan(
+                plan["plan_token"], plan["confirmation"], actor="tester"
+            )
+        self.assertEqual(changed.exception.status, 409)
+        with db.get_db() as connection:
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM recovered_channel_cases").fetchone()[0],
+                0,
+            )
+
     def test_case_inventory_is_exactly_confined_to_one_real_raw_channel(self) -> None:
         selected = self.make_media()
         self.make_media(SECOND_VIDEO_ID, channel_id=OTHER_CHANNEL_ID)
@@ -2762,6 +2940,8 @@ class RecoveredChannelRouteTests(RecoveredChannelTestCase):
         endpoints = (
             ("get", "/api/recovery/channel-cases", None),
             ("post", "/api/recovery/channel-cases", {}),
+            ("post", "/api/recovery/channel-cases/attach-plan", {}),
+            ("post", "/api/recovery/channel-cases/attach", {}),
             ("get", "/api/recovery/channel-cases/case", None),
             ("patch", "/api/recovery/channel-cases/case", {}),
             ("get", "/api/recovery/channel-cases/case/items", None),
@@ -2843,6 +3023,44 @@ class RecoveredChannelRouteTests(RecoveredChannelTestCase):
                 (case_id,),
             ).fetchone()
         self.assertEqual(event["actor"], "route-tester")
+
+    def test_existing_target_attach_routes_accept_ids_and_exact_confirmation_only(self) -> None:
+        self.login()
+        source = self.make_media()
+        target = self.target_dir / "Western Decline"
+        target.mkdir()
+        link = target / "video.mp4"
+        link.symlink_to(self.host_source_dir / SOURCE_CHANNEL_ID / source.name)
+
+        extra = self.client.post(
+            "/api/recovery/channel-cases/attach-plan",
+            json={
+                "source_channel_id": SOURCE_CHANNEL_ID,
+                "target_component": "Western Decline",
+                "filepath": str(link),
+            },
+        )
+        self.assertEqual(extra.status_code, 400)
+        planned = self.client.post(
+            "/api/recovery/channel-cases/attach-plan",
+            json={
+                "source_channel_id": SOURCE_CHANNEL_ID,
+                "target_component": "Western Decline",
+            },
+        )
+        self.assertEqual(planned.status_code, 200, planned.get_json())
+        plan = planned.get_json()["plan"]
+        wrong = self.client.post(
+            "/api/recovery/channel-cases/attach",
+            json={"plan_token": plan["plan_token"], "confirmation": "ATTACH something else"},
+        )
+        self.assertEqual(wrong.status_code, 400)
+        applied = self.client.post(
+            "/api/recovery/channel-cases/attach",
+            json={"plan_token": plan["plan_token"], "confirmation": plan["confirmation"]},
+        )
+        self.assertEqual(applied.status_code, 201, applied.get_json())
+        self.assertEqual(applied.get_json()["filesystem_changes"], 0)
 
     def test_scoped_organization_routes_bind_scope_and_reject_extra_keys(self) -> None:
         self.login()

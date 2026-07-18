@@ -117,6 +117,9 @@
     let repairPollTimer: ReturnType<typeof setTimeout> | null = null;
     let acknowledgeWeakReference = false;
     let repairConfirmationInput = "";
+    let existingTargetComponent = "";
+    let attachPlan: Record<string, any> | null = null;
+    let attachConfirmation = "";
 
     function asRecord(value: unknown): Record<string, unknown> {
         return value && typeof value === "object" && !Array.isArray(value)
@@ -253,14 +256,18 @@
 
     function inspectionFinished(): boolean {
         if (!investigation) return false;
-        const total = Math.max(investigation.total, itemsTotal);
-        return total > 0 && investigation.completed + investigation.failed >= total;
+        const total = numeric(investigation.counts?.remaining, Math.max(investigation.total, itemsTotal));
+        const finished = numeric(
+            investigation.counts?.remaining_finished,
+            investigation.completed + investigation.failed,
+        );
+        return total > 0 && finished >= total;
     }
 
     function hasItemsNeedingInspection(): boolean {
         const counts = investigation?.counts || {};
-        const total = numeric(counts.total, totalCount);
-        const completed = numeric(counts.completed);
+        const total = numeric(counts.remaining, totalCount);
+        const completed = numeric(counts.remaining_finished, counts.completed);
         return total > completed;
     }
 
@@ -398,6 +405,63 @@
             await moveTo("inspect");
         } catch (value) {
             error = `Investigation could not be created: ${messageFrom(value)}`;
+        } finally {
+            actionBusy = false;
+        }
+    }
+
+    async function buildExistingTargetPlan(component = existingTargetComponent) {
+        actionBusy = true;
+        error = null;
+        notice = null;
+        attachPlan = null;
+        attachConfirmation = "";
+        try {
+            const body: Record<string, string> = {
+                source_channel_id: sourceChannelId,
+            };
+            if (component.trim()) body.target_component = component.trim();
+            const data = await request(`${API_ROOT}/attach-plan`, {
+                method: "POST",
+                body: JSON.stringify(body),
+            });
+            attachPlan = asRecord(data?.plan || data);
+            if (text(attachPlan.status) === "ready") {
+                existingTargetComponent = text(attachPlan.target_component);
+                notice = "Dry run complete. No source or Target entry has been changed.";
+            } else {
+                notice = text(attachPlan.message, "Choose the exact existing Target folder.");
+            }
+        } catch (value) {
+            error = `Existing Target folder could not be reconciled: ${messageFrom(value)}`;
+        } finally {
+            actionBusy = false;
+        }
+    }
+
+    async function applyExistingTargetPlan() {
+        if (!attachPlan?.plan_token || actionBusy) return;
+        actionBusy = true;
+        error = null;
+        try {
+            const data = await request(`${API_ROOT}/attach`, {
+                method: "POST",
+                body: JSON.stringify({
+                    plan_token: attachPlan.plan_token,
+                    confirmation: attachConfirmation,
+                }),
+            });
+            investigation = normalizeRecoveredChannelInvestigation(data);
+            if (!investigation.id) throw new Error("The server did not return an investigation ID");
+            targetChannelName = investigation.channel_name || existingTargetComponent;
+            changed = true;
+            items = [];
+            itemsPage = 0;
+            notice = `${numeric(data?.adopted_links)} existing links attached; ${numeric(data?.source_only)} source-only videos remain for review.`;
+            await loadCase(investigation.id, true);
+            await moveTo("inspect");
+        } catch (value) {
+            error = `Existing Target folder could not be attached: ${messageFrom(value)}`;
         } finally {
             actionBusy = false;
         }
@@ -1521,6 +1585,16 @@
         totalCount,
         (investigation?.completed || 0) + (investigation?.failed || 0),
     );
+    $: inspectionScopeTotal = countFromCase(
+        investigation?.counts,
+        ["remaining"],
+        totalCount,
+    );
+    $: inspectionScopeFinished = countFromCase(
+        investigation?.counts,
+        ["remaining_finished"],
+        completedCount,
+    );
     $: hasMoreItems = items.length < itemsTotal;
     $: organizationRunning =
         activeJobKind === "organize" &&
@@ -1627,6 +1701,76 @@
                     </div>
                 </div>
 
+                <section class="legacy-attach" aria-labelledby="legacy-attach-heading">
+                    <div>
+                        <span class="step-eyebrow">Existing archive edge case</span>
+                        <h4 id="legacy-attach-heading">Pair an existing Target channel folder</h4>
+                        <p>Use this when human-readable video folders and symlinks already exist, but TubeArchivist metadata does not. Detection uses exact symlink targets—not folder or title resemblance.</p>
+                    </div>
+                    <label for="existing-target-component">Exact Target folder name <small>(optional for auto-detect)</small></label>
+                    <div class="legacy-attach-controls">
+                        <input
+                            id="existing-target-component"
+                            bind:value={existingTargetComponent}
+                            placeholder="Western Decline"
+                            autocomplete="off"
+                            spellcheck="false"
+                            disabled={actionBusy}
+                            on:input={() => { attachPlan = null; attachConfirmation = ""; }}
+                        />
+                        <button type="button" on:click={() => buildExistingTargetPlan()} disabled={actionBusy}>
+                            <i class="bi bi-diagram-3" aria-hidden="true"></i>
+                            {actionBusy ? "Scanning…" : existingTargetComponent.trim() ? "Build attach dry run" : "Auto-detect folder"}
+                        </button>
+                    </div>
+
+                    {#if attachPlan && text(attachPlan.status) === "selection_required"}
+                        <div class="attach-candidates">
+                            <strong>Exact-link candidates</strong>
+                            {#if Array.isArray(attachPlan.candidates) && attachPlan.candidates.length}
+                                {#each attachPlan.candidates as candidate}
+                                    <button type="button" on:click={() => { existingTargetComponent = text(candidate.target_component); void buildExistingTargetPlan(existingTargetComponent); }} disabled={actionBusy}>
+                                        <span>{text(candidate.target_component)}</span>
+                                        <small>{numeric(candidate.exact_unique_links) + numeric(candidate.already_tracked_links)} exact links · {numeric(candidate.source_only)} source-only</small>
+                                    </button>
+                                {/each}
+                            {:else}
+                                <p>No Target folder contained an exact symlink target for this raw channel ID. Enter the exact folder name to inspect it directly.</p>
+                            {/if}
+                        </div>
+                    {:else if attachPlan && text(attachPlan.status) === "ready"}
+                        {@const counts = asRecord(attachPlan.counts)}
+                        <div class="attach-summary" role="status">
+                            <dl>
+                                <div><dt>Raw source videos</dt><dd>{numeric(counts.source_total)}</dd></div>
+                                <div><dt>Existing exact links</dt><dd>{numeric(counts.exact_unique_links)}</dd></div>
+                                <div class:attention={numeric(counts.source_only) > 0}><dt>Source-only / unaccounted</dt><dd>{numeric(counts.source_only)}</dd></div>
+                                <div><dt>Already tracked</dt><dd>{numeric(counts.already_tracked)}</dd></div>
+                                <div><dt>Unrelated real files</dt><dd>{numeric(counts.real_media) + numeric(counts.unrelated_files)}</dd></div>
+                                <div class:attention={numeric(counts.ambiguous) + numeric(counts.broken_links) > 0}><dt>Ambiguous or broken</dt><dd>{numeric(counts.ambiguous) + numeric(counts.broken_links)}</dd></div>
+                            </dl>
+                            {#if Array.isArray(attachPlan.source_only) && attachPlan.source_only.length}
+                                <details open>
+                                    <summary>Source-only videos ({attachPlan.source_only.length})</summary>
+                                    <ul>
+                                        {#each attachPlan.source_only as missing}
+                                            <li><code>{text(missing.video_id)}</code><span>{text(missing.filename)}</span></li>
+                                        {/each}
+                                    </ul>
+                                </details>
+                            {/if}
+                            <p><strong>Filesystem changes: none.</strong> Applying records proven ownership of unique exact links; it does not rename, move, delete, replace, or create media.</p>
+                            <label for="attach-confirmation">Type <code>{text(attachPlan.confirmation)}</code> to attach</label>
+                            <div class="legacy-attach-controls">
+                                <input id="attach-confirmation" bind:value={attachConfirmation} autocomplete="off" spellcheck="false" disabled={actionBusy} />
+                                <button class="primary-action" type="button" on:click={applyExistingTargetPlan} disabled={actionBusy || attachConfirmation !== text(attachPlan.confirmation)}>
+                                    Attach existing folder
+                                </button>
+                            </div>
+                        </div>
+                    {/if}
+                </section>
+
                 <footer class="step-actions">
                     <button class="primary-action" type="button" on:click={createCase} disabled={!targetChannelName.trim() || actionBusy}>
                         <i class="bi bi-arrow-right-circle" aria-hidden="true"></i>
@@ -1647,12 +1791,12 @@
                 <div class="inspection-summary">
                     <div class="inspection-progress">
                         <div>
-                            <strong>{completedCount} of {totalCount}</strong>
+                            <strong>{inspectionScopeFinished} of {inspectionScopeTotal}</strong>
                             <span>inspections finished</span>
                         </div>
-                        <span>{totalCount ? Math.round((completedCount / totalCount) * 100) : 0}%</span>
+                        <span>{inspectionScopeTotal ? Math.round((inspectionScopeFinished / inspectionScopeTotal) * 100) : 0}%</span>
                     </div>
-                    <progress max={Math.max(1, totalCount)} value={completedCount}>{completedCount} of {totalCount}</progress>
+                    <progress max={Math.max(1, inspectionScopeTotal)} value={inspectionScopeFinished}>{inspectionScopeFinished} of {inspectionScopeTotal}</progress>
 
                     {#if activeJob && !terminalJobStatuses.has(jobStatus(activeJob))}
                         <div class="active-work" aria-live="polite">
@@ -1670,10 +1814,10 @@
                     {/if}
 
                     <dl class="inspection-counts">
-                        <div><dt>Total</dt><dd>{totalCount}</dd></div>
-                        <div><dt>Finished</dt><dd>{completedCount}</dd></div>
+                        <div><dt>To investigate</dt><dd>{inspectionScopeTotal}</dd></div>
+                        <div><dt>Finished</dt><dd>{inspectionScopeFinished}</dd></div>
                         <div><dt>Needs review</dt><dd>{countFromCase(investigation?.counts, ["review"], 0)}</dd></div>
-                        <div><dt>Remaining</dt><dd>{Math.max(0, totalCount - completedCount)}</dd></div>
+                        <div><dt>Remaining</dt><dd>{Math.max(0, inspectionScopeTotal - inspectionScopeFinished)}</dd></div>
                     </dl>
                 </div>
 
@@ -1684,11 +1828,11 @@
                             Cancel remaining
                         </button>
                     {:else}
-                        <button class="primary-action" type="button" on:click={() => startInspection(!hasItemsNeedingInspection())} disabled={actionBusy || totalCount === 0 || dirtyExpectedDurationItems.length > 0} title={dirtyExpectedDurationItems.length > 0 ? "Save or discard expected-duration edits first" : undefined}>
+                        <button class="primary-action" type="button" on:click={() => startInspection(!hasItemsNeedingInspection())} disabled={actionBusy || inspectionScopeTotal === 0 || dirtyExpectedDurationItems.length > 0} title={dirtyExpectedDurationItems.length > 0 ? "Save or discard expected-duration edits first" : undefined}>
                             <i class="bi bi-activity" aria-hidden="true"></i>
-                            {hasItemsNeedingInspection() ? completedCount > 0 ? "Resume remaining inspection" : "Inspect all videos" : "Run full inspection again"}
+                            {hasItemsNeedingInspection() ? inspectionScopeFinished > 0 ? "Resume remaining inspection" : "Inspect unaccounted videos" : "Run full inspection again"}
                         </button>
-                        {#if completedCount > 0}
+                        {#if inspectionScopeFinished > 0}
                             <button type="button" on:click={() => moveTo("review")}>
                                 Review results
                                 <i class="bi bi-arrow-right" aria-hidden="true"></i>
@@ -2467,6 +2611,31 @@
     .source-identity small,
     .target-preview small { color: var(--muted, var(--text-muted)); font-size: 10px; }
 
+    .legacy-attach { display: grid; width: min(680px, calc(100% - 20px)); margin: 0 auto 10px; gap: 8px; padding: 12px; background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .legacy-attach h4 { margin: 2px 0 3px; font-size: 13px; }
+    .legacy-attach p { margin: 0; color: var(--muted, var(--text-muted)); font-size: 10px; line-height: 1.45; }
+    .legacy-attach label { color: var(--text-secondary, var(--text-soft)); font-size: 11px; font-weight: 700; }
+    .legacy-attach label small { color: var(--muted, var(--text-muted)); font-weight: 400; }
+    .legacy-attach-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+    .legacy-attach-controls input { min-width: 0; padding: 7px 9px; color: var(--text); background: var(--frame, var(--page-deep)); border: 1px solid var(--rule, var(--line)); border-radius: 0; }
+    .attach-candidates,
+    .attach-summary { display: grid; gap: 8px; padding: 9px; background: var(--frame, var(--page-deep)); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .attach-candidates > button { justify-content: space-between; text-align: left; }
+    .attach-candidates > button span,
+    .attach-candidates > button small { min-width: 0; overflow-wrap: anywhere; }
+    .attach-candidates > button small { color: var(--muted, var(--text-muted)); }
+    .attach-summary dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .attach-summary dl div { min-width: 0; padding: 7px; border-right: 1px solid var(--rule-dim, var(--line-soft)); border-bottom: 1px solid var(--rule-dim, var(--line-soft)); }
+    .attach-summary dl div:nth-child(3n) { border-right: 0; }
+    .attach-summary dt { color: var(--muted, var(--text-muted)); font-size: 9px; }
+    .attach-summary dd { margin: 2px 0 0; font-size: 15px; font-weight: 700; }
+    .attach-summary .attention dd { color: var(--warning, #d5bd74); }
+    .attach-summary details { max-height: 180px; overflow: auto; }
+    .attach-summary summary { cursor: pointer; font-size: 11px; font-weight: 700; }
+    .attach-summary ul { display: grid; gap: 3px; padding: 0; margin: 6px 0 0; list-style: none; }
+    .attach-summary li { display: flex; justify-content: space-between; gap: 8px; padding: 4px 6px; background: var(--row, var(--surface-raised)); font-size: 10px; }
+    .attach-summary li span { min-width: 0; overflow-wrap: anywhere; }
+
     .step-actions { display: flex; min-height: 48px; align-items: center; justify-content: flex-end; gap: 7px; margin-top: auto; padding: 8px 10px; background: var(--surface, #434b3c); border-top: 1px solid var(--rule-dim, var(--line-soft)); }
     .split-actions { justify-content: space-between; }
 
@@ -2737,11 +2906,18 @@
         .step-panel > header { align-items: flex-start; flex-direction: column; }
         .step-panel h3 { font-size: 15px; }
         .channel-form,
+        .legacy-attach,
         .inspection-summary,
         .organization-running { width: calc(100% - 12px); margin: 6px auto; padding: 9px; }
         .step-actions,
         .split-actions { align-items: stretch; flex-direction: column-reverse; }
         .step-actions button { width: 100%; }
+        .legacy-attach-controls { grid-template-columns: minmax(0, 1fr); }
+        .legacy-attach-controls button { width: 100%; }
+        .attach-summary dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .attach-summary dl div:nth-child(3n) { border-right: 1px solid var(--rule-dim, var(--line-soft)); }
+        .attach-summary dl div:nth-child(2n) { border-right: 0; }
+        .attach-summary li { align-items: flex-start; flex-direction: column; }
         .inspection-counts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .inspection-counts div:nth-child(2) { border-right: 0; }
         .inspection-counts div:nth-child(-n + 2) { border-bottom: 1px solid var(--rule-dim, var(--line-soft)); }

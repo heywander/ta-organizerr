@@ -57,6 +57,7 @@ _TERMINAL_JOB_STATES = {
 }
 _ACTIVE_JOB_STATES = {"queued", "running", "cancelling"}
 _ORGANIZATION_SCOPES = {"approved", "likely_usable"}
+_ATTACH_PLAN_TTL_SECONDS = 15 * 60
 
 _runtime_lock = threading.RLock()
 _threads: dict[str, threading.Thread] = {}
@@ -188,6 +189,24 @@ def _validated_target_name(value: object) -> tuple[str, str]:
     return name, component
 
 
+def _validated_existing_component(value: object) -> str:
+    """Validate one exact, top-level component already present in Target."""
+    if not isinstance(value, str):
+        raise RecoveredChannelError("target_component must be a string")
+    component = value.strip()
+    if (
+        not component
+        or len(component) > _MAX_NAME_LENGTH + len(" [Recovered]")
+        or sanitize(component) != component
+        or component in {".", ".."}
+        or "/" in component
+        or "\\" in component
+        or unicodedata.normalize("NFC", component) != component
+    ):
+        raise RecoveredChannelError("target_component is not a safe top-level folder name")
+    return component
+
+
 def _confirmed_recovered_component(
     conn: sqlite3.Connection,
     channel_id: str,
@@ -232,7 +251,9 @@ def _channel_root(channel_id: str) -> Path:
     return root
 
 
-def _discover_channel(channel_id: str) -> list[dict[str, Any]]:
+def _discover_channel(
+    channel_id: str, *, exclude_library_owned: bool = True
+) -> list[dict[str, Any]]:
     root = _channel_root(channel_id)
     # Recovery cases own only files that have no existing library owner. This
     # mirrors the Unindexed entry point and prevents an entire mixed raw channel
@@ -274,7 +295,7 @@ def _discover_channel(channel_id: str) -> list[dict[str, Any]]:
                 video_id = extract_id_from_filename(path.name)
                 if not video_id or not is_valid_youtube_id(video_id):
                     continue
-                if video_id in owned_video_ids:
+                if exclude_library_owned and video_id in owned_video_ids:
                     continue
                 found.append({
                     "video_id": video_id,
@@ -409,19 +430,22 @@ def _item_link_state(
     elif not isinstance(target_component, str):
         status_value = "unsafe"
     else:
-        managed_root = next(
-            (
-                root
-                for root in (TARGET_DIR, HIDDEN_DIR)
-                if organized == root / target_component / filename
-            ),
-            None,
-        )
-        if managed_root is None:
+        managed_root: Path | None = None
+        relative_entry: Path | None = None
+        for root in (TARGET_DIR, HIDDEN_DIR):
+            try:
+                relative = organized.relative_to(root / target_component)
+            except ValueError:
+                continue
+            if relative.parts and all(part not in {"", ".", ".."} for part in relative.parts):
+                managed_root = root
+                relative_entry = relative
+                break
+        if managed_root is None or relative_entry is None:
             status_value = "unsafe"
         else:
-            entry_state, parent_status = _read_managed_link_state(
-                managed_root, target_component, filename
+            entry_state, parent_status = _read_managed_nested_link_state(
+                managed_root, target_component, relative_entry
             )
             if parent_status is not None:
                 status_value = parent_status
@@ -429,7 +453,11 @@ def _item_link_state(
                 status_value = "missing"
             elif entry_state["mode"] == stat.S_IFLNK:
                 actual_target = entry_state["target"]
-                if actual_target != link_target:
+                resolved_target = resolve_media_source(organized)
+                if (
+                    actual_target != link_target
+                    and (resolved_target is None or Path(resolved_target) != source)
+                ):
                     status_value = "wrong_symlink"
                 elif source_error is not None:
                     status_value = "source_invalid"
@@ -446,8 +474,17 @@ def _item_link_state(
         if owner_valid or organized is None
         else "The recovered videos row no longer owns this exact organized path"
     )
+    direct_managed_path = bool(
+        organized is not None
+        and isinstance(target_component, str)
+        and any(
+            organized == root / target_component / filename
+            for root in (TARGET_DIR, HIDDEN_DIR)
+        )
+    )
     repairable = bool(
         status_value == "missing"
+        and direct_managed_path
         and owner_valid
         and source_error is None
         and isinstance(row["sha256"], str)
@@ -738,6 +775,577 @@ def _sync_case_inventory(case_id: str) -> list[dict[str, Any]]:
     return discovered
 
 
+def _attach_collision_error(
+    conn: sqlite3.Connection, channel_id: str, component: str
+) -> str | None:
+    folded = unicodedata.normalize("NFC", component).casefold()
+    for case in conn.execute(
+        "SELECT case_id, source_channel_id, target_component FROM recovered_channel_cases"
+    ):
+        if (
+            case["source_channel_id"] == channel_id
+            or unicodedata.normalize("NFC", case["target_component"]).casefold() == folded
+        ):
+            return f"Recovered case {case['case_id']} already owns this channel or target folder"
+    for identity in conn.execute(
+        "SELECT channel_id, storage_component FROM channel_identities "
+        "WHERE storage_component IS NOT NULL AND channel_id <> ?",
+        (channel_id,),
+    ):
+        if unicodedata.normalize("NFC", identity["storage_component"]).casefold() == folded:
+            return f"Channel {identity['channel_id']} already owns this target folder"
+    for foreign in conn.execute(
+        "SELECT DISTINCT channel_id, channel FROM videos "
+        "WHERE channel IS NOT NULL AND channel_id IS NOT NULL AND channel_id <> ?",
+        (channel_id,),
+    ):
+        if unicodedata.normalize("NFC", foreign["channel"]).casefold() == folded:
+            return f"Channel {foreign['channel_id']} already owns media in this target folder"
+    return None
+
+
+def _translate_attach_target(path: Path) -> Path:
+    absolute = Path(os.path.abspath(path))
+    if path_within(absolute, (SOURCE_DIR,), follow_symlinks=False):
+        return absolute
+    for prefix in (HOST_SOURCE_BASE, Path("/mnt/user/tubearchives/bp")):
+        try:
+            return SOURCE_DIR / absolute.relative_to(prefix)
+        except ValueError:
+            continue
+    return absolute
+
+
+def _attach_scan(
+    channel_id: str,
+    component: str,
+    *,
+    discovered: list[dict[str, Any]] | None = None,
+    owners: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Inventory an existing target tree without following directory links."""
+    channel_id = _validated_channel_id(channel_id)
+    component = _validated_existing_component(component)
+    folder = TARGET_DIR / component
+    try:
+        folder_stat = os.lstat(folder)
+    except FileNotFoundError:
+        raise RecoveredChannelError("The selected Target folder does not exist", 404) from None
+    except OSError as exc:
+        raise RecoveredChannelError(f"Could not inspect the selected Target folder: {exc}", 409) from exc
+    if stat.S_ISLNK(folder_stat.st_mode) or not stat.S_ISDIR(folder_stat.st_mode):
+        raise RecoveredChannelError("The selected Target entry must be a real directory", 409)
+    if not path_in_allowed_tree(folder, (TARGET_DIR,)):
+        raise RecoveredChannelError("The selected Target folder escaped TARGET_DIR", 409)
+
+    source_items = list(
+        discovered
+        if discovered is not None
+        else _discover_channel(channel_id, exclude_library_owned=False)
+    )
+    source_by_path = {str(Path(item["source_path"])): item for item in source_items}
+    source_by_id: dict[str, list[dict[str, Any]]] = {}
+    for item in source_items:
+        source_by_id.setdefault(item["video_id"], []).append(item)
+    if owners is None:
+        with get_db() as conn:
+            owners = {
+                row["video_id"]: dict(row)
+                for row in conn.execute(
+                    "SELECT video_id, channel_id, channel, symlink, status FROM videos"
+                )
+                if isinstance(row["video_id"], str)
+            }
+
+    exact_links: dict[str, list[dict[str, Any]]] = {}
+    foreign_links: list[dict[str, Any]] = []
+    broken_links: list[dict[str, Any]] = []
+    unsafe_entries: list[dict[str, Any]] = []
+    real_media: list[dict[str, Any]] = []
+    unrelated_files: list[dict[str, Any]] = []
+    snapshot_entries: list[dict[str, Any]] = []
+    try:
+        for current, dirs, names in os.walk(folder, followlinks=False):
+            current_path = Path(current)
+            safe_dirs: list[str] = []
+            for name in dirs:
+                entry_path = current_path / name
+                relative = str(entry_path.relative_to(folder))
+                entry_stat = os.lstat(entry_path)
+                snapshot_entries.append({
+                    "path": relative,
+                    "mode": stat.S_IFMT(entry_stat.st_mode),
+                    "device": entry_stat.st_dev,
+                    "inode": entry_stat.st_ino,
+                    "mtime_ns": entry_stat.st_mtime_ns,
+                    "target": os.readlink(entry_path) if stat.S_ISLNK(entry_stat.st_mode) else None,
+                })
+                if stat.S_ISDIR(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):
+                    safe_dirs.append(name)
+                else:
+                    unsafe_entries.append({"path": str(entry_path), "reason": "directory entry is not a real directory"})
+            dirs[:] = safe_dirs
+            for name in names:
+                entry_path = current_path / name
+                relative = str(entry_path.relative_to(folder))
+                entry_stat = os.lstat(entry_path)
+                raw_target = os.readlink(entry_path) if stat.S_ISLNK(entry_stat.st_mode) else None
+                snapshot_entries.append({
+                    "path": relative,
+                    "mode": stat.S_IFMT(entry_stat.st_mode),
+                    "device": entry_stat.st_dev,
+                    "inode": entry_stat.st_ino,
+                    "mtime_ns": entry_stat.st_mtime_ns,
+                    "target": raw_target,
+                })
+                if stat.S_ISREG(entry_stat.st_mode):
+                    record = {"path": str(entry_path), "size_bytes": entry_stat.st_size}
+                    (real_media if is_video(entry_path) else unrelated_files).append(record)
+                    continue
+                if not stat.S_ISLNK(entry_stat.st_mode) or raw_target is None:
+                    unsafe_entries.append({"path": str(entry_path), "reason": "entry is neither a regular file nor a symlink"})
+                    continue
+                raw_path = Path(raw_target)
+                if not raw_path.is_absolute():
+                    raw_path = entry_path.parent / raw_path
+                translated = _translate_attach_target(raw_path)
+                target_id = extract_id_from_filename(translated.name) if translated else None
+                record = {
+                    "path": str(entry_path),
+                    "relative_path": relative,
+                    "raw_target": raw_target,
+                    "translated_target": str(translated) if translated else None,
+                    "video_id": target_id,
+                }
+                source_item = source_by_path.get(str(translated)) if translated else None
+                if source_item is None:
+                    if target_id in source_by_id:
+                        record["reason"] = "target path does not identify the selected source file exactly"
+                        broken_links.append(record)
+                    else:
+                        record["reason"] = "target does not belong to the selected raw channel inventory"
+                        foreign_links.append(record)
+                    continue
+                try:
+                    current_source = os.lstat(source_item["source_path"])
+                except OSError:
+                    record["reason"] = "source target is missing"
+                    broken_links.append(record)
+                    continue
+                observed = (
+                    current_source.st_size,
+                    current_source.st_dev,
+                    current_source.st_ino,
+                    current_source.st_mtime_ns,
+                    current_source.st_ctime_ns,
+                )
+                expected = tuple(
+                    source_item[key]
+                    for key in ("size_bytes", "device", "inode", "mtime_ns", "ctime_ns")
+                )
+                if not stat.S_ISREG(current_source.st_mode) or observed != expected:
+                    record["reason"] = "source target changed during inventory"
+                    broken_links.append(record)
+                    continue
+                record["size_bytes"] = current_source.st_size
+                exact_links.setdefault(source_item["video_id"], []).append(record)
+    except OSError as exc:
+        raise RecoveredChannelError(f"Could not scan the existing Target folder: {exc}", 409) from exc
+
+    attachable: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    tracked: list[dict[str, Any]] = []
+    source_only: list[dict[str, Any]] = []
+    for item in source_items:
+        video_id = item["video_id"]
+        links = exact_links.get(video_id, [])
+        owner = owners.get(video_id)
+        if owner is not None:
+            tracked.append({
+                "video_id": video_id,
+                "source_path": item["source_path"],
+                "link_paths": [link["path"] for link in links],
+                "owner_channel_id": owner.get("channel_id"),
+                "owner_path": owner.get("symlink"),
+            })
+        elif len(links) == 1:
+            attachable.append({
+                "video_id": video_id,
+                "source_path": item["source_path"],
+                "link_path": links[0]["path"],
+                "relative_path": links[0]["relative_path"],
+                "raw_target": links[0]["raw_target"],
+            })
+        elif len(links) > 1:
+            ambiguous.append({
+                "video_id": video_id,
+                "source_path": item["source_path"],
+                "link_paths": [link["path"] for link in links],
+            })
+        else:
+            source_only.append({
+                "video_id": video_id,
+                "source_path": item["source_path"],
+                "filename": Path(item["source_path"]).name,
+            })
+
+    snapshot = {
+        "channel_id": channel_id,
+        "target_component": component,
+        "folder": {
+            "device": folder_stat.st_dev,
+            "inode": folder_stat.st_ino,
+            "mtime_ns": folder_stat.st_mtime_ns,
+        },
+        "sources": [
+            {
+                key: item[key]
+                for key in (
+                    "video_id", "source_path", "suffix", "size_bytes", "device",
+                    "inode", "mtime_ns", "ctime_ns",
+                )
+            }
+            for item in source_items
+        ],
+        "entries": sorted(snapshot_entries, key=lambda item: item["path"]),
+    }
+    return {
+        "source_channel_id": channel_id,
+        "target_component": component,
+        "target_folder_path": str(folder),
+        "counts": {
+            "source_total": len(source_items),
+            "exact_unique_links": len(attachable),
+            "source_only": len(source_only),
+            "already_tracked": len(tracked),
+            "tracked_exact_links": sum(
+                1
+                for item in tracked
+                if item["owner_channel_id"] == channel_id and item["link_paths"]
+            ),
+            "ambiguous": len(ambiguous),
+            "broken_links": len(broken_links),
+            "foreign_links": len(foreign_links),
+            "real_media": len(real_media),
+            "unrelated_files": len(unrelated_files),
+            "unsafe_entries": len(unsafe_entries),
+        },
+        "attachable": attachable,
+        "source_only": source_only,
+        "already_tracked": tracked,
+        "ambiguous": ambiguous,
+        "broken_links": broken_links,
+        "foreign_links": foreign_links,
+        "real_media": real_media,
+        "unrelated_files": unrelated_files,
+        "unsafe_entries": unsafe_entries,
+        "snapshot": snapshot,
+    }
+
+
+def build_attach_plan(
+    source_channel_id: str,
+    target_component: object = None,
+    *,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Build a single-use, read-only plan for adopting legacy Target links."""
+    channel_id = _validated_channel_id(source_channel_id)
+    discovered = _discover_channel(channel_id, exclude_library_owned=False)
+    if not discovered:
+        raise RecoveredChannelError("No non-empty exact-ID media files were found in this source channel", 404)
+    selected: str | None = None
+    candidates: list[dict[str, Any]] = []
+    with get_db() as conn:
+        owner_snapshot = {
+            owner["video_id"]: dict(owner)
+            for owner in conn.execute(
+                "SELECT video_id, channel_id, channel, symlink, status FROM videos"
+            )
+            if isinstance(owner["video_id"], str)
+        }
+    if target_component is None or (isinstance(target_component, str) and not target_component.strip()):
+        try:
+            entries = sorted(TARGET_DIR.iterdir(), key=lambda path: path.name.casefold())
+        except OSError as exc:
+            raise RecoveredChannelError(f"Could not list Target folders: {exc}", 409) from exc
+        for entry in entries:
+            try:
+                mode = os.lstat(entry).st_mode
+            except OSError:
+                continue
+            if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+                continue
+            try:
+                scan = _attach_scan(
+                    channel_id, entry.name,
+                    discovered=discovered, owners=owner_snapshot,
+                )
+            except RecoveredChannelError:
+                continue
+            exact_count = scan["counts"]["exact_unique_links"]
+            tracked_count = scan["counts"]["tracked_exact_links"]
+            if exact_count or tracked_count:
+                candidates.append({
+                    "target_component": entry.name,
+                    "exact_unique_links": exact_count,
+                    "already_tracked_links": tracked_count,
+                    "source_only": scan["counts"]["source_only"],
+                    "issues": scan["counts"]["ambiguous"] + scan["counts"]["broken_links"],
+                })
+        if len(candidates) == 1:
+            selected = candidates[0]["target_component"]
+        else:
+            return {
+                "status": "selection_required",
+                "source_channel_id": channel_id,
+                "candidates": candidates,
+                "message": (
+                    "No exact-link Target folder was detected"
+                    if not candidates
+                    else "More than one Target folder contains exact channel links"
+                ),
+            }
+    else:
+        selected = _validated_existing_component(target_component)
+
+    assert selected is not None
+    scan = _attach_scan(
+        channel_id, selected, discovered=discovered, owners=owner_snapshot
+    )
+    with get_db() as conn:
+        collision = _attach_collision_error(conn, channel_id, selected)
+    if collision:
+        raise RecoveredChannelError(collision, 409)
+    if not scan["attachable"] and not scan["counts"]["tracked_exact_links"]:
+        raise RecoveredChannelError(
+            "The selected folder has no exact-ID symlink evidence for this source channel", 409
+        )
+    token = secrets.token_urlsafe(32)
+    payload = {
+        "scan_snapshot": scan["snapshot"],
+        "attachable": scan["attachable"],
+        "tracked_evidence": [
+            item
+            for item in scan["already_tracked"]
+            if item["owner_channel_id"] == channel_id and item["link_paths"]
+        ],
+    }
+    actor_name = actor or "authenticated user"
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM recovered_channel_attach_plans WHERE expires_at < ? OR consumed_at IS NOT NULL",
+            (time.time(),),
+        )
+        conn.execute(
+            "INSERT INTO recovered_channel_attach_plans "
+            "(token_hash, channel_id, target_component, actor, payload_json, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                hashlib.sha256(token.encode()).hexdigest(), channel_id, selected,
+                actor_name, _json(payload), time.time() + _ATTACH_PLAN_TTL_SECONDS,
+            ),
+        )
+        conn.commit()
+    public_scan = {key: value for key, value in scan.items() if key != "snapshot"}
+    return {
+        "status": "ready",
+        "plan_token": token,
+        "confirmation": f"ATTACH {selected}",
+        "expires_in_seconds": _ATTACH_PLAN_TTL_SECONDS,
+        "auto_selected": target_component is None or not str(target_component).strip(),
+        "candidates": candidates,
+        **public_scan,
+    }
+
+
+def _assert_attach_link_current(component: str, match: dict[str, Any]) -> None:
+    relative = Path(match["relative_path"])
+    state, parent_status = _read_managed_nested_link_state(
+        TARGET_DIR, component, relative
+    )
+    if (
+        parent_status is not None
+        or state is None
+        or state["mode"] != stat.S_IFLNK
+        or state["target"] != match["raw_target"]
+    ):
+        raise RecoveredChannelError(
+            f"Existing link {match['relative_path']} changed after the dry run", 409
+        )
+    raw = Path(match["raw_target"])
+    if not raw.is_absolute():
+        raw = TARGET_DIR / component / relative.parent / raw
+    if _translate_attach_target(raw) != Path(match["source_path"]):
+        raise RecoveredChannelError(
+            f"Existing link {match['relative_path']} no longer targets its exact source",
+            409,
+        )
+
+
+def apply_attach_plan(
+    plan_token: object,
+    confirmation: object,
+    *,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(plan_token, str) or not plan_token:
+        raise RecoveredChannelError("A current attach plan token is required")
+    actor_name = actor or "authenticated user"
+    token_hash = hashlib.sha256(plan_token.encode()).hexdigest()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM recovered_channel_attach_plans WHERE token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+    if row is None or row["consumed_at"] is not None or row["expires_at"] < time.time():
+        raise RecoveredChannelError("The attach plan is missing, expired, or already used", 409)
+    if row["actor"] != actor_name:
+        raise RecoveredChannelError("The attach plan belongs to a different administrator", 403)
+    component = row["target_component"]
+    if confirmation != f"ATTACH {component}":
+        raise RecoveredChannelError(f"Type ATTACH {component} exactly to confirm")
+    payload = _decode_json(row["payload_json"], {})
+    if not isinstance(payload, dict):
+        raise RecoveredChannelError("The attach plan payload is invalid", 409)
+    channel_id = row["channel_id"]
+
+    with LIBRARY_MUTATION_LOCK:
+        current_scan = _attach_scan(channel_id, component)
+        if current_scan["snapshot"] != payload.get("scan_snapshot"):
+            raise RecoveredChannelError("Source or Target inventory changed; build a new dry run", 409)
+        if current_scan["attachable"] != payload.get("attachable"):
+            raise RecoveredChannelError("Database ownership changed; build a new dry run", 409)
+        current_tracked_evidence = [
+            item
+            for item in current_scan["already_tracked"]
+            if item["owner_channel_id"] == channel_id and item["link_paths"]
+        ]
+        if current_tracked_evidence != payload.get("tracked_evidence"):
+            raise RecoveredChannelError("Database ownership changed; build a new dry run", 409)
+        discovered = _discover_channel(channel_id)
+        if not discovered:
+            raise RecoveredChannelError("Every source video gained an owner before attach; rescan", 409)
+        try:
+            with media_mutation_guard(
+                paths=(item["source_path"] for item in discovered),
+                action="attach this source inventory to an existing Target folder",
+            ):
+                pass
+        except MediaReservationConflict as exc:
+            raise RecoveredChannelError(str(exc), 409) from exc
+        for item in discovered:
+            try:
+                current_source = os.lstat(item["source_path"])
+            except OSError as exc:
+                raise RecoveredChannelError(
+                    f"Source inventory changed after the dry run: {exc}", 409
+                ) from exc
+            if (
+                not stat.S_ISREG(current_source.st_mode)
+                or (
+                    current_source.st_size,
+                    current_source.st_dev,
+                    current_source.st_ino,
+                    current_source.st_mtime_ns,
+                    current_source.st_ctime_ns,
+                )
+                != tuple(
+                    item[key]
+                    for key in (
+                        "size_bytes", "device", "inode", "mtime_ns", "ctime_ns"
+                    )
+                )
+            ):
+                raise RecoveredChannelError(
+                    "Source inventory changed after the dry run; build a new plan", 409
+                )
+        attach_by_id = {
+            item["video_id"]: item for item in current_scan["attachable"]
+        }
+        case_id = secrets.token_hex(12)
+        with get_db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            plan_row = conn.execute(
+                "SELECT * FROM recovered_channel_attach_plans WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if (
+                plan_row is None
+                or plan_row["consumed_at"] is not None
+                or plan_row["expires_at"] < time.time()
+                or plan_row["actor"] != actor_name
+            ):
+                raise RecoveredChannelError("The attach plan is no longer usable", 409)
+            collision = _attach_collision_error(conn, channel_id, component)
+            if collision:
+                raise RecoveredChannelError(collision, 409)
+            conn.execute(
+                "INSERT INTO recovered_channel_cases "
+                "(case_id, source_channel_id, target_channel_name, target_component, status, created_by) "
+                "VALUES (?, ?, ?, ?, 'review', ?)",
+                (case_id, channel_id, component, component, actor_name),
+            )
+            availability.upsert_channel_identity(
+                conn, channel_id, display_name=component,
+                provenance="recovered", storage_component=component,
+            )
+            _insert_discovered(conn, case_id, discovered)
+            adopted = 0
+            for video_id, match in attach_by_id.items():
+                _assert_attach_link_current(component, match)
+                item = conn.execute(
+                    "SELECT item_id FROM recovered_channel_items WHERE case_id = ? AND video_id = ?",
+                    (case_id, video_id),
+                ).fetchone()
+                if item is None:
+                    continue
+                owner = conn.execute(
+                    "SELECT 1 FROM videos WHERE video_id = ?", (video_id,)
+                ).fetchone()
+                if owner is not None:
+                    raise RecoveredChannelError(f"Video {video_id} gained an owner; build a new dry run", 409)
+                link_path = match["link_path"]
+                conn.execute(
+                    "INSERT INTO videos "
+                    "(video_id, title, channel, channel_id, published, symlink, status, is_live, adopted_real) "
+                    "VALUES (?, ?, ?, ?, NULL, ?, 'recovered', 0, 0)",
+                    (video_id, video_id, component, channel_id, link_path),
+                )
+                conn.execute(
+                    "UPDATE recovered_channel_items SET organized_path = ?, organized_at = ?, "
+                    "error = NULL, updated_at = CURRENT_TIMESTAMP WHERE item_id = ?",
+                    (link_path, _now(), item["item_id"]),
+                )
+                _event(
+                    conn, case_id, "legacy_link_attached", actor=actor_name,
+                    item_id=item["item_id"],
+                    details={"organized_path": link_path, "video_id": video_id},
+                )
+                adopted += 1
+            conn.execute(
+                "UPDATE recovered_channel_attach_plans SET consumed_at = ? WHERE token_hash = ?",
+                (_now(), token_hash),
+            )
+            _event(
+                conn, case_id, "case_attached", actor=actor_name,
+                details={
+                    "source_channel_id": channel_id,
+                    "target_component": component,
+                    "adopted_links": adopted,
+                    "source_only": current_scan["counts"]["source_only"],
+                    "filesystem_changes": 0,
+                },
+            )
+            conn.commit()
+    return {
+        "case": get_case(case_id)["case"],
+        "adopted_links": adopted,
+        "source_only": current_scan["counts"]["source_only"],
+        "filesystem_changes": 0,
+    }
+
+
 def create_case(
     source_channel_id: str,
     target_channel_name: str,
@@ -903,6 +1511,7 @@ def list_cases() -> list[dict[str, Any]]:
                        SUM(CASE WHEN inspection_status IN ('completed', 'inconclusive') THEN 1 ELSE 0 END) AS finished,
                        SUM(CASE WHEN organized_path IS NULL AND decision = 'approved' THEN 1 ELSE 0 END) AS approved,
                        SUM(CASE WHEN organized_path IS NULL THEN 1 ELSE 0 END) AS remaining,
+                       SUM(CASE WHEN organized_path IS NULL AND inspection_status IN ('completed', 'inconclusive') THEN 1 ELSE 0 END) AS remaining_finished,
                        SUM(CASE WHEN organized_path IS NOT NULL THEN 1 ELSE 0 END) AS organized
                 FROM recovered_channel_items WHERE case_id = ?
                 """,
@@ -932,6 +1541,7 @@ def get_case(case_id: str) -> dict[str, Any]:
                    SUM(CASE WHEN organized_path IS NULL AND decision = 'approved' THEN 1 ELSE 0 END) AS approved,
                    SUM(CASE WHEN organized_path IS NULL AND decision = 'hold' THEN 1 ELSE 0 END) AS hold,
                    SUM(CASE WHEN organized_path IS NULL THEN 1 ELSE 0 END) AS remaining,
+                   SUM(CASE WHEN organized_path IS NULL AND inspection_status IN ('completed', 'inconclusive') THEN 1 ELSE 0 END) AS remaining_finished,
                    SUM(CASE WHEN organized_path IS NOT NULL THEN 1 ELSE 0 END) AS organized
             FROM recovered_channel_items WHERE case_id = ?
             """,
@@ -2128,6 +2738,39 @@ def _read_managed_link_state(
         if component_fd is not None:
             os.close(component_fd)
         os.close(root_fd)
+
+
+def _read_managed_nested_link_state(
+    managed_root: Path, component: str, relative_entry: Path
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read one direct or nested link without following any parent symlink."""
+    parts = relative_entry.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None, "unsafe"
+    root_fd: int | None = None
+    current_fd: int | None = None
+    opened: list[int] = []
+    try:
+        root_fd = os.open(managed_root, _DIRECTORY_FLAGS)
+    except OSError:
+        return None, "unsafe"
+    try:
+        current_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=root_fd)
+        opened.append(current_fd)
+        _assert_pinned_managed_root(managed_root, root_fd, current_fd, component)
+        for directory in parts[:-1]:
+            current_fd = os.open(directory, _DIRECTORY_FLAGS, dir_fd=current_fd)
+            opened.append(current_fd)
+        return _link_state_at(current_fd, parts[-1]), None
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, RecoveredChannelError):
+        return None, "unsafe"
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+        if root_fd is not None:
+            os.close(root_fd)
 
 
 def _remove_created_symlink_at(
@@ -3488,10 +4131,16 @@ def update_recovered_paths_after_move(old_root: Path, new_root: Path) -> int:
             try:
                 source = Path(row["source_path"])
                 expected_target = HOST_SOURCE_BASE / source.relative_to(SOURCE_DIR)
+                translated_target = resolve_media_source(new_path)
                 if (
                     not new_path.is_symlink()
-                    or new_path.name != row["video_id"] + source.suffix
-                    or os.readlink(new_path) != str(expected_target)
+                    or (
+                        os.readlink(new_path) != str(expected_target)
+                        and (
+                            translated_target is None
+                            or Path(translated_target) != source
+                        )
+                    )
                 ):
                     log(
                         f"⛔ Refusing recovered path update for non-owned destination: {new_path}"

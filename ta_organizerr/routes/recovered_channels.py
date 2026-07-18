@@ -55,6 +55,38 @@ def api_recovered_channel_create():
     return jsonify({"case": case}), 201
 
 
+@bp.post("/attach-plan")
+@requires_auth
+def api_recovered_channel_attach_plan():
+    data = _body()
+    if not set(data).issubset({"source_channel_id", "target_component"}) or "source_channel_id" not in data:
+        raise recovered_channels.RecoveredChannelError(
+            "Attach planning accepts source_channel_id and optional target_component only"
+        )
+    return jsonify({
+        "plan": recovered_channels.build_attach_plan(
+            data.get("source_channel_id"),
+            data.get("target_component"),
+            actor=_actor(),
+        )
+    })
+
+
+@bp.post("/attach")
+@requires_auth
+def api_recovered_channel_attach():
+    data = _body()
+    if set(data) != {"plan_token", "confirmation"}:
+        raise recovered_channels.RecoveredChannelError(
+            "Attach requires plan_token and exact confirmation only"
+        )
+    return jsonify(
+        recovered_channels.apply_attach_plan(
+            data.get("plan_token"), data.get("confirmation"), actor=_actor()
+        )
+    ), 201
+
+
 @bp.get("/<case_id>")
 @requires_auth
 def api_recovered_channel_case(case_id: str):

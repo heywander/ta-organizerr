@@ -301,6 +301,16 @@ migration.
   Their **Published / link health** view can recreate an absent managed symlink
   only from that item's original checksum-bound source; it never replaces a
   real file, a wrong symlink, an unsafe path, or a mismatched database owner.
+- **Pair an existing Target channel folder** covers archives that already have
+  human-readable video directories and `video.mp4` symlinks but no usable
+  TubeArchivist metadata. Enter the exact top-level Target folder name or let
+  the server suggest folders proven by exact symlink targets. Its dry run
+  separates unique exact links, already-tracked links, source-only videos,
+  duplicate matches, broken or foreign links, real media, and unrelated files.
+  Applying the plan records only unique exact-ID ownership and creates the
+  recovered case for still-unowned source videos; it performs zero filesystem
+  changes. Existing nested link paths remain valid, while source-only videos
+  stay available for inspection and later machine-name symlink publication.
 - Link Reconciliation classifies healthy links, exact-ID repairs, ambiguous
   matches, invalid media, real files where links were expected, and truly
   missing entries. Repair is limited to one case-sensitive exact video-ID match;

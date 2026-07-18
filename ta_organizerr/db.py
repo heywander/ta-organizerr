@@ -248,6 +248,17 @@ CREATE TABLE IF NOT EXISTS recovered_channel_events (
 );
 CREATE INDEX IF NOT EXISTS idx_recovered_events_case
     ON recovered_channel_events(case_id, event_id);
+CREATE TABLE IF NOT EXISTS recovered_channel_attach_plans (
+    token_hash TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    target_component TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_recovered_attach_plans_expiry
+    ON recovered_channel_attach_plans(expires_at, consumed_at);
 CREATE TABLE IF NOT EXISTS recovered_media_repairs (
     repair_id TEXT PRIMARY KEY,
     case_id TEXT NOT NULL,
