@@ -248,6 +248,51 @@ CREATE TABLE IF NOT EXISTS recovered_channel_events (
 );
 CREATE INDEX IF NOT EXISTS idx_recovered_events_case
     ON recovered_channel_events(case_id, event_id);
+CREATE TABLE IF NOT EXISTS recovered_media_repairs (
+    repair_id TEXT PRIMARY KEY,
+    case_id TEXT NOT NULL,
+    damaged_item_id TEXT NOT NULL,
+    reference_item_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'queued',
+    progress REAL NOT NULL DEFAULT 0,
+    source_sha256 TEXT,
+    reference_sha256 TEXT,
+    candidate_sha256 TEXT,
+    source_fingerprint_json TEXT,
+    reference_fingerprint_json TEXT,
+    before_json TEXT,
+    after_json TEXT,
+    assessment TEXT,
+    candidate_path TEXT,
+    backup_path TEXT,
+    backup_sha256 TEXT,
+    decision TEXT NOT NULL DEFAULT 'pending',
+    cancel_requested BOOLEAN NOT NULL DEFAULT 0,
+    log_json TEXT,
+    tool_version TEXT,
+    action_actor TEXT,
+    error TEXT,
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    adopted_at TIMESTAMP,
+    restored_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_recovered_repairs_case
+    ON recovered_media_repairs(case_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_recovered_repairs_damaged
+    ON recovered_media_repairs(damaged_item_id, created_at);
+CREATE TABLE IF NOT EXISTS recovered_media_repair_tokens (
+    token_hash TEXT PRIMARY KEY,
+    repair_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    consumed_at TIMESTAMP
+);
 """
 
 _MIGRATIONS = [
@@ -257,6 +302,8 @@ _MIGRATIONS = [
     "ALTER TABLE videos ADD COLUMN channel_id TEXT",
     "ALTER TABLE availability_jobs ADD COLUMN phase TEXT NOT NULL DEFAULT 'queued'",
     "ALTER TABLE availability_jobs ADD COLUMN message TEXT",
+    "ALTER TABLE recovered_media_repairs ADD COLUMN tool_version TEXT",
+    "ALTER TABLE recovered_media_repairs ADD COLUMN action_actor TEXT",
 ]
 
 

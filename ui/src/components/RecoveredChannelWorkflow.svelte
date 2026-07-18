@@ -43,6 +43,9 @@
         "canceled",
         "partial",
         "interrupted",
+        "adopted",
+        "restored",
+        "recovery_blocked",
     ]);
 
     let step: RecoveredChannelStep = "channel";
@@ -77,6 +80,43 @@
     let backButton: HTMLButtonElement | null = null;
     let likelyPlanTrigger: HTMLButtonElement | null = null;
     let likelyPlanConfirmationHeading: HTMLElement | null = null;
+    type RepairReference = {
+        item_id: string;
+        video_id: string;
+        filename: string;
+        score: number;
+        compatibility: string;
+        reasons: string[];
+        health_tier: string;
+        size_bytes?: number;
+        preview_url?: string;
+        preview_audio_url?: string;
+    };
+    type ReferenceRepair = Record<string, any> & {
+        repair_id: string;
+        status: string;
+        phase: string;
+        assessment?: string;
+        decision?: string;
+        progress?: number;
+        error?: string;
+        candidate_preview_url?: string;
+        candidate_audio_url?: string;
+        backup_preview_url?: string;
+        backup_audio_url?: string;
+    };
+    let repairDamaged: RecoveredChannelItem | null = null;
+    let repairReferences: RepairReference[] = [];
+    let repairHistory: ReferenceRepair[] = [];
+    let selectedReferenceId = "";
+    let activeReferenceRepair: ReferenceRepair | null = null;
+    let repairCompatibilityUncertain = false;
+    let referenceRepairBusy = false;
+    let referenceRepairError: string | null = null;
+    let repairActionPlan: Record<string, any> | null = null;
+    let repairPollTimer: ReturnType<typeof setTimeout> | null = null;
+    let acknowledgeWeakReference = false;
+    let repairConfirmationInput = "";
 
     function asRecord(value: unknown): Record<string, unknown> {
         return value && typeof value === "object" && !Array.isArray(value)
@@ -810,6 +850,269 @@
         });
     }
 
+    function repairPath(suffix = ""): string {
+        if (!investigation) throw new Error("Recovered channel case is not loaded");
+        return casePath(`/reference-repairs${suffix}`);
+    }
+
+    function itemEligibleForReferenceRepair(item: RecoveredChannelItem): boolean {
+        return ["serious", "inconclusive"].includes(item.bucket || item.severity);
+    }
+
+    function selectRepairAttempt(repairId: string) {
+        if (repairPollTimer) clearTimeout(repairPollTimer);
+        repairPollTimer = null;
+        activeReferenceRepair =
+            repairHistory.find((entry) => entry.repair_id === repairId) || null;
+        repairActionPlan = null;
+        repairConfirmationInput = "";
+        if (activeReferenceRepair && !terminalJobStatuses.has(activeReferenceRepair.status)) {
+            scheduleRepairPoll(250);
+        }
+    }
+
+    async function openReferenceRepair(item: RecoveredChannelItem) {
+        if (!investigation) return;
+        repairDamaged = item;
+        step = "review";
+        mobileReviewBucket = "review";
+        repairReferences = [];
+        repairHistory = [];
+        selectedReferenceId = "";
+        activeReferenceRepair = null;
+        repairActionPlan = null;
+        referenceRepairError = null;
+        referenceRepairBusy = true;
+        try {
+            const repairData = await request(
+                repairPath(`?damaged_item_id=${encodeURIComponent(item.id)}`),
+            );
+            repairHistory = Array.isArray(repairData?.repairs) ? repairData.repairs : [];
+            activeReferenceRepair = repairHistory[0] || null;
+            if (itemEligibleForReferenceRepair(item)) {
+                try {
+                    const referenceData = await request(
+                        casePath(`/items/${encodeURIComponent(item.id)}/repair-references`),
+                    );
+                    repairReferences = Array.isArray(referenceData?.references)
+                        ? referenceData.references
+                        : [];
+                    repairCompatibilityUncertain = Boolean(
+                        referenceData?.compatibility_uncertain,
+                    );
+                } catch (value) {
+                    referenceRepairError = `Reference candidates could not be loaded: ${messageFrom(value)}`;
+                }
+            }
+            selectedReferenceId = "";
+            acknowledgeWeakReference = false;
+            if (activeReferenceRepair && !terminalJobStatuses.has(activeReferenceRepair.status)) {
+                scheduleRepairPoll(500);
+            }
+            await tick();
+            document.getElementById("reference-repair-heading")?.scrollIntoView({ block: "nearest" });
+        } catch (value) {
+            referenceRepairError = messageFrom(value);
+        } finally {
+            referenceRepairBusy = false;
+        }
+    }
+
+    function closeReferenceRepair() {
+        if (repairPollTimer) clearTimeout(repairPollTimer);
+        repairPollTimer = null;
+        repairDamaged = null;
+        repairReferences = [];
+        repairHistory = [];
+        activeReferenceRepair = null;
+        repairActionPlan = null;
+        repairConfirmationInput = "";
+        referenceRepairError = null;
+    }
+
+    function scheduleRepairPoll(delay = 1000) {
+        if (repairPollTimer) clearTimeout(repairPollTimer);
+        repairPollTimer = setTimeout(() => void pollReferenceRepair(), delay);
+    }
+
+    async function pollReferenceRepair() {
+        if (!investigation || !activeReferenceRepair || destroyed) return;
+        try {
+            const data = await request(
+                repairPath(`/${encodeURIComponent(activeReferenceRepair.repair_id)}`),
+            );
+            activeReferenceRepair = data?.repair || data;
+            repairHistory = [
+                activeReferenceRepair!,
+                ...repairHistory.filter(
+                    (entry) => entry.repair_id !== activeReferenceRepair?.repair_id,
+                ),
+            ];
+            if (!terminalJobStatuses.has(activeReferenceRepair?.status || "")) {
+                scheduleRepairPoll(1000);
+            }
+        } catch (value) {
+            referenceRepairError = `Repair status could not be refreshed: ${messageFrom(value)}`;
+            scheduleRepairPoll(3000);
+        }
+    }
+
+    async function startReferenceRepair() {
+        if (!repairDamaged || !selectedReferenceId) return;
+        referenceRepairBusy = true;
+        referenceRepairError = null;
+        repairActionPlan = null;
+        try {
+            const data = await request(repairPath(), {
+                method: "POST",
+                body: JSON.stringify({
+                    damaged_item_id: repairDamaged.id,
+                    reference_item_id: selectedReferenceId,
+                }),
+            });
+            activeReferenceRepair = data?.repair || data;
+            repairHistory = [activeReferenceRepair!, ...repairHistory];
+            scheduleRepairPoll(400);
+        } catch (value) {
+            referenceRepairError = messageFrom(value);
+        } finally {
+            referenceRepairBusy = false;
+        }
+    }
+
+    async function cancelReferenceRepair() {
+        if (!activeReferenceRepair) return;
+        referenceRepairBusy = true;
+        try {
+            const data = await request(
+                repairPath(`/${encodeURIComponent(activeReferenceRepair.repair_id)}/cancel`),
+                { method: "POST" },
+            );
+            activeReferenceRepair = data?.repair || data;
+            repairHistory = [
+                activeReferenceRepair!,
+                ...repairHistory.filter(
+                    (entry) => entry.repair_id !== activeReferenceRepair?.repair_id,
+                ),
+            ];
+            scheduleRepairPoll(300);
+        } catch (value) {
+            referenceRepairError = messageFrom(value);
+        } finally {
+            referenceRepairBusy = false;
+        }
+    }
+
+    async function retryReferenceRepair() {
+        if (!activeReferenceRepair) return;
+        referenceRepairBusy = true;
+        try {
+            const data = await request(
+                repairPath(`/${encodeURIComponent(activeReferenceRepair.repair_id)}/retry`),
+                { method: "POST" },
+            );
+            activeReferenceRepair = data?.repair || data;
+            repairHistory = [activeReferenceRepair!, ...repairHistory];
+            repairActionPlan = null;
+            repairConfirmationInput = "";
+            scheduleRepairPoll(300);
+        } catch (value) {
+            referenceRepairError = messageFrom(value);
+        } finally {
+            referenceRepairBusy = false;
+        }
+    }
+
+    async function prepareRepairAction(action: "adopt" | "restore") {
+        if (!activeReferenceRepair) return;
+        referenceRepairBusy = true;
+        referenceRepairError = null;
+        try {
+            const data = await request(
+                repairPath(`/${encodeURIComponent(activeReferenceRepair.repair_id)}/${action}-plan`),
+                { method: "POST" },
+            );
+            repairActionPlan = data?.plan || data;
+            repairConfirmationInput = "";
+        } catch (value) {
+            referenceRepairError = messageFrom(value);
+        } finally {
+            referenceRepairBusy = false;
+        }
+    }
+
+    async function applyRepairAction() {
+        if (!activeReferenceRepair || !repairActionPlan) return;
+        const action = text(repairActionPlan.action) as "adopt" | "restore";
+        referenceRepairBusy = true;
+        referenceRepairError = null;
+        try {
+            const data = await request(
+                repairPath(`/${encodeURIComponent(activeReferenceRepair.repair_id)}/${action}`),
+                {
+                    method: "POST",
+                    body: JSON.stringify({
+                        plan_token: repairActionPlan.plan_token,
+                        confirmation: repairConfirmationInput,
+                    }),
+                },
+            );
+            activeReferenceRepair = data?.repair || data;
+            repairHistory = repairHistory.map((entry) =>
+                entry.repair_id === activeReferenceRepair?.repair_id
+                    ? activeReferenceRepair!
+                    : entry,
+            );
+            repairActionPlan = null;
+            changed = true;
+            await loadCase(investigation!.id, false);
+            itemsPage = 0;
+            items = [];
+            await loadItems(true);
+            repairDamaged = items.find((item) => item.id === repairDamaged?.id) || repairDamaged;
+        } catch (value) {
+            referenceRepairError = messageFrom(value);
+        } finally {
+            referenceRepairBusy = false;
+        }
+    }
+
+    function repairReport(which: "before" | "after"): Record<string, any> {
+        return asRecord(activeReferenceRepair?.[which]);
+    }
+
+    function repairReportStreams(which: "before" | "after"): string {
+        const streams = Array.isArray(repairReport(which).streams)
+            ? repairReport(which).streams
+            : [];
+        return streams.length
+            ? streams
+                  .map((entry: Record<string, unknown>) =>
+                      `${text(entry.type, "media")}: ${text(entry.codec, "unknown")}`,
+                  )
+                  .join(" · ")
+            : "No streams reported";
+    }
+
+    function repairAssessmentLabel(value?: string): string {
+        const labels: Record<string, string> = {
+            better: "Likely better",
+            worse: "Likely worse",
+            uncertain: "Uncertain — human review required",
+        };
+        return labels[value || ""] || value || "Not assessed";
+    }
+
+    function selectedRepairReference(): RepairReference | undefined {
+        return repairReferences.find((entry) => entry.item_id === selectedReferenceId);
+    }
+
+    function selectedReferenceNeedsAcknowledgement(): boolean {
+        return ["weak", "uncertain"].includes(
+            selectedRepairReference()?.compatibility || "",
+        );
+    }
+
     function itemIsPublished(item: RecoveredChannelItem): boolean {
         return (
             Boolean(item.organized_path) ||
@@ -1149,6 +1452,7 @@
     onDestroy(() => {
         destroyed = true;
         if (pollTimer) clearTimeout(pollTimer);
+        if (repairPollTimer) clearTimeout(repairPollTimer);
     });
 
     $: unresolvedItems = items.filter((item) => !itemIsPublished(item));
@@ -1560,6 +1864,9 @@
                                     <div class="media-actions">
                                         <button type="button" on:click={() => openPreview(item, "video")} disabled={!item.path}><i class="bi bi-play-circle" aria-hidden="true"></i> Preview</button>
                                         <button type="button" on:click={() => openPreview(item, "audio")} disabled={!item.path}><i class="bi bi-headphones" aria-hidden="true"></i> Listen</button>
+                                        {#if numeric(item.reference_repair_count) > 0}
+                                            <button type="button" on:click={() => openReferenceRepair(item)} disabled={referenceRepairBusy}><i class="bi bi-clock-history" aria-hidden="true"></i> Repair history</button>
+                                        {/if}
                                     </div>
                                     <div class="decision-actions" aria-label={`Decision for ${item.filename || item.video_id}`}>
                                         <button
@@ -1593,6 +1900,159 @@
                             </div>
                             <span>{reviewCount}</span>
                         </header>
+                        {#if repairDamaged}
+                            <section class="reference-repair-panel" aria-labelledby="reference-repair-heading">
+                                <header>
+                                    <div>
+                                        <span class="step-eyebrow">UNTRUNC reference repair</span>
+                                        <h5 id="reference-repair-heading">{repairDamaged.filename || repairDamaged.video_id}</h5>
+                                        <p>A healthy video supplies container and track structure only. It does not donate or reconstruct missing pictures or audio.</p>
+                                    </div>
+                                    <button type="button" aria-label="Close reference repair" on:click={closeReferenceRepair}><i class="bi bi-x-lg" aria-hidden="true"></i></button>
+                                </header>
+
+                                {#if referenceRepairError}
+                                    <p class="reference-repair-error" role="alert"><i class="bi bi-exclamation-triangle" aria-hidden="true"></i>{referenceRepairError}</p>
+                                {/if}
+
+                                {#if repairHistory.length > 0}
+                                    <div class="repair-history-selector">
+                                        <label for="reference-repair-history">Repair attempt</label>
+                                        <select id="reference-repair-history" value={activeReferenceRepair?.repair_id || ""} on:change={(event) => selectRepairAttempt(event.currentTarget.value)}>
+                                            {#each repairHistory as attempt}
+                                                <option value={attempt.repair_id}>{attempt.reference_video_id || attempt.reference_item_id} · {attempt.status} · {repairAssessmentLabel(attempt.assessment)}</option>
+                                            {/each}
+                                        </select>
+                                        {#if activeReferenceRepair}
+                                            <span>Created {activeReferenceRepair.created_at || "unknown"} · Tool {activeReferenceRepair.tool_version || "not recorded"}</span>
+                                        {/if}
+                                    </div>
+                                {/if}
+
+                                {#if itemEligibleForReferenceRepair(repairDamaged) && (!activeReferenceRepair || terminalJobStatuses.has(activeReferenceRepair.status))}
+                                    <div class="reference-selector">
+                                        <label for="reference-repair-candidate">Healthy reference</label>
+                                        {#if repairCompatibilityUncertain}
+                                            <p class="compatibility-warning"><i class="bi bi-question-diamond" aria-hidden="true"></i>The damaged container exposes no streams, so compatibility is reference-led and uncertain.</p>
+                                        {/if}
+                                        <select id="reference-repair-candidate" bind:value={selectedReferenceId} on:change={() => (acknowledgeWeakReference = false)} disabled={referenceRepairBusy || repairReferences.length === 0}>
+                                            <option value="">Choose a healthy reference…</option>
+                                            {#each repairReferences as reference}
+                                                <option value={reference.item_id}>{reference.filename} · {reference.compatibility} · score {reference.score}</option>
+                                            {/each}
+                                        </select>
+                                        {#if selectedReferenceId}
+                                            {@const selectedReference = repairReferences.find((entry) => entry.item_id === selectedReferenceId)}
+                                            {#if selectedReference}
+                                                <div class="reference-rationale">
+                                                    <strong>{selectedReference.video_id}</strong>
+                                                    <span>{selectedReference.reasons.join(" · ")}</span>
+                                                </div>
+                                                <div class="reference-preview">
+                                                    <video src={selectedReference.preview_url} controls playsinline preload="metadata"></video>
+                                                    <audio src={selectedReference.preview_audio_url} controls preload="metadata"></audio>
+                                                </div>
+                                                {#if selectedReferenceNeedsAcknowledgement()}
+                                                    <label class="compatibility-acknowledgement">
+                                                        <input type="checkbox" bind:checked={acknowledgeWeakReference} />
+                                                        I understand this reference is not a strong technical match and UNTRUNC may produce a worse result.
+                                                    </label>
+                                                {/if}
+                                            {/if}
+                                        {:else if !referenceRepairBusy}
+                                            <p>No completed clear/minimal MP4-family reference exists in this recovered channel.</p>
+                                        {/if}
+                                        <div class="reference-repair-actions">
+                                            {#if activeReferenceRepair && ["failed", "cancelled", "interrupted"].includes(activeReferenceRepair.status)}
+                                                <button type="button" on:click={retryReferenceRepair} disabled={referenceRepairBusy}><i class="bi bi-arrow-clockwise" aria-hidden="true"></i> Retry same pair</button>
+                                            {/if}
+                                            <button class="primary-action" type="button" on:click={startReferenceRepair} disabled={referenceRepairBusy || !selectedReferenceId || (selectedReferenceNeedsAcknowledgement() && !acknowledgeWeakReference)}>
+                                                <i class="bi bi-tools" aria-hidden="true"></i>{referenceRepairBusy ? "Starting…" : "Run UNTRUNC privately"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                {/if}
+
+                                {#if activeReferenceRepair}
+                                    <div class="repair-job-state" data-status={activeReferenceRepair.status}>
+                                        <div><strong>{activeReferenceRepair.status}</strong><span>{activeReferenceRepair.phase || "queued"}</span></div>
+                                        <progress max="100" value={numeric(activeReferenceRepair.progress)}></progress>
+                                        <span>{Math.round(numeric(activeReferenceRepair.progress))}%</span>
+                                    </div>
+                                    {#if !terminalJobStatuses.has(activeReferenceRepair.status)}
+                                        <button type="button" on:click={cancelReferenceRepair} disabled={referenceRepairBusy}>Cancel repair</button>
+                                    {/if}
+                                    {#if activeReferenceRepair.error}
+                                        <p class="reference-repair-error" role="alert">{activeReferenceRepair.error}</p>
+                                    {/if}
+                                {/if}
+
+                                {#if activeReferenceRepair?.status === "completed" || activeReferenceRepair?.decision === "adopted" || activeReferenceRepair?.decision === "restored"}
+                                    <div class="repair-assessment" data-assessment={activeReferenceRepair.assessment}>
+                                        <span>Nonbinding assessment</span>
+                                        <strong>{repairAssessmentLabel(activeReferenceRepair.assessment)}</strong>
+                                        <p>A clean technical report cannot prove visual or audible authenticity. Watch, listen, and seek through both copies.</p>
+                                    </div>
+                                    <div class="repair-comparison">
+                                        <article>
+                                            <h6>{activeReferenceRepair.decision === "adopted" ? "Verified original backup" : activeReferenceRepair.decision === "restored" ? "Restored original source" : "Original source"}</h6>
+                                            <video src={activeReferenceRepair.decision === "adopted" ? activeReferenceRepair.backup_preview_url : `/api/recovery/preview?filepath=${encodeURIComponent(repairDamaged.path)}`} controls playsinline preload="metadata"></video>
+                                            <audio src={activeReferenceRepair.decision === "adopted" ? activeReferenceRepair.backup_audio_url : `/api/recovery/preview-audio?filepath=${encodeURIComponent(repairDamaged.path)}`} controls preload="metadata"></audio>
+                                            <dl>
+                                                <div><dt>Streams</dt><dd>{repairReportStreams("before")}</dd></div>
+                                                <div><dt>Duration</dt><dd>{formatDuration(repairReport("before").duration_seconds)}</dd></div>
+                                                <div><dt>Decoded to</dt><dd>{formatDuration(repairReport("before").decoded_endpoint_seconds)}</dd></div>
+                                                <div><dt>Seekable</dt><dd>{repairReport("before").seekable === true ? "Yes" : repairReport("before").seekable === false ? "No" : "Unknown"}</dd></div>
+                                                <div><dt>Decode</dt><dd>{repairReport("before").decode_clean === true ? "Clean" : repairReport("before").probeable === false ? "Not probeable" : "Warnings/errors"}</dd></div>
+                                                <div><dt>Size</dt><dd>{formatBytes(repairReport("before").size_bytes)}</dd></div>
+                                                <div><dt>Errors</dt><dd>{Array.isArray(repairReport("before").errors) && repairReport("before").errors.length ? repairReport("before").errors.join(" · ") : "None reported"}</dd></div>
+                                                <div><dt>SHA-256</dt><dd><code>{text(activeReferenceRepair.source_sha256).slice(0, 16)}…</code></dd></div>
+                                            </dl>
+                                        </article>
+                                        <article>
+                                            <h6>UNTRUNC candidate</h6>
+                                            <video src={activeReferenceRepair.candidate_preview_url} controls playsinline preload="metadata"></video>
+                                            <audio src={activeReferenceRepair.candidate_audio_url} controls preload="metadata"></audio>
+                                            <dl>
+                                                <div><dt>Streams</dt><dd>{repairReportStreams("after")}</dd></div>
+                                                <div><dt>Duration</dt><dd>{formatDuration(repairReport("after").duration_seconds)}</dd></div>
+                                                <div><dt>Decoded to</dt><dd>{formatDuration(repairReport("after").decoded_endpoint_seconds)}</dd></div>
+                                                <div><dt>Seekable</dt><dd>{repairReport("after").seekable === true ? "Yes" : repairReport("after").seekable === false ? "No" : "Unknown"}</dd></div>
+                                                <div><dt>Decode</dt><dd>{repairReport("after").decode_clean ? "Clean" : "Warnings/errors"}</dd></div>
+                                                <div><dt>Size</dt><dd>{formatBytes(repairReport("after").size_bytes)}</dd></div>
+                                                <div><dt>Errors</dt><dd>{Array.isArray(repairReport("after").errors) && repairReport("after").errors.length ? repairReport("after").errors.join(" · ") : "None reported"}</dd></div>
+                                                <div><dt>SHA-256</dt><dd><code>{text(activeReferenceRepair.candidate_sha256).slice(0, 16)}…</code></dd></div>
+                                            </dl>
+                                        </article>
+                                    </div>
+                                    {#if activeReferenceRepair.decision === "adopted"}
+                                        <button type="button" on:click={() => prepareRepairAction("restore")} disabled={referenceRepairBusy}><i class="bi bi-arrow-counterclockwise" aria-hidden="true"></i> Prepare Restore Original</button>
+                                    {:else if activeReferenceRepair.decision !== "restored"}
+                                        <button class="primary-action" type="button" on:click={() => prepareRepairAction("adopt")} disabled={referenceRepairBusy}><i class="bi bi-shield-check" aria-hidden="true"></i> Prepare source replacement</button>
+                                    {/if}
+                                {/if}
+
+                                {#if repairActionPlan}
+                                    <section class="repair-action-plan" aria-label="Source replacement dry run">
+                                        <h6>{repairActionPlan.action === "restore" ? "Restore dry run" : "Replacement dry run"}</h6>
+                                        <dl>
+                                            <div><dt>Source</dt><dd><code>{repairActionPlan.source_path}</code></dd></div>
+                                            <div><dt>Permanent backup</dt><dd><code>{repairActionPlan.backup_path}</code></dd></div>
+                                            <div><dt>Target changes</dt><dd>{repairActionPlan.target_mutations} — existing symlinks remain untouched</dd></div>
+                                        </dl>
+                                        <p>This token is checksum-bound, single-use, and expires in ten minutes. The server revalidates everything immediately before replacement.</p>
+                                        <label class="repair-confirmation">
+                                            Type <code>{repairActionPlan.confirmation}</code> to continue
+                                            <input type="text" autocomplete="off" bind:value={repairConfirmationInput} />
+                                        </label>
+                                        <div class="reference-repair-actions">
+                                            <button type="button" on:click={() => (repairActionPlan = null)} disabled={referenceRepairBusy}>Cancel</button>
+                                            <button class="danger-action" type="button" on:click={applyRepairAction} disabled={referenceRepairBusy || repairConfirmationInput !== repairActionPlan.confirmation}>{referenceRepairBusy ? "Applying…" : repairActionPlan.action === "restore" ? "Restore verified original" : "Replace source with candidate"}</button>
+                                        </div>
+                                    </section>
+                                {/if}
+                            </section>
+                        {/if}
                         <div class="media-list">
                             {#each reviewItems as item (item.id)}
                                 <article class:approved={item.decision === "approved"} class:held={item.decision === "held"} aria-labelledby={`recovered-item-${item.id}`}>
@@ -1654,6 +2114,9 @@
                                     <div class="media-actions">
                                         <button type="button" on:click={() => openPreview(item, "video")} disabled={!item.path}><i class="bi bi-play-circle" aria-hidden="true"></i> Preview</button>
                                         <button type="button" on:click={() => openPreview(item, "audio")} disabled={!item.path}><i class="bi bi-headphones" aria-hidden="true"></i> Listen</button>
+                                        {#if itemEligibleForReferenceRepair(item) || numeric(item.reference_repair_count) > 0}
+                                            <button type="button" on:click={() => openReferenceRepair(item)} disabled={referenceRepairBusy}><i class="bi bi-tools" aria-hidden="true"></i> {itemEligibleForReferenceRepair(item) ? "Reference repair" : "Repair history"}</button>
+                                        {/if}
                                     </div>
                                     <div class="decision-actions" aria-label={`Decision for ${item.filename || item.video_id}`}>
                                         <button
@@ -1858,6 +2321,9 @@
                                 {/if}
                                 <div class="published-link-actions">
                                     <button type="button" on:click={() => openPreview(item, "video")} disabled={!item.path}><i class="bi bi-play-circle" aria-hidden="true"></i> Preview source</button>
+                                    {#if numeric(item.reference_repair_count) > 0}
+                                        <button type="button" on:click={() => openReferenceRepair(item)} disabled={referenceRepairBusy}><i class="bi bi-clock-history" aria-hidden="true"></i> Repair history / restore</button>
+                                    {/if}
                                     {#if canRepairPublishedLink(item)}
                                         <button class="primary-action" type="button" on:click={() => repairPublishedLink(item)} disabled={repairingItemIds.has(item.id)}>
                                             <i class="bi bi-link-45deg" aria-hidden="true"></i>
@@ -2076,6 +2542,57 @@
     .media-heading code { color: var(--muted, var(--text-muted)); font-size: 10px; }
     .condition-badge { display: inline-flex; min-height: 19px; align-items: center; padding: 2px 5px; border: 1px solid; font-size: 8px; font-weight: 700; text-transform: uppercase; }
     .condition-badge--likely { color: var(--text); border-color: var(--success); }
+    .reference-repair-panel { display: grid; gap: 10px; margin: 8px; padding: 12px; min-width: 0; background: var(--frame, var(--page-deep)); border: 1px solid var(--accent); }
+    .reference-repair-panel > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 0 0 9px; border-bottom: 1px solid var(--rule-dim, var(--line-soft)); }
+    .reference-repair-panel > header > div { min-width: 0; }
+    .reference-repair-panel > header h5 { margin: 3px 0; font-size: 13px; }
+    .reference-repair-panel > header h5,
+    .reference-repair-panel > header p { overflow-wrap: anywhere; }
+    .reference-repair-panel > header p { max-width: 680px; margin: 0; color: var(--muted, var(--text-muted)); font-size: 10px; line-height: 1.45; }
+    .reference-selector { display: grid; gap: 7px; }
+    .reference-selector label { font-size: 10px; font-weight: 700; }
+    .reference-selector select { width: 100%; min-width: 0; }
+    .repair-history-selector { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 5px 9px; padding: 8px; background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .repair-history-selector label { font-size: 10px; font-weight: 700; }
+    .repair-history-selector select { width: 100%; min-width: 0; }
+    .repair-history-selector span { grid-column: 2; min-width: 0; color: var(--muted, var(--text-muted)); font-size: 9px; overflow-wrap: anywhere; }
+    .compatibility-warning, .reference-repair-error { display: flex; gap: 7px; margin: 0; padding: 8px; font-size: 10px; border: 1px solid var(--warning, #b89a56); }
+    .reference-repair-error { color: var(--danger-text, #f0c2b7); border-color: var(--danger, #a75f52); }
+    .reference-rationale { display: grid; gap: 3px; padding: 8px; background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .reference-rationale strong { font-size: 10px; }
+    .reference-rationale span { color: var(--muted, var(--text-muted)); font-size: 9px; }
+    .reference-preview { display: grid; grid-template-columns: minmax(0, 2fr) minmax(180px, 1fr); align-items: center; gap: 8px; min-width: 0; }
+    .reference-preview video { width: 100%; max-height: 220px; background: #111; }
+    .reference-preview audio { width: 100%; }
+    .compatibility-acknowledgement { display: flex; align-items: flex-start; gap: 8px; padding: 8px; font-size: 10px; border: 1px solid var(--warning, #b89a56); }
+    .compatibility-acknowledgement input { flex: 0 0 auto; }
+    .reference-repair-actions { display: flex; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+    .repair-job-state { display: grid; grid-template-columns: minmax(110px, auto) minmax(100px, 1fr) auto; align-items: center; gap: 8px; padding: 8px; background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .repair-job-state > div { display: grid; }
+    .repair-job-state strong { text-transform: capitalize; }
+    .repair-job-state span { color: var(--muted, var(--text-muted)); font-size: 9px; }
+    .repair-job-state progress { width: 100%; }
+    .repair-assessment { display: grid; gap: 3px; padding: 10px; border: 1px solid var(--accent); }
+    .repair-assessment > span { color: var(--muted, var(--text-muted)); font-size: 9px; text-transform: uppercase; }
+    .repair-assessment > strong { font-size: 13px; }
+    .repair-assessment p { margin: 2px 0 0; color: var(--muted, var(--text-muted)); font-size: 10px; }
+    .repair-assessment[data-assessment="better"] { border-color: var(--success); }
+    .repair-assessment[data-assessment="worse"] { border-color: var(--danger, #a75f52); }
+    .repair-comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; min-width: 0; }
+    .repair-comparison article { display: grid; align-content: start; gap: 7px; min-width: 0; padding: 9px; background: var(--surface, #434b3c); border: 1px solid var(--rule-dim, var(--line-soft)); }
+    .repair-comparison h6 { margin: 0; font-size: 11px; }
+    .repair-comparison video { display: block; width: 100%; max-height: 260px; background: #111; }
+    .repair-comparison audio { width: 100%; height: 34px; }
+    .repair-comparison dl, .repair-action-plan dl { display: grid; gap: 5px; margin: 0; }
+    .repair-comparison dl > div, .repair-action-plan dl > div { display: grid; grid-template-columns: 78px minmax(0, 1fr); gap: 7px; }
+    .repair-comparison dt, .repair-action-plan dt { color: var(--muted, var(--text-muted)); font-size: 9px; }
+    .repair-comparison dd, .repair-action-plan dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 9px; }
+    .repair-action-plan { display: grid; gap: 9px; padding: 10px; border: 1px solid var(--danger, #a75f52); }
+    .repair-action-plan h6, .repair-action-plan p { margin: 0; }
+    .repair-action-plan p { color: var(--muted, var(--text-muted)); font-size: 10px; }
+    .repair-confirmation { display: grid; gap: 5px; font-size: 10px; }
+    .repair-confirmation input { width: 100%; min-width: 0; }
+    .danger-action { color: var(--danger-text, #f0c2b7); border-color: var(--danger, #a75f52); }
     .condition-badge--review { color: var(--danger-text, #f0d7cf); background: var(--danger-surface, #4a2e28); border-color: var(--danger-rule, #8b5a4e); }
     .media-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border: 1px solid var(--rule-dim, var(--line-soft)); }
     .media-facts div { min-width: 0; padding: 5px; border-right: 1px solid var(--rule-dim, var(--line-soft)); }
@@ -2244,6 +2761,15 @@
         .likely-plan-confirmation ul { font-size: 10px; line-height: 1.45; }
         .likely-plan-confirmation-actions { align-items: stretch; flex-direction: column-reverse; }
         .likely-plan-confirmation-actions button { width: 100%; }
+        .reference-repair-panel { margin: 7px 0; padding: 10px; }
+        .repair-history-selector { grid-template-columns: minmax(0, 1fr); }
+        .repair-history-selector span { grid-column: 1; }
+        .repair-comparison { grid-template-columns: minmax(0, 1fr); }
+        .reference-preview { grid-template-columns: minmax(0, 1fr); }
+        .reference-repair-actions { align-items: stretch; flex-direction: column-reverse; }
+        .reference-repair-actions button { width: 100%; }
+        .repair-job-state { grid-template-columns: minmax(0, 1fr) auto; }
+        .repair-job-state progress { grid-column: 1 / -1; }
         .media-list { max-height: none; overflow: visible; }
         .media-list article { padding: 9px; }
         .media-list summary { display: flex; min-height: 44px; align-items: center; }

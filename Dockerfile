@@ -9,8 +9,29 @@ COPY ui .
 RUN bun run build
 
 
-# --- Stage 2: Backend (Python) ---
-FROM python:3.11.10-slim AS backend
+# --- Stage 2: UNTRUNC Build ---
+# Pin the maintained fork so media recovery behavior and its FFmpeg ABI cannot
+# silently change between application builds.
+FROM python:3.11.10-slim-bookworm AS untrunc-builder
+ARG UNTRUNC_COMMIT=a87f33aa36fb0e174eebad92434d2f9fc3a749da
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates git make g++ pkg-config \
+      libavformat-dev libavcodec-dev libavutil-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN git clone https://github.com/anthwlock/untrunc.git \
+ && cd untrunc \
+ && git checkout --detach "${UNTRUNC_COMMIT}" \
+ && test "$(git rev-parse HEAD)" = "${UNTRUNC_COMMIT}" \
+ && make -j2 \
+ && ./untrunc -V \
+ && git archive --format=tar.gz --prefix=untrunc-source/ \
+      -o /build/untrunc-source.tar.gz HEAD
+
+
+# --- Stage 3: Backend (Python) ---
+FROM python:3.11.10-slim-bookworm AS backend
 WORKDIR /app
 
 # 1. System deps. ffmpeg for transcoding; gosu for dropping privileges in the
@@ -18,6 +39,15 @@ WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg gosu \
  && rm -rf /var/lib/apt/lists/*
+
+# UNTRUNC is GPL-2.0. Keep its license and pinned-source provenance alongside
+# the distributed binary.
+COPY --from=untrunc-builder /build/untrunc/untrunc /usr/local/bin/untrunc
+COPY --from=untrunc-builder /build/untrunc/COPYING /usr/share/doc/untrunc/COPYING
+COPY --from=untrunc-builder /build/untrunc-source.tar.gz /usr/share/doc/untrunc/untrunc-source.tar.gz
+RUN untrunc -V \
+ && ldd /usr/local/bin/untrunc \
+ && ! ldd /usr/local/bin/untrunc | grep -q "not found"
 
 # 2. Python deps (yt-dlp pinned via pip, avoiding the latest-binary curl).
 COPY requirements.txt .

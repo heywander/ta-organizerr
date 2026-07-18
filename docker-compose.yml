@@ -22,6 +22,10 @@ services:
       - HOST=${HOST:-0.0.0.0}
       - PORT=${PORT:-5000}
       - SCAN_INTERVAL=${SCAN_INTERVAL:-60}
+      - UNTRUNC_BINARY=${UNTRUNC_BINARY:-untrunc}
+      - UNTRUNC_JOB_TIMEOUT_SECONDS=${UNTRUNC_JOB_TIMEOUT_SECONDS:-86400}
+      - UNTRUNC_INSPECTION_TIMEOUT_SECONDS=${UNTRUNC_INSPECTION_TIMEOUT_SECONDS:-86400}
+      - UNTRUNC_MAX_OUTPUT_BYTES=${UNTRUNC_MAX_OUTPUT_BYTES:-107374182400}
       - ALLOWED_IPS=${ALLOWED_IPS:-127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12}
       # This must be the absolute host path mounted at /app/source. The app
       # rejects missing and relative values before it can create symlinks.

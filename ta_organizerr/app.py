@@ -91,6 +91,12 @@ def create_app(initialize_db: bool = True) -> Flask:
 
         reclassify_legacy_channel_observations()
 
+        # Long-running UNTRUNC and source replacement work is journaled in
+        # SQLite. Reconcile any crash-left action before serving mutations.
+        from .reference_repair import recover_interrupted_repairs
+
+        recover_interrupted_repairs()
+
     app.secret_key = get_or_create_secret_key(FLASK_SECRET_KEY_ENV)
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,

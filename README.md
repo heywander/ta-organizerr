@@ -93,6 +93,10 @@ SALVAGE_DIR=/app/data/media-salvage
 MAX_CONCURRENT_SALVAGE_JOBS=1
 SALVAGE_JOB_TIMEOUT_SECONDS=86400
 SALVAGE_MAX_OUTPUT_BYTES=107374182400
+UNTRUNC_BINARY=/usr/local/bin/untrunc
+UNTRUNC_JOB_TIMEOUT_SECONDS=86400
+UNTRUNC_INSPECTION_TIMEOUT_SECONDS=86400
+UNTRUNC_MAX_OUTPUT_BYTES=107374182400
 RECONCILIATION_PROBE_WORKERS=2
 RECONCILIATION_PROBE_CACHE_MAX=4096
 
@@ -329,6 +333,31 @@ migration.
   IDs are rejected. While a salvage or transcode job is active, its source,
   requested link, and generated output inode are reserved so in-app delete,
   import, link-repair, and library-move actions cannot invalidate the job.
+- Recovered Channel Review also offers guarded **UNTRUNC reference repair** for
+  completed Needs-Review MP4/MOV/M4V/3GP items. References are limited to
+  completed clear/minimal files in the same recovered-channel case and ranked
+  by container and stream structure; the administrator still chooses one. A
+  reference supplies MP4-family container and track structure only—it cannot
+  recreate media bytes that are genuinely gone. Jobs run one at a time, survive
+  page navigation, and persist reports, bounded logs, hashes, and candidates at
+  `/app/data/media-salvage/reference-repairs/<repair-id>/`. Interrupted work is
+  marked safely after restart and can be retried.
+- An UNTRUNC candidate never replaces archive media automatically. The review
+  panel keeps attempt history and provides paired video/audio playback plus
+  stream, duration, decode, size, seekability, error, and SHA-256 evidence.
+  Adoption requires a checksum-bound dry run, an expiring single-use token, and
+  exact typed confirmation. The server first creates and verifies a permanent
+  original backup, stages the candidate beside the source, revalidates pinned
+  descriptors and hashes, then atomically replaces only the `/app/source` entry
+  at its existing pathname. `/app/target` files and symlinks are not changed.
+  **Restore Original** uses the same guarded process and verified backup.
+- UNTRUNC, FFmpeg, and FFprobe are native parsers processing potentially corrupt
+  administrator-selected media with the app's container identity. Child
+  processes receive required media descriptors and a minimal environment, with
+  timeout, disk, output, and log limits, but this is not a separate network or
+  privilege sandbox. Keep the workflow on a trusted host. The image includes
+  the pinned UNTRUNC revision's license and source archive under
+  `/usr/share/doc/untrunc/`.
 - Transcoding replaces the resolved source media file in place after FFmpeg
   completes successfully. It is limited to MP4, Matroska (`.mkv`), and MOV
   containers. It maps every input stream, copies metadata/chapters and

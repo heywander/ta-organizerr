@@ -4,7 +4,7 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request, session
 
 from ..auth import requires_auth
-from .. import recovered_channels
+from .. import recovered_channels, reference_repair
 
 
 bp = Blueprint(
@@ -29,6 +29,11 @@ def _body() -> dict:
 
 @bp.errorhandler(recovered_channels.RecoveredChannelError)
 def _workflow_error(exc: recovered_channels.RecoveredChannelError):
+    return jsonify({"error": str(exc)}), exc.status
+
+
+@bp.errorhandler(reference_repair.ReferenceRepairError)
+def _repair_error(exc: reference_repair.ReferenceRepairError):
     return jsonify({"error": str(exc)}), exc.status
 
 
@@ -155,6 +160,102 @@ def api_recovered_channel_cancel(case_id: str, job_id: str):
             case_id, job_id, actor=_actor()
         )
     }), 202
+
+
+@bp.get("/<case_id>/items/<item_id>/repair-references")
+@requires_auth
+def api_recovered_channel_repair_references(case_id: str, item_id: str):
+    return jsonify(reference_repair.ranked_references(case_id, item_id))
+
+
+@bp.get("/<case_id>/reference-repairs")
+@requires_auth
+def api_recovered_channel_reference_repairs(case_id: str):
+    return jsonify({
+        "repairs": reference_repair.list_repairs(
+            case_id, request.args.get("damaged_item_id") or None
+        )
+    })
+
+
+@bp.post("/<case_id>/reference-repairs")
+@requires_auth
+def api_recovered_channel_reference_repair_start(case_id: str):
+    data = _body()
+    if set(data) != {"damaged_item_id", "reference_item_id"}:
+        raise reference_repair.ReferenceRepairError(
+            "Start repair requires damaged_item_id and reference_item_id only"
+        )
+    repair = reference_repair.start_repair(
+        case_id,
+        data.get("damaged_item_id"),
+        data.get("reference_item_id"),
+        actor=_actor(),
+    )
+    return jsonify({"repair": repair}), 202
+
+
+@bp.get("/<case_id>/reference-repairs/<repair_id>")
+@requires_auth
+def api_recovered_channel_reference_repair(case_id: str, repair_id: str):
+    return jsonify({"repair": reference_repair.get_repair(case_id, repair_id)})
+
+
+@bp.post("/<case_id>/reference-repairs/<repair_id>/cancel")
+@requires_auth
+def api_recovered_channel_reference_repair_cancel(case_id: str, repair_id: str):
+    data = request.get_json(silent=True)
+    if data not in (None, {}):
+        raise reference_repair.ReferenceRepairError("Cancel does not accept options")
+    return jsonify({
+        "repair": reference_repair.cancel_repair(
+            case_id, repair_id, actor=_actor()
+        )
+    }), 202
+
+
+@bp.post("/<case_id>/reference-repairs/<repair_id>/retry")
+@requires_auth
+def api_recovered_channel_reference_repair_retry(case_id: str, repair_id: str):
+    data = request.get_json(silent=True)
+    if data not in (None, {}):
+        raise reference_repair.ReferenceRepairError("Retry does not accept options")
+    return jsonify({
+        "repair": reference_repair.retry_repair(
+            case_id, repair_id, actor=_actor()
+        )
+    }), 202
+
+
+@bp.post("/<case_id>/reference-repairs/<repair_id>/<action>-plan")
+@requires_auth
+def api_recovered_channel_reference_repair_plan(
+    case_id: str, repair_id: str, action: str
+):
+    data = request.get_json(silent=True)
+    if data not in (None, {}):
+        raise reference_repair.ReferenceRepairError("Action planning accepts no options")
+    return jsonify({
+        "plan": reference_repair.build_action_plan(
+            case_id, repair_id, action, actor=_actor()
+        )
+    })
+
+
+@bp.post("/<case_id>/reference-repairs/<repair_id>/<action>")
+@requires_auth
+def api_recovered_channel_reference_repair_apply(
+    case_id: str, repair_id: str, action: str
+):
+    data = _body()
+    if set(data) != {"plan_token", "confirmation"}:
+        raise reference_repair.ReferenceRepairError(
+            "Apply requires plan_token and exact confirmation only"
+        )
+    return jsonify(reference_repair.apply_action(
+        case_id, repair_id, action, data.get("plan_token"),
+        data.get("confirmation"), actor=_actor()
+    ))
 
 
 @bp.post("/<case_id>/organization-plan")

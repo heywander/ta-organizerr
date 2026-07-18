@@ -81,6 +81,16 @@ SALVAGE_JOB_TIMEOUT_SECONDS = _positive_int(
 SALVAGE_MAX_OUTPUT_BYTES = _positive_int(
     "SALVAGE_MAX_OUTPUT_BYTES", 100 * 1024 * 1024 * 1024
 )
+UNTRUNC_BINARY = os.getenv("UNTRUNC_BINARY", "untrunc").strip() or "untrunc"
+UNTRUNC_JOB_TIMEOUT_SECONDS = _positive_int(
+    "UNTRUNC_JOB_TIMEOUT_SECONDS", 24 * 3600
+)
+UNTRUNC_INSPECTION_TIMEOUT_SECONDS = _positive_int(
+    "UNTRUNC_INSPECTION_TIMEOUT_SECONDS", 24 * 3600
+)
+UNTRUNC_MAX_OUTPUT_BYTES = _positive_int(
+    "UNTRUNC_MAX_OUTPUT_BYTES", 100 * 1024 * 1024 * 1024
+)
 
 # Public-resource probes without account cookies. The application endpoints
 # remain administrator-authenticated. The API key is optional corroboration;

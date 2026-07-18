@@ -347,6 +347,9 @@ def _item_row(row: sqlite3.Row) -> dict[str, Any]:
         "metadata_notes": row["metadata_notes"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "reference_repair_count": (
+            row["reference_repair_count"] if "reference_repair_count" in row.keys() else 0
+        ),
         "preview_url": "/api/recovery/preview?filepath=" + _quote_path(row["source_path"]),
         "preview_audio_url": "/api/recovery/preview-audio?filepath=" + _quote_path(row["source_path"]),
         **link_state,
@@ -629,6 +632,14 @@ def _active_job(conn: sqlite3.Connection, case_id: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def _active_reference_repair(conn: sqlite3.Connection, case_id: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM recovered_media_repairs WHERE case_id=? "
+        "AND status IN ('queued','running','cancelling','adopting','restoring') LIMIT 1",
+        (case_id,),
+    ).fetchone() is not None
+
+
 def _insert_discovered(
     conn: sqlite3.Connection, case_id: str, discovered: list[dict[str, Any]]
 ) -> None:
@@ -690,7 +701,15 @@ def _insert_discovered(
 def _sync_case_inventory(case_id: str) -> list[dict[str, Any]]:
     with get_db() as conn:
         case = _require_case(conn, case_id)
-        discovered = _discover_channel(case["source_channel_id"])
+        channel_id = case["source_channel_id"]
+    discovered = _discover_channel(channel_id)
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_case(conn, case_id)
+        if _active_reference_repair(conn, case_id):
+            raise RecoveredChannelError(
+                "Wait for the active reference repair before syncing inventory", 409
+            )
         _insert_discovered(conn, case_id, discovered)
         current_paths = {item["source_path"] for item in discovered}
         existing = conn.execute(
@@ -940,7 +959,7 @@ def update_case(
         component = _confirmed_recovered_component(
             conn, current_case["source_channel_id"], component
         )
-        if _active_job(conn, case_id):
+        if _active_job(conn, case_id) or _active_reference_repair(conn, case_id):
             raise RecoveredChannelError("Wait for the active job before renaming", 409)
         if conn.execute(
             "SELECT 1 FROM recovered_channel_items WHERE case_id = ? AND organized_path IS NOT NULL",
@@ -1040,7 +1059,10 @@ def list_items(
                    recovered_channel_cases.source_channel_id AS source_channel_id,
                    recovered_channel_cases.target_component AS target_component,
                    videos.status AS recovered_owner_status,
-                   videos.symlink AS recovered_owner_symlink
+                   videos.symlink AS recovered_owner_symlink,
+                   (SELECT COUNT(*) FROM recovered_media_repairs
+                    WHERE recovered_media_repairs.damaged_item_id = recovered_channel_items.item_id)
+                       AS reference_repair_count
             FROM recovered_channel_items
             JOIN recovered_channel_cases USING (case_id)
             LEFT JOIN videos
@@ -1118,7 +1140,7 @@ def update_item(
         conn.execute("BEGIN IMMEDIATE")
         case = _require_case(conn, case_id)
         row = _require_item(conn, case_id, item_id)
-        if _active_job(conn, case_id):
+        if _active_job(conn, case_id) or _active_reference_repair(conn, case_id):
             raise RecoveredChannelError("Wait for the active job before editing items", 409)
         if row["organized_path"]:
             raise RecoveredChannelError("Organized items are immutable history", 409)
@@ -1228,7 +1250,7 @@ def bulk_decision(
     with get_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         case = _require_case(conn, case_id)
-        if _active_job(conn, case_id):
+        if _active_job(conn, case_id) or _active_reference_repair(conn, case_id):
             raise RecoveredChannelError("Wait for the active job before editing items", 409)
         rows = [
             _require_item(conn, case_id, item_id)
@@ -1508,7 +1530,7 @@ def start_inspection(
     with get_db() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _require_case(conn, case_id)
-        if _active_job(conn, case_id):
+        if _active_job(conn, case_id) or _active_reference_repair(conn, case_id):
             raise RecoveredChannelError("This case already has an active job", 409)
         if rescan:
             rows = conn.execute(
@@ -2410,7 +2432,7 @@ def start_organization(
             raise RecoveredChannelError(
                 "Organization plan changed; review it again", 409
             )
-        if _active_job(conn, case_id):
+        if _active_job(conn, case_id) or _active_reference_repair(conn, case_id):
             raise RecoveredChannelError("This case already has an active job", 409)
         all_current_rows = _unorganized_case_rows(conn, case_id)
         if not secrets.compare_digest(
