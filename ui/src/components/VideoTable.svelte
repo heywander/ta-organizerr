@@ -14,7 +14,11 @@
             searchTerm === "" ||
             v.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
             v.video_id.includes(searchTerm);
-        const matchStatus = statusFilter === "" || v.status === statusFilter;
+        const matchStatus =
+            statusFilter === "" ||
+            (statusFilter === "problem"
+                ? v.status !== "linked"
+                : v.status === statusFilter);
         const matchChannel =
             channelFilter === "" || v.channel === channelFilter;
         return matchSearch && matchStatus && matchChannel;
@@ -38,7 +42,7 @@
             >
                 <option value="">All Status</option>
                 <option value="linked">Linked</option>
-                <option value="missing">Missing</option>
+                <option value="problem">Missing / Error</option>
             </select>
 
             <select
@@ -68,16 +72,16 @@
     <div
         class="overflow-auto flex-grow max-h-[500px] scrollbar-thin scrollbar-thumb-gray-800"
     >
-        <table class="w-full text-left text-xs font-mono">
+        <table class="w-full table-fixed text-left text-[11px] font-mono">
             <thead
                 class="bg-black/50 text-gray-500 sticky top-0 backdrop-blur-sm z-10"
             >
                 <tr>
-                    <th class="p-3 w-8">St</th>
-                    <th class="p-3">Published</th>
-                    <th class="p-3">Channel</th>
-                    <th class="p-3">Title</th>
-                    <th class="p-3">ID</th>
+                    <th class="px-2 py-2 w-7">St</th>
+                    <th class="px-2 py-2 w-20">Published</th>
+                    <th class="px-2 py-2 w-[28%]">Channel</th>
+                    <th class="px-2 py-2">Title</th>
+                    <th class="px-2 py-2 w-28">ID</th>
                 </tr>
             </thead>
             <tbody>
@@ -100,7 +104,7 @@
                         <tr
                             class="border-b border-gray-800/50 hover:bg-white/5 transition-colors group"
                         >
-                            <td class="p-3">
+                            <td class="px-2 py-2">
                                 <div
                                     class="w-2 h-2 rounded-full {v.status ===
                                     'linked'
@@ -108,15 +112,18 @@
                                         : 'bg-red-500 shadow-[0_0_5px_rgba(239,68,68,0.5)]'}"
                                 ></div>
                             </td>
-                            <td class="p-3 text-gray-400 whitespace-nowrap"
+                            <td class="px-2 py-2 text-gray-400 tabular-nums leading-tight break-words"
                                 >{v.published}</td
                             >
-                            <td class="p-3 text-neon-cyan/80">{v.channel}</td>
                             <td
-                                class="p-3 font-semibold text-white group-hover:text-neon-pink transition-colors truncate max-w-[200px]"
+                                class="px-2 py-2 text-neon-cyan/80 truncate"
+                                title={v.channel}>{v.channel}</td
+                            >
+                            <td
+                                class="px-2 py-2 font-semibold text-white group-hover:text-neon-pink transition-colors truncate"
                                 title={v.title}>{v.title}</td
                             >
-                            <td class="p-3 text-gray-600 select-all"
+                            <td class="px-2 py-2 text-gray-600 select-all break-all"
                                 >{v.video_id}</td
                             >
                         </tr>
