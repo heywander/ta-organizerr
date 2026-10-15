@@ -1,0 +1,106 @@
+---
+import Layout from "../layouts/Layout.astro";
+---
+
+<Layout title="Login">
+    <div class="min-h-[70vh] flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
+        <div class="max-w-md w-full space-y-8 glass-panel p-8 rounded-2xl relative overflow-hidden group">
+            <!-- Glow Effect -->
+            <div class="absolute -top-24 -left-24 w-48 h-48 bg-neon-cyan/20 blur-[80px] rounded-full pointer-events-none group-hover:bg-neon-cyan/30 transition-colors"></div>
+            <div class="absolute -bottom-24 -right-24 w-48 h-48 bg-neon-pink/20 blur-[80px] rounded-full pointer-events-none group-hover:bg-neon-pink/30 transition-colors"></div>
+
+            <div class="relative z-10">
+                <div class="text-center">
+                    <i class="bi bi-shield-lock text-6xl neon-text-cyan animate-pulse inline-block mb-4"></i>
+                    <h2 class="mt-2 text-3xl font-extrabold italic tracking-tighter text-white">
+                        ACCESS_REQUIRED
+                    </h2>
+                    <p class="mt-2 text-sm text-gray-400 font-mono">
+                        // PLEASE_IDENTIFY_YOURSELF
+                    </p>
+                </div>
+
+                <form id="login-form" class="mt-8 space-y-6">
+                    <div class="space-y-4">
+                        <div>
+                            <label for="username" class="sr-only">Username</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">
+                                    <i class="bi bi-person-fill"></i>
+                                </span>
+                                <input id="username" name="username" type="text" required 
+                                    class="appearance-none relative block w-full px-10 py-3 border border-gray-800 bg-cyber-darker/50 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-neon-cyan/50 focus:border-neon-cyan transition-all placeholder-gray-600 sm:text-sm" 
+                                    placeholder="Username" />
+                            </div>
+                        </div>
+                        <div>
+                            <label for="password" class="sr-only">Password</label>
+                            <div class="relative">
+                                <span class="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">
+                                    <i class="bi bi-key-fill"></i>
+                                </span>
+                                <input id="password" name="password" type="password" required 
+                                    class="appearance-none relative block w-full px-10 py-3 border border-gray-800 bg-cyber-darker/50 text-white rounded-lg focus:outline-none focus:ring-2 focus:ring-neon-pink/50 focus:border-neon-pink transition-all placeholder-gray-600 sm:text-sm" 
+                                    placeholder="Password" />
+                            </div>
+                        </div>
+                    </div>
+
+                    <div id="error-message" class="hidden text-neon-pink text-xs font-mono text-center animate-bounce">
+                        // ERROR: INVALID_CREDENTIALS
+                    </div>
+
+                    <div>
+                        <button type="submit" id="submit-btn"
+                            class="group relative w-full flex justify-center py-3 px-4 border border-transparent text-sm font-bold rounded-lg text-cyber-dark bg-gradient-to-r from-neon-cyan to-neon-pink hover:from-white hover:to-white transition-all duration-300 shadow-[0_0_15px_rgba(0,243,255,0.3)] hover:shadow-[0_0_25px_rgba(255,255,255,0.5)] focus:outline-none uppercase italic tracking-widest">
+                            <span class="absolute left-0 inset-y-0 flex items-center pl-3">
+                                <i class="bi bi-unlock-fill text-cyber-dark group-hover:animate-bounce"></i>
+                            </span>
+                            Authenticate
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</Layout>
+
+<script>
+    const form = document.getElementById('login-form');
+    const errorMsg = document.getElementById('error-message');
+    const submitBtn = document.getElementById('submit-btn');
+
+    // If no admin exists yet, send the user to first-run setup.
+    fetch('/api/auth/setup-status').then(r => r.json()).then(data => {
+        if (data.setup_required) window.location.href = '/setup';
+    }).catch(() => {});
+
+    form?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        errorMsg?.classList.add('hidden');
+        
+        const formData = new FormData(form as HTMLFormElement);
+        const data = Object.fromEntries(formData.entries());
+
+        if (submitBtn) submitBtn.innerHTML = '<i class="bi bi-arrow-repeat animate-spin mr-2"></i> Processing...';
+
+        try {
+            const res = await fetch('/api/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+
+            if (res.ok) {
+                window.location.href = '/';
+            } else {
+                errorMsg?.classList.remove('hidden');
+                if (submitBtn) submitBtn.innerHTML = 'Authenticate';
+            }
+        } catch (err) {
+            console.error(err);
+            errorMsg?.classList.remove('hidden');
+            if (submitBtn) submitBtn.innerHTML = 'Authenticate';
+        }
+    });
+</script>

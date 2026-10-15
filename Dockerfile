@@ -1,39 +1,56 @@
 # --- Stage 1: Frontend Build (Bun) ---
-FROM oven/bun:1 as frontend
+FROM oven/bun:1.1.34 AS frontend
 WORKDIR /app/ui
 
-# Copy frontend code
 COPY ui/package.json ui/bun.lock ./
 RUN bun install --frozen-lockfile
 
 COPY ui .
 RUN bun run build
 
+
 # --- Stage 2: Backend (Python) ---
-FROM python:3.11-slim
+FROM python:3.11.10-slim AS backend
 WORKDIR /app
 
-# 1. Install System Deps (ffmpeg, curl for yt-dlp)
-RUN apt-get update && apt-get install -y ffmpeg curl && rm -rf /var/lib/apt/lists/*
-RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp
+# 1. System deps. ffmpeg for transcoding; gosu for dropping privileges in the
+#    entrypoint after fixing volume ownership at runtime.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg gosu \
+ && rm -rf /var/lib/apt/lists/*
 
-# 2. Install Python Deps
+# 2. Python deps (yt-dlp pinned via pip, avoiding the latest-binary curl).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Copy Backend Code
-COPY ta_symlink.py .
-# Copy other backend files if any (templates/ was old, but maybe still needed if I missed something? No, I replaced routes.)
-# But just in case, I'll exclude templates from copy or just copy everything and ignore.
-# Using .dockerignore would be good, but explicit copy is fine too.
-# Let's copy specific files or everything. The previous dockerfile did `COPY . .`.
-# I should probably just copy the python file and any others.
-# Let's stick to what was there but ensure we copy the BUILT frontend.
+# 3. Backend code
+COPY ta_organizerr ./ta_organizerr
 
-# 4. Copy Built Frontend from Stage 1
-# Python app expects: os.path.join(os.getcwd(), 'ui', 'dist')
-# defaults WORKDIR /app, so /app/ui/dist
+# 4. Built frontend from stage 1
 COPY --from=frontend /app/ui/dist ./ui/dist
 
-# 5. CMD
-CMD ["python", "ta_symlink.py"]
+# 5. Create the app user. Initial uid/gid of 1000 are placeholders — the
+#    entrypoint adjusts them at runtime via PUID/PGID env vars to match the
+#    host-mounted volume ownership.
+RUN groupadd --system --gid 1000 app \
+ && useradd --system --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin app \
+ && chown -R app:app /app
+
+# 6. Entrypoint script handles the runtime uid/gid swap before invoking gunicorn.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENV PYTHONUNBUFFERED=1 \
+    PORT=5000 \
+    HOST=0.0.0.0
+
+EXPOSE 5000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,os; urllib.request.urlopen(f'http://127.0.0.1:{os.environ.get(\"PORT\",5000)}/api/auth/setup-status', timeout=3).read()" || exit 1
+
+# Single worker because the scheduler runs in-process; multiple workers would
+# scan in parallel and clobber the DB.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", \
+     "--timeout", "300", "--access-logfile", "-", "ta_organizerr.wsgi:app"]

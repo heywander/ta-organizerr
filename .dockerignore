@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+!.env.example
+ui/node_modules
+ui/dist
+ui/.astro
+__pycache__
+*.pyc
+tests
+data
+source
+target
+hidden
+import
