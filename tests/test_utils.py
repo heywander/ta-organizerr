@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from unittest.mock import patch
+
+from ta_organizerr import utils
 from ta_organizerr.config import SOURCE_DIR
 from ta_organizerr.utils import path_in_allowed_tree, path_within, translate_host_path
 
@@ -25,11 +28,12 @@ class PathValidationTests(unittest.TestCase):
             self.assertFalse(path_within(link, [allowed]))
 
     def test_host_path_translation_uses_path_boundaries(self) -> None:
-        host_path = Path("/mnt/user/tubearchives/bp/Channel/video.mp4")
-        similar_prefix = Path("/mnt/user/tubearchives/bp2/Channel/video.mp4")
+        host_path = Path("/mnt/user/archive/Channel/video.mp4")
+        similar_prefix = Path("/mnt/user/archive2/Channel/video.mp4")
 
-        self.assertEqual(translate_host_path(host_path), SOURCE_DIR / "Channel/video.mp4")
-        self.assertEqual(translate_host_path(similar_prefix), similar_prefix)
+        with patch.object(utils, "HOST_SOURCE_BASE", Path("/mnt/user/archive")):
+            self.assertEqual(translate_host_path(host_path), SOURCE_DIR / "Channel/video.mp4")
+            self.assertEqual(translate_host_path(similar_prefix), similar_prefix)
 
 
 if __name__ == "__main__":

@@ -10,11 +10,24 @@ from ..auth import requires_auth
 from ..db import get_db
 from ..logging_util import transcode_log_buffer, transcode_log_lock, tlog
 from ..recovery import RECOVERY_ALLOWED_BASES
-from ..transcode import detect_encoder, transcode_video
+from ..transcode import (
+    active_jobs,
+    detect_encoder,
+    scan_codecs,
+    transcode_is_running,
+    transcode_video,
+)
 from ..utils import clamp_pagination, path_in_allowed_tree
 
 
 bp = Blueprint("transcode", __name__, url_prefix="/api/transcode")
+
+
+# Linked videos that are not yet H.264/AAC, or whose codecs are still unknown.
+_QUEUE_WHERE = (
+    "status = 'linked' AND ("
+    "video_codec IS NULL OR video_codec != 'h264' OR audio_codec IS NULL OR audio_codec != 'aac')"
+)
 
 
 @bp.route("/videos")
@@ -24,11 +37,15 @@ def api_transcode_videos():
     offset = (page - 1) * per_page
     with get_db() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) AS count FROM videos WHERE status = 'missing'"
+            f"SELECT COUNT(*) AS count FROM videos WHERE {_QUEUE_WHERE}"
+        ).fetchone()["count"]
+        unknown = conn.execute(
+            "SELECT COUNT(*) AS count FROM videos WHERE status = 'linked' AND video_codec IS NULL"
         ).fetchone()["count"]
         videos = []
         for row in conn.execute(
-            "SELECT * FROM videos WHERE status = 'missing' LIMIT ? OFFSET ?",
+            f"SELECT * FROM videos WHERE {_QUEUE_WHERE} "
+            "ORDER BY video_codec IS NULL, channel, published DESC LIMIT ? OFFSET ?",
             (per_page, offset),
         ):
             videos.append({
@@ -37,14 +54,37 @@ def api_transcode_videos():
                 "channel": row["channel"],
                 "published": row["published"],
                 "symlink": row["symlink"],
+                "video_codec": row["video_codec"],
+                "audio_codec": row["audio_codec"],
             })
     return jsonify({
         "videos": videos,
         "total": total,
+        "unknown": unknown,
         "page": page,
         "per_page": per_page,
         "pages": (total + per_page - 1) // per_page if per_page else 1,
+        "running": transcode_is_running(),
+        "active": active_jobs(),
     })
+
+
+_CODEC_SCAN_LOCK = threading.Lock()
+
+
+@bp.route("/scan", methods=["POST"])
+@requires_auth
+def api_transcode_scan():
+    """Probe codecs of linked videos in the background so the queue is accurate."""
+    if _CODEC_SCAN_LOCK.locked():
+        return jsonify({"status": "running", "message": "Codec scan already in progress"}), 202
+
+    def run():
+        with _CODEC_SCAN_LOCK:
+            scan_codecs()
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "started", "message": "Codec scan started"}), 202
 
 
 @bp.route("/start", methods=["POST"])
@@ -57,10 +97,16 @@ def api_transcode_start():
     if not path_in_allowed_tree(Path(filepath), RECOVERY_ALLOWED_BASES):
         return jsonify({"error": "Path outside allowed directories"}), 400
 
+    if filepath in active_jobs():
+        return jsonify({"message": "Already queued", "encoder": None}), 202
     encoder = detect_encoder()
     tlog(f"🖥️  Selected encoder: {encoder}")
     threading.Thread(target=transcode_video, args=(filepath, encoder), daemon=True).start()
-    return jsonify({"message": "Transcode started", "encoder": encoder})
+    queued = transcode_is_running()
+    return jsonify({
+        "message": "Transcode queued behind the running job" if queued else "Transcode started",
+        "encoder": encoder,
+    })
 
 
 @bp.route("/logs")

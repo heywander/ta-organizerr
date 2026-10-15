@@ -235,6 +235,24 @@ def _ensure_symlink(host_source_path: Path, dest_file: Path, video_dir: Path, ch
         return False, False, f"Non-symlink file already exists at {dest_file}"
 
 
+def _prune_stale_missing_rows() -> None:
+    """Drop ``missing`` rows whose symlink entry no longer exists on disk.
+
+    ``check_orphaned_links`` marks broken links as ``missing``; once the user
+    (or cleanup) removes the link the row would otherwise linger forever and
+    keep inflating the dashboard's missing count.
+    """
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT video_id, symlink FROM videos WHERE status = 'missing'"
+        ).fetchall()
+        stale = [row["video_id"] for row in rows if not row["symlink"] or not os.path.lexists(row["symlink"])]
+        if stale:
+            conn.executemany("DELETE FROM videos WHERE video_id = ?", [(vid,) for vid in stale])
+            conn.commit()
+            log(f"🧹 Pruned {len(stale)} stale 'missing' rows whose links are gone.")
+
+
 def process_videos() -> str | None:
     """Run the full sync: fetch metadata, organize symlinks, persist DB rows."""
     if not _SCAN_LOCK.acquire(blocking=False):
@@ -275,6 +293,9 @@ def _process_videos_unlocked() -> str | None:
     verified_links = 0
 
     with get_db() as conn:
+        # Keep probed codecs across rescans: park them in a temp table, then
+        # the INSERT below pulls them back by video_id.
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS codec_cache AS SELECT video_id, video_codec, audio_codec FROM videos WHERE video_codec IS NOT NULL")
         conn.execute("DELETE FROM videos WHERE status IN ('linked', 'error')")
         try:
             for video_file in SOURCE_DIR.rglob("*"):
@@ -285,7 +306,7 @@ def _process_videos_unlocked() -> str | None:
                 if not meta:
                     continue
 
-                sanitized_channel = sanitize(meta["channel_name"])
+                sanitized_channel = sanitize(meta["channel_name"], fallback="Unknown Channel")
                 is_hidden = meta["channel_name"] in hidden_channels
                 target_root = HIDDEN_DIR if is_hidden else TARGET_DIR
                 other_root = TARGET_DIR if is_hidden else HIDDEN_DIR
@@ -296,7 +317,7 @@ def _process_videos_unlocked() -> str | None:
                 if meta.get("is_live"):
                     channel_dir = channel_dir / "#streams"
 
-                folder_name = f"{meta['published']} - {sanitize(meta['title'])}"
+                folder_name = f"{meta['published']} - {sanitize(meta['title'], fallback=video_id)}"
                 video_dir = channel_dir / folder_name
                 host_source_path = HOST_SOURCE_BASE / video_file.relative_to(SOURCE_DIR)
                 dest_file = video_dir / f"video{video_file.suffix}"
@@ -324,8 +345,11 @@ def _process_videos_unlocked() -> str | None:
                 conn.execute(
                     """
                     INSERT OR REPLACE INTO videos
-                    (video_id, title, channel, published, symlink, is_live, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (video_id, title, channel, published, symlink, is_live, status,
+                     source_path, video_codec, audio_codec)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                            COALESCE(?, (SELECT video_codec FROM codec_cache WHERE video_id = ?)),
+                            COALESCE(?, (SELECT audio_codec FROM codec_cache WHERE video_id = ?)))
                     """,
                     (
                         video_id,
@@ -335,6 +359,9 @@ def _process_videos_unlocked() -> str | None:
                         str(dest_file),
                         1 if meta.get("is_live") else 0,
                         row_status,
+                        str(video_file),
+                        None, video_id,
+                        None, video_id,
                     ),
                 )
                 processed_videos.append({
@@ -350,7 +377,10 @@ def _process_videos_unlocked() -> str | None:
             log(f"❌❌❌ CRITICAL ERROR in process_videos: {exc}")
             log(f"Traceback: {traceback.format_exc()}")
             return str(exc)
+        conn.execute("DROP TABLE IF EXISTS codec_cache")
         conn.commit()
+
+    _prune_stale_missing_rows()
 
     log(f"✅ Scan complete. Processed {len(processed_videos)} videos.")
     log(f"   - New/Fixed Links: {new_links}")

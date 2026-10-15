@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -11,7 +12,10 @@ from .config import HOST_SOURCE_BASE, MAX_PER_PAGE, SOURCE_DIR
 _VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".avi"}
 _YOUTUBE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 _BRACKETED_ID_RE = re.compile(r"\[([a-zA-Z0-9_-]{11})\]$")
-_FILENAME_INVALID_RE = re.compile(r'[\/:*?"<>|]')
+# Characters that are invalid on at least one common filesystem (NTFS/SMB,
+# ext4, APFS), plus ASCII control characters.
+_FILENAME_INVALID_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
+_MAX_NAME_LENGTH = 200
 
 
 def is_video(path: str | Path) -> bool:
@@ -35,10 +39,22 @@ def extract_id_from_filename(filename: str) -> Optional[str]:
     return None
 
 
-def sanitize(text: str) -> str:
-    text = text.encode("ascii", "ignore").decode()
+def sanitize(text: str, fallback: str = "") -> str:
+    """Turn arbitrary text into a safe single path component.
+
+    Unicode is preserved (NFC-normalized) so non-Latin channel names keep
+    their real titles instead of collapsing to an empty string. Only
+    filesystem-invalid characters are replaced, leading/trailing dots and
+    whitespace are stripped (``.`` / ``..`` would otherwise escape the
+    folder), and the result is capped to a sane length. ``fallback`` is
+    returned when nothing usable is left.
+    """
+    text = unicodedata.normalize("NFC", text or "")
     text = _FILENAME_INVALID_RE.sub("_", text)
-    return text.strip()
+    text = text.strip().strip(".").strip()
+    if len(text) > _MAX_NAME_LENGTH:
+        text = text[:_MAX_NAME_LENGTH].rstrip()
+    return text or fallback
 
 
 def _relative_to(candidate: Path, base: Path) -> Path | None:
@@ -73,10 +89,9 @@ def translate_host_path(host_path: Optional[str | Path]) -> Optional[Path]:
     p = Path(host_path)
     if _relative_to(p, SOURCE_DIR) is not None:
         return p
-    for prefix in (Path("/mnt/user/tubearchives/bp"), HOST_SOURCE_BASE):
-        rel = _relative_to(p, prefix)
-        if rel is not None:
-            return SOURCE_DIR / rel
+    rel = _relative_to(p, HOST_SOURCE_BASE)
+    if rel is not None:
+        return SOURCE_DIR / rel
     return p
 
 

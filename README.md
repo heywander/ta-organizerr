@@ -20,7 +20,9 @@ management, and optional FFmpeg transcoding.
 - Checks and repairs broken symlinks and empty folders.
 - Scans for unindexed, redundant, rescue, and lost media.
 - Stages recovered videos and metadata into `/app/import`.
-- Can transcode media to H.264/AAC with FFmpeg.
+- Can transcode media to H.264/AAC with FFmpeg, keeping the original
+  filename and container so TubeArchivist's index stays valid.
+- Unicode channel and video titles are kept as-is in folder names.
 - Supports Docker and Unraid-style `PUID`/`PGID` ownership.
 
 ## Requirements
@@ -58,8 +60,13 @@ IMPORT_DIR=/app/import
 DATA_DIR=/app/data
 
 # Host-side source path to write into symlink targets.
-# Set this to the path your host/media clients should see.
-HOST_SOURCE_BASE=/mnt/user/tubearchives/bp
+# Set this to the path your host/media clients should see. Defaults to
+# SOURCE_DIR, which only resolves inside the container.
+HOST_SOURCE_BASE=/mnt/user/tubearchivist/downloads
+
+# Number of reverse proxies in front of the app (0 = none). Needed for
+# ALLOWED_IPS to see real client addresses behind Nginx/Traefik/Caddy.
+TRUSTED_PROXY_COUNT=0
 
 # Set to true only when serving over HTTPS.
 SESSION_COOKIE_SECURE=false
@@ -131,13 +138,18 @@ Livestreams are placed below the channel folder:
 - Recovery can stage files plus `.info.json` metadata for TubeArchivist import.
 - Destruct mode deletes both target entries and matched source archive files; use
   it only when you intend to permanently remove media.
+- The Transcode page lists linked videos that are not yet H.264/AAC. Run
+  "Scan Codecs" once to probe existing files; results are stored in the DB.
+- State-changing API requests must be same-origin (checked via `Origin` /
+  `Sec-Fetch-Site`), so the UI cannot be driven from another site.
 
 ## Development
 
-Backend syntax check:
+Backend syntax check and tests:
 
 ```bash
 python3 -m compileall -q ta_organizerr
+python3 -m unittest discover -s tests -t .
 ```
 
 Frontend build:
@@ -160,6 +172,8 @@ docker build -t tubesorter .
   TubeArchivist metadata.
 - If symlinks look broken inside the container but work on the host, verify
   `HOST_SOURCE_BASE` and `/app/source` point at the same archive tree.
+- If every request is denied behind a reverse proxy, set
+  `TRUSTED_PROXY_COUNT=1` so the real client IP is used for `ALLOWED_IPS`.
 - If login works over HTTP but not through HTTPS, set
   `SESSION_COOKIE_SECURE=true` only behind a TLS-terminating proxy.
 - If the UI lacks icons or fonts, check the browser console for CSP violations.

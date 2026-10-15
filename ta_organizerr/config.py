@@ -20,7 +20,16 @@ TARGET_DIR = Path(os.getenv("TARGET_DIR", "/app/target"))
 HIDDEN_DIR = Path(os.getenv("HIDDEN_DIR", "/app/hidden"))
 IMPORT_DIR = Path(os.getenv("IMPORT_DIR", "/app/import"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-HOST_SOURCE_BASE = Path(os.getenv("HOST_SOURCE_BASE", "/mnt/user/tubearchives/bp"))
+# Path at which media clients (Plex, Jellyfin, the host itself) see the
+# archive. Symlinks are written against this path. Defaults to the in-container
+# source path so a fresh install produces links that at least resolve inside
+# the container; set it to the host-side path for real deployments.
+HOST_SOURCE_BASE = Path(os.getenv("HOST_SOURCE_BASE") or str(SOURCE_DIR))
+
+# Number of reverse proxies in front of the app. When > 0, X-Forwarded-For is
+# trusted for that many hops so ALLOWED_IPS and login logging see the real
+# client address instead of the proxy's.
+TRUSTED_PROXY_COUNT = int(os.getenv("TRUSTED_PROXY_COUNT", "0"))
 
 DB_PATH = DATA_DIR / "videos.db"
 
