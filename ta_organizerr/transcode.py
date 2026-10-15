@@ -17,6 +17,7 @@ from .config import (
     SOURCE_DIR,
     TARGET_DIR,
 )
+from .db import get_db
 from .logging_util import tlog
 from .library_lock import LIBRARY_MUTATION_LOCK
 from .media_reservations import (
@@ -114,6 +115,90 @@ def probe_streams(filepath: str) -> list[MediaStream] | None:
     ) as exc:
         tlog(f"ffprobe failure on {filepath}: {exc}")
         return None
+
+
+def summarize_codecs(streams: list[MediaStream]) -> tuple[str, str]:
+    """Collapse a stream inventory to the (video, audio) pair the queue tracks.
+
+    Mirrors the decision in :func:`_transcode_resolved`: a file is done when
+    its single primary video stream is H.264 and every audio stream (possibly
+    none) is AAC. ``none``/``multiple`` keep oddly shaped files visible in the
+    queue instead of hiding them behind an unknown-codec placeholder.
+    """
+    primary = [s for s in streams if s.stream_type == "video" and not s.attached_pic]
+    audio = [s.codec for s in streams if s.stream_type == "audio"]
+    if not primary:
+        video_codec = "none"
+    elif len(primary) > 1:
+        video_codec = "multiple"
+    else:
+        video_codec = primary[0].codec or "unknown"
+    if not audio:
+        audio_codec = "none"
+    elif all(codec == "aac" for codec in audio):
+        audio_codec = "aac"
+    else:
+        audio_codec = next(codec for codec in audio if codec != "aac") or "unknown"
+    return video_codec, audio_codec
+
+
+def needs_transcode(video_codec: str | None, audio_codec: str | None) -> bool:
+    return video_codec != "h264" or audio_codec not in {"aac", "none"}
+
+
+# SQL fragment matching rows :func:`needs_transcode` would flag, including
+# rows that have never been probed. Shared with the transcode routes.
+NEEDS_TRANSCODE_SQL = (
+    "(video_codec IS NULL OR video_codec != 'h264' "
+    "OR audio_codec IS NULL OR audio_codec NOT IN ('aac', 'none'))"
+)
+
+
+def _record_codecs(where: str, key: str | None, video_codec: str, audio_codec: str) -> None:
+    """Persist probed codecs so the queue can be built without re-probing."""
+    if not key:
+        return
+    try:
+        with get_db() as conn:
+            conn.execute(
+                f"UPDATE videos SET video_codec = ?, audio_codec = ? WHERE {where} = ?",
+                (video_codec, audio_codec, key),
+            )
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never break a transcode
+        tlog(f"⚠️ Could not record codecs for {key}: {exc}")
+
+
+def scan_codecs(limit: int | None = None) -> int:
+    """Probe linked videos with no codec info yet and store the result.
+
+    Returns the number of rows probed. Each probe is a quick ffprobe header
+    read; nothing is reserved or modified, so it is safe to run while
+    transcodes or scans are active.
+    """
+    query = (
+        "SELECT video_id, symlink FROM videos "
+        "WHERE status = 'linked' AND symlink IS NOT NULL AND video_codec IS NULL "
+        "ORDER BY channel, published DESC"
+    )
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    with get_db() as conn:
+        rows = conn.execute(query).fetchall()
+    tlog(f"🔎 Probing codecs for {len(rows)} videos...")
+    probed = 0
+    for row in rows:
+        source, _error = _resolve_source(row["symlink"])
+        if source is None:
+            continue
+        streams = probe_streams(str(source))
+        if streams is None:
+            continue
+        video_codec, audio_codec = summarize_codecs(streams)
+        _record_codecs("video_id", row["video_id"], video_codec, audio_codec)
+        probed += 1
+    tlog(f"✅ Codec scan complete. Probed {probed} videos.")
+    return probed
 
 
 def _build_cmd(
@@ -301,12 +386,29 @@ def _commit_output(
     return True
 
 
-def _transcode_resolved(source: Path, encoder: str) -> bool:
+def _commit_and_record(
+    temp_file: Path,
+    source: Path,
+    original_stat: os.stat_result,
+    requested_path: str | None,
+) -> bool:
+    committed = _commit_output(temp_file, source, original_stat)
+    if committed:
+        _record_codecs("symlink", requested_path, "h264", "aac")
+    return committed
+
+
+def _transcode_resolved(
+    source: Path,
+    encoder: str,
+    requested_path: str | None = None,
+) -> bool:
     filepath = str(source)
     streams = probe_streams(filepath)
     if streams is None:
         tlog(f"❌ Refusing transcode because stream inventory failed: {filepath}")
         return False
+    _record_codecs("symlink", requested_path, *summarize_codecs(streams))
     video_streams = [stream for stream in streams if stream.stream_type == "video"]
     primary_videos = [stream for stream in video_streams if not stream.attached_pic]
     audio_codecs = [
@@ -349,7 +451,7 @@ def _transcode_resolved(source: Path, encoder: str) -> bool:
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode == 0:
-            return _commit_output(temp_file, source, original_stat)
+            return _commit_and_record(temp_file, source, original_stat, requested_path)
 
         hardware_encoder = encoder in {
             "h264_nvenc",
@@ -372,7 +474,7 @@ def _transcode_resolved(source: Path, encoder: str) -> bool:
                 check=False,
             )
             if cpu_result.returncode == 0:
-                return _commit_output(temp_file, source, original_stat)
+                return _commit_and_record(temp_file, source, original_stat, requested_path)
             tlog(f"❌ Failed (CPU): {filepath}\nError: {cpu_result.stderr}")
         else:
             tlog(f"❌ Failed: {filepath}\nError: {result.stderr}")
@@ -400,14 +502,14 @@ def transcode_video(filepath: str, encoder: str = "libx264") -> bool:
         tlog(message)
         return False
     try:
-        return _transcode_resolved(source, encoder)
+        return _transcode_resolved(source, encoder, requested_path=filepath)
     finally:
         _release(source)
 
 
-def _run_reserved(source: Path, encoder: str) -> None:
+def _run_reserved(source: Path, encoder: str, requested_path: str | None = None) -> None:
     try:
-        _transcode_resolved(source, encoder)
+        _transcode_resolved(source, encoder, requested_path=requested_path)
     finally:
         _release(source)
 
@@ -424,7 +526,7 @@ def start_transcode_job(filepath: str, encoder: str = "libx264") -> tuple[bool, 
     try:
         thread = threading.Thread(
             target=_run_reserved,
-            args=(source, encoder),
+            args=(source, encoder, filepath),
             daemon=True,
             name=f"transcode-{source.name}",
         )

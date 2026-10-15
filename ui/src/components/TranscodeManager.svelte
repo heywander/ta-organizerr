@@ -1,12 +1,16 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onMount, onDestroy } from "svelte";
     import LogViewer from "./LogViewer.svelte";
 
     let videos: any[] = [];
     let loading = false;
     let page = 1;
     let total = 0;
+    let unknown = 0;
     let pages = 1;
+    let scanning = false;
+    let scanRequested = false;
+    let scanPoll: ReturnType<typeof setInterval> | null = null;
     let error: string | null = null;
     let pendingPaths = new Set<string>();
     let startedPaths = new Set<string>();
@@ -40,8 +44,11 @@
             }
             videos = data.videos;
             total = Number(data.total) || 0;
+            unknown = Number(data.unknown) || 0;
+            scanning = Boolean(data.scanning);
             pages = Math.max(1, Number(data.pages) || 1);
             page = Math.max(1, Number(data.page) || p);
+            syncScanPoll();
         } catch (e) {
             console.error(e);
             videos = [];
@@ -85,6 +92,54 @@
         }
     }
 
+    function stopScanPoll() {
+        if (scanPoll !== null) {
+            clearInterval(scanPoll);
+            scanPoll = null;
+        }
+    }
+
+    function syncScanPoll() {
+        // Keep refreshing while the server probes files so finished rows
+        // drop out of the queue without a manual refresh.
+        if (scanning) {
+            if (scanPoll === null) {
+                scanPoll = setInterval(() => fetchVideos(page), 8000);
+            }
+        } else {
+            stopScanPoll();
+        }
+    }
+
+    async function scanCodecs() {
+        if (scanRequested || scanning) return;
+        if (
+            !confirm(
+                "Probe every linked video for its codecs? This reads file headers in the background and does not modify media.",
+            )
+        )
+            return;
+        scanRequested = true;
+        error = null;
+        try {
+            const res = await fetch("/api/transcode/scan", { method: "POST" });
+            const data = await readResponse(res);
+            scanning = true;
+            syncScanPoll();
+            alert(data.message || "Codec scan started.");
+        } catch (e) {
+            error = `Could not start codec scan: ${messageFrom(e)}`;
+            alert(error);
+        } finally {
+            scanRequested = false;
+        }
+    }
+
+    function codecLabel(v: any): string {
+        if (!v.video_codec && !v.audio_codec) return "not probed";
+        return `${v.video_codec ?? "?"} / ${v.audio_codec ?? "?"}`;
+    }
+
     function refreshVideos() {
         // A deliberate refresh clears local job markers; the server still owns
         // concurrency and validates every request.
@@ -95,6 +150,8 @@
     onMount(() => {
         fetchVideos();
     });
+
+    onDestroy(stopScanPoll);
 </script>
 
 <div class="transcode-page">
@@ -105,18 +162,31 @@
                 Transcode media
             </h1>
             <p class="section-description">
-                {total} linked {total === 1 ? "file" : "files"} available. Transcoding replaces the source file in place.
+                {total} linked {total === 1 ? "file" : "files"} not yet H.264/AAC{#if unknown > 0}
+                    ({unknown} not probed yet){/if}. Transcoding replaces the source file in place.
             </p>
         </div>
-        <button
-            type="button"
-            class="button"
-            on:click={refreshVideos}
-            disabled={loading}
-        >
-            <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
-            {loading ? "Refreshing…" : "Refresh list"}
-        </button>
+        <div class="transcode-summary__actions">
+            <button
+                type="button"
+                class="button"
+                on:click={scanCodecs}
+                disabled={scanning || scanRequested}
+                title="Probe linked files with ffprobe so only media that needs converting is listed"
+            >
+                <i class="bi bi-search" aria-hidden="true"></i>
+                {scanning ? "Scanning codecs…" : "Scan codecs"}
+            </button>
+            <button
+                type="button"
+                class="button"
+                on:click={refreshVideos}
+                disabled={loading}
+            >
+                <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+                {loading ? "Refreshing…" : "Refresh list"}
+            </button>
+        </div>
     </section>
 
     {#if error}
@@ -133,7 +203,9 @@
                         <i class="bi bi-folder2-open" aria-hidden="true"></i>
                         Eligible files
                     </h2>
-                    <p class="section-description">Only linked archive media is listed.</p>
+                    <p class="section-description">
+                        Only linked archive media that still needs converting is listed. Unprobed files sort last.
+                    </p>
                 </div>
             </header>
 
@@ -144,17 +216,24 @@
                             <th class="channel-column">Channel</th>
                             <th class="published-column">Published</th>
                             <th>Title</th>
+                            <th class="codec-column">Codecs</th>
                             <th class="action-column">Action</th>
                         </tr>
                     </thead>
                     <tbody>
                         {#if loading}
                             <tr class="state-row">
-                                <td colspan="4" class="table-message">Loading media…</td>
+                                <td colspan="5" class="table-message">Loading media…</td>
                             </tr>
                         {:else if videos.length === 0}
                             <tr class="state-row">
-                                <td colspan="4" class="table-message">No linked videos are currently available.</td>
+                                <td colspan="5" class="table-message">
+                                    {#if unknown > 0}
+                                        No probed videos need transcoding. Run a codec scan to check the rest.
+                                    {:else}
+                                        Every linked video is already H.264/AAC.
+                                    {/if}
+                                </td>
                             </tr>
                         {:else}
                             {#each videos as v}
@@ -171,6 +250,10 @@
                                         <span class="mobile-cell-label">Title</span>
                                         <i class="bi bi-file-earmark-play" aria-hidden="true"></i>
                                         <span>{v.title}</span>
+                                    </td>
+                                    <td class="codec-column" title={codecLabel(v)}>
+                                        <span class="mobile-cell-label">Codecs</span>
+                                        {codecLabel(v)}
                                     </td>
                                     <td class="action-column">
                                         <button
@@ -247,6 +330,12 @@
         background: var(--surface-raised) !important;
     }
 
+    .transcode-summary__actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
     .transcode-layout {
         display: grid;
         grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr);
@@ -309,6 +398,12 @@
         font-weight: 600;
     }
 
+    .codec-column {
+        width: 118px;
+        color: var(--text-muted);
+        font-variant-numeric: tabular-nums;
+    }
+
     .action-column {
         width: 112px;
         text-align: right;
@@ -358,6 +453,10 @@
             flex-direction: column;
         }
 
+        .transcode-summary__actions {
+            flex-direction: column;
+        }
+
         .transcode-summary .button {
             width: 100%;
         }
@@ -399,6 +498,7 @@
                 "title"
                 "channel"
                 "published"
+                "codecs"
                 "action";
             grid-template-columns: minmax(0, 1fr);
             border: 1px solid var(--line-soft);
@@ -455,6 +555,11 @@
         .published-column {
             display: block;
             grid-area: published;
+        }
+
+        .codec-column {
+            display: block;
+            grid-area: codecs;
         }
 
         .action-column {

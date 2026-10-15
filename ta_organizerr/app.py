@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import ipaddress
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 from flask import Flask, abort, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from .auth import get_or_create_secret_key
 from .config import (
@@ -15,6 +17,7 @@ from .config import (
     SESSION_COOKIE_SECURE,
     SESSION_LIFETIME_SECONDS,
     STATIC_FOLDER,
+    TRUSTED_PROXY_COUNT,
 )
 from .db import init_db_with_retry
 from .extensions import limiter
@@ -45,6 +48,31 @@ def _enforce_ip_allowlist():
     abort(403)
 
 
+_STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _enforce_same_origin():
+    """Reject cross-site state-changing requests (CSRF defence).
+
+    The session cookie is SameSite=Lax, which already blocks most cross-site
+    POSTs, but browsers send ``Origin`` (or ``Sec-Fetch-Site``) on every
+    fetch/XHR, so we can verify it without changing any client code. Requests
+    with neither header (curl, scripts) are left alone: they carry no cookie.
+    """
+    if request.method not in _STATE_CHANGING_METHODS:
+        return
+    origin = request.headers.get("Origin")
+    if origin and origin != "null":
+        if urlsplit(origin).netloc.lower() != request.host.lower():
+            log(f"⛔ Cross-origin {request.method} blocked from {origin} ({request.remote_addr})")
+            abort(403)
+        return
+    fetch_site = request.headers.get("Sec-Fetch-Site")
+    if fetch_site and fetch_site not in {"same-origin", "none"}:
+        log(f"⛔ Cross-site {request.method} blocked (Sec-Fetch-Site={fetch_site}, {request.remote_addr})")
+        abort(403)
+
+
 def _apply_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
@@ -72,6 +100,13 @@ def create_app(initialize_db: bool = True) -> Flask:
     # bypass their authentication gates via Flask's automatic static catch-all.
     app = Flask(__name__, static_folder=None)
     app.config["STATIC_BUILD_FOLDER"] = STATIC_FOLDER
+    if TRUSTED_PROXY_COUNT > 0:
+        app.wsgi_app = ProxyFix(
+            app.wsgi_app,
+            x_for=TRUSTED_PROXY_COUNT,
+            x_proto=TRUSTED_PROXY_COUNT,
+            x_host=TRUSTED_PROXY_COUNT,
+        )
     if not HOST_SOURCE_BASE_CONFIGURED:
         log(
             "⚠️ HOST_SOURCE_BASE is unset; using legacy fallback "
@@ -108,6 +143,7 @@ def create_app(initialize_db: bool = True) -> Flask:
 
     limiter.init_app(app)
     app.before_request(_enforce_ip_allowlist)
+    app.before_request(_enforce_same_origin)
     app.after_request(_apply_security_headers)
 
     # Register blueprints. Imported lazily to avoid circular imports during

@@ -1,6 +1,7 @@
 """Transcode trigger + log endpoints."""
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from flask import Blueprint, jsonify, request
@@ -11,12 +12,26 @@ from ..logging_util import read_transcode_logs, tlog
 from ..library_lock import LIBRARY_MUTATION_LOCK
 from ..recovery import RECOVERY_ALLOWED_BASES
 from ..recovered_channels import is_recovered_media_path
-from ..transcode import detect_encoder, start_transcode_job
+from ..transcode import (
+    NEEDS_TRANSCODE_SQL,
+    detect_encoder,
+    scan_codecs,
+    start_transcode_job,
+)
 from ..utils import clamp_pagination, path_in_allowed_tree
 
 
 bp = Blueprint("transcode", __name__, url_prefix="/api/transcode")
 _MAX_PATH_LENGTH = 4096
+_CODEC_SCAN_LOCK = threading.Lock()
+
+# Linked media in a container the transcoder can rewrite in place.
+_ELIGIBLE_SQL = (
+    "status = 'linked' AND symlink IS NOT NULL AND ("
+    "lower(symlink) LIKE '%.mp4' OR lower(symlink) LIKE '%.mkv' OR lower(symlink) LIKE '%.mov')"
+)
+# ...that is not yet H.264/AAC, or has never been probed.
+_QUEUE_SQL = f"{_ELIGIBLE_SQL} AND {NEEDS_TRANSCODE_SQL}"
 
 
 @bp.route("/videos")
@@ -26,27 +41,17 @@ def api_transcode_videos():
     offset = (page - 1) * per_page
     with get_db() as conn:
         total = conn.execute(
-            """
-            SELECT COUNT(*) AS count FROM videos
-            WHERE status = 'linked' AND symlink IS NOT NULL
-              AND (
-                  lower(symlink) LIKE '%.mp4'
-                  OR lower(symlink) LIKE '%.mkv'
-                  OR lower(symlink) LIKE '%.mov'
-              )
-            """
+            f"SELECT COUNT(*) AS count FROM videos WHERE {_QUEUE_SQL}"
+        ).fetchone()["count"]
+        unknown = conn.execute(
+            f"SELECT COUNT(*) AS count FROM videos WHERE {_ELIGIBLE_SQL} AND video_codec IS NULL"
         ).fetchone()["count"]
         videos = []
         for row in conn.execute(
-            """
+            f"""
             SELECT * FROM videos
-            WHERE status = 'linked' AND symlink IS NOT NULL
-              AND (
-                  lower(symlink) LIKE '%.mp4'
-                  OR lower(symlink) LIKE '%.mkv'
-                  OR lower(symlink) LIKE '%.mov'
-              )
-            ORDER BY channel, published DESC
+            WHERE {_QUEUE_SQL}
+            ORDER BY (video_codec IS NULL), channel, published DESC
             LIMIT ? OFFSET ?
             """,
             (per_page, offset),
@@ -57,14 +62,39 @@ def api_transcode_videos():
                 "channel": row["channel"],
                 "published": row["published"],
                 "symlink": row["symlink"],
+                "video_codec": row["video_codec"],
+                "audio_codec": row["audio_codec"],
             })
     return jsonify({
         "videos": videos,
         "total": total,
+        "unknown": unknown,
+        "scanning": _CODEC_SCAN_LOCK.locked(),
         "page": page,
         "per_page": per_page,
         "pages": (total + per_page - 1) // per_page if per_page else 1,
     })
+
+
+@bp.route("/scan", methods=["POST"])
+@requires_auth
+def api_transcode_scan():
+    """Probe codecs of linked videos in the background so the queue is accurate."""
+    if not _CODEC_SCAN_LOCK.acquire(blocking=False):
+        return jsonify({"status": "running", "message": "Codec scan already in progress"}), 202
+
+    def run() -> None:
+        try:
+            scan_codecs()
+        finally:
+            _CODEC_SCAN_LOCK.release()
+
+    try:
+        threading.Thread(target=run, daemon=True, name="codec-scan").start()
+    except RuntimeError as exc:
+        _CODEC_SCAN_LOCK.release()
+        return jsonify({"error": f"Could not start codec scan: {exc}"}), 500
+    return jsonify({"status": "started", "message": "Codec scan started"}), 202
 
 
 @bp.route("/start", methods=["POST"])

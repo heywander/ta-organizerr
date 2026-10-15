@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS videos (
     status TEXT,
     is_live BOOLEAN DEFAULT 0,
     adopted_real BOOLEAN DEFAULT 0,
+    video_codec TEXT,
+    audio_codec TEXT,
     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS lost_media (
@@ -315,6 +317,8 @@ _MIGRATIONS = [
     "ALTER TABLE availability_jobs ADD COLUMN message TEXT",
     "ALTER TABLE recovered_media_repairs ADD COLUMN tool_version TEXT",
     "ALTER TABLE recovered_media_repairs ADD COLUMN action_actor TEXT",
+    "ALTER TABLE videos ADD COLUMN video_codec TEXT",
+    "ALTER TABLE videos ADD COLUMN audio_codec TEXT",
 ]
 
 
@@ -326,6 +330,34 @@ def get_db() -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+def stash_codecs(conn: sqlite3.Connection) -> None:
+    """Park probed codecs in a temp table before a scan rewrites ``videos``.
+
+    A full scan deletes and re-inserts the linked rows, which would otherwise
+    throw away every ffprobe result and force the Transcode page to re-probe
+    the whole library. Pair with :func:`restore_codecs` on the same connection.
+    """
+    conn.execute("DROP TABLE IF EXISTS temp.codec_cache")
+    conn.execute(
+        "CREATE TEMP TABLE codec_cache AS "
+        "SELECT video_id, video_codec, audio_codec FROM videos "
+        "WHERE video_codec IS NOT NULL OR audio_codec IS NOT NULL"
+    )
+
+
+def restore_codecs(conn: sqlite3.Connection) -> None:
+    """Copy codecs stashed by :func:`stash_codecs` back onto the new rows."""
+    conn.execute(
+        """
+        UPDATE videos SET
+            video_codec = (SELECT c.video_codec FROM temp.codec_cache c WHERE c.video_id = videos.video_id),
+            audio_codec = (SELECT c.audio_codec FROM temp.codec_cache c WHERE c.video_id = videos.video_id)
+        WHERE video_id IN (SELECT video_id FROM temp.codec_cache)
+        """
+    )
+    conn.execute("DROP TABLE IF EXISTS temp.codec_cache")
 
 
 def _prepare_db_path() -> None:

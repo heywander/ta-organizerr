@@ -365,14 +365,17 @@ def recover_video_metadata(filepath: str) -> tuple[bool, str]:
     temp_json = Path(f"{output_template}.info.json")
 
     log(f"🚑 Recovering: {vid_id} ...")
+    # ``--id`` was removed from yt-dlp long ago; the output template already
+    # pins the filename, and the URL goes last so option parsing cannot
+    # mistake it for a value.
     cmd = [
         "yt-dlp",
+        "--no-update",
         "--write-info-json",
         "--skip-download",
-        "--id",
-        f"https://www.youtube.com/watch?v={vid_id}",
         "-o",
         str(output_template),
+        f"https://www.youtube.com/watch?v={vid_id}",
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
@@ -428,12 +431,19 @@ def force_import(filepath: str) -> tuple[bool, str]:
 
     IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     json_path = IMPORT_DIR / f"{src_path.stem}.info.json"
+    # Best guess at the original upload date: the file's mtime, which
+    # TubeArchivist/yt-dlp set to the upload date on download. Today's date
+    # would make the video sort as brand new.
+    try:
+        upload_dt = datetime.fromtimestamp(src_path.stat().st_mtime)
+    except OSError:
+        upload_dt = datetime.now()
     offline_meta = {
         "id": vid_id,
         "title": f"Offline Import - {src_path.stem}",
         "uploader": "Unknown (Lost Media)",
-        "upload_date": datetime.now().strftime("%Y%m%d"),
-        "description": "Imported via TubeSorterr Force Import (Lost Media)",
+        "upload_date": upload_dt.strftime("%Y%m%d"),
+        "description": "Imported via TubeSorter Force Import (Lost Media)",
         "webpage_url": f"https://www.youtube.com/watch?v={vid_id}",
         "view_count": 0,
         "like_count": 0,

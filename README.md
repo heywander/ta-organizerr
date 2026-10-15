@@ -34,7 +34,10 @@ management, and optional FFmpeg transcoding.
   decode results and human decisions, then publishes approved files as direct
   exact-ID links under an administrator-named `[Recovered]` channel.
 - Stages recovered videos and metadata into `/app/import`.
-- Can transcode media to H.264/AAC with FFmpeg.
+- Can transcode media to H.264/AAC with FFmpeg, keeping the original
+  filename and container so TubeArchivist's index stays valid.
+- Probes and remembers codecs so the Transcode page lists only files that
+  still need conversion.
 - Supports Docker and Unraid-style `PUID`/`PGID` ownership.
 
 ## Requirements
@@ -75,6 +78,10 @@ Common optional settings:
 ```env
 SCAN_INTERVAL=60
 ALLOWED_IPS=127.0.0.1,192.168.1.0/24,10.0.0.0/8,172.16.0.0/12
+
+# Number of reverse proxies in front of the app (0 = none). Needed for
+# ALLOWED_IPS to see real client addresses behind Nginx/Traefik/Caddy.
+TRUSTED_PROXY_COUNT=0
 
 PUID=99
 PGID=100
@@ -235,6 +242,11 @@ migration.
 - Maintenance can remove empty folders and zero-byte invalid `video.*` files.
 - Orphan checks scan both target and hidden folders recursively.
 - Recovery can stage files plus `.info.json` metadata for TubeArchivist import.
+- The Transcode page lists linked videos that are not yet H.264/AAC. Run
+  "Scan codecs" once to probe existing files; results are stored in the DB and
+  survive rescans.
+- State-changing API requests must be same-origin (checked via `Origin` /
+  `Sec-Fetch-Site`), so the UI cannot be driven from another site.
 - Availability checks run as durable, manually started server jobs. Channel
   checks use canonical `UC...` IDs; video checks are limited to exact IDs
   derived by the server from tracked records, recovered cases, and the selected
@@ -476,6 +488,8 @@ image. A failed test prevents publication.
   `HOST_SOURCE_BASE` and `/app/source` point at the same archive tree.
 - If the container is unhealthy after changing `ALLOWED_IPS`, retain
   `127.0.0.1`; the container healthcheck connects over loopback.
+- If every request is denied behind a reverse proxy, set
+  `TRUSTED_PROXY_COUNT=1` so the real client IP is used for `ALLOWED_IPS`.
 - If login works over HTTP but not through HTTPS, set
   `SESSION_COOKIE_SECURE=true` only behind a TLS-terminating proxy.
 - If the UI lacks icons or fonts, check the browser console for CSP violations.

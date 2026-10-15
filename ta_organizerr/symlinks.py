@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import availability, channel_designation, db as db_module, video_designation
 from .config import HIDDEN_DIR, HOST_SOURCE_BASE, SOURCE_DIR, TARGET_DIR
-from .db import get_db
+from .db import get_db, restore_codecs, stash_codecs
 from .logging_util import log
 from .library_lock import LIBRARY_MUTATION_LOCK
 from .media_reservations import MediaReservationConflict, media_mutation_guard
@@ -751,6 +751,9 @@ def _process_videos_unlocked() -> str | None:
 
     try:
         with get_db() as conn:
+            # Keep probed codecs across rescans; the delete/insert below would
+            # otherwise wipe them and force the Transcode page to re-probe.
+            stash_codecs(conn)
             conn.execute("DELETE FROM videos WHERE status IN ('linked', 'error')")
             availability.upsert_metadata_identities(conn, video_map)
             conn.executemany(
@@ -762,6 +765,7 @@ def _process_videos_unlocked() -> str | None:
                 """,
                 db_rows,
             )
+            restore_codecs(conn)
             conn.commit()
     except Exception as exc:  # noqa: BLE001 — surface DB consistency failures
         log(f"❌ Could not persist scan results: {exc}")

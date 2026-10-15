@@ -21,6 +21,17 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
+def _nonnegative_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got {raw_value!r}") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be zero or greater, got {value}")
+    return value
+
+
 def _nonnegative_float(name: str, default: float) -> float:
     raw_value = os.getenv(name, str(default))
     try:
@@ -63,6 +74,11 @@ SALVAGE_DIR = Path(os.getenv("SALVAGE_DIR", str(DATA_DIR / "media-salvage")))
 # requires an explicit value, and app startup logs a warning when this fallback
 # is active so it can be removed in a future breaking release.
 HOST_SOURCE_BASE_CONFIGURED, HOST_SOURCE_BASE = _host_source_base()
+
+# Number of reverse proxies in front of the app. When > 0, X-Forwarded-* is
+# trusted for that many hops so ALLOWED_IPS and login logging see the real
+# client address instead of the proxy's.
+TRUSTED_PROXY_COUNT = _nonnegative_int("TRUSTED_PROXY_COUNT", 0)
 
 DB_PATH = DATA_DIR / "videos.db"
 
